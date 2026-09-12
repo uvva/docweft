@@ -23,6 +23,17 @@
 #   - TIFF (libtiff)   TIFF decode (vcpkg: tiff | nixpkgs: libtiff). If not
 #                      present, setImage throws NotImplemented for TIFF.
 #                      Adds TEXTFABRIC_HAVE_TIFF compile definition.
+#   - PoDoFo           Native OOXML→PDF rendering with no Microsoft Word or
+#     (opt-in via       LibreOffice installed — see PLAN.md. Only searched
+#     TEXTFABRIC_        when TEXTFABRIC_ENABLE_NATIVE_PDF=ON (default OFF);
+#     ENABLE_NATIVE_PDF) fails the configure step loudly if enabled but not
+#                        found, rather than silently degrading, since a user
+#                        who opted in clearly wants this path to work.
+#                        (vcpkg: podofo | nixpkgs: podofo). Build it with its
+#                        MPL-2.0 licensing option selected, not the
+#                        LGPL-2.0-or-later alternative — keeps static linking
+#                        free of relinking obligations (see PLAN.md).
+#                        Adds TEXTFABRIC_HAVE_PODOFO compile definition.
 #
 # Optional (tests only):
 #   - Catch2 3.x       (vcpkg: catch2 | nixpkgs: catch2_3)
@@ -243,6 +254,22 @@ if(TIFF_FOUND)
 else()
     message(STATUS "  [dep] TIFF: NOT found — TIFF support disabled")
     set(TEXTFABRIC_HAVE_TIFF OFF CACHE INTERNAL "TIFF decoder available")
+endif()
+
+# ── PoDoFo (Stage 6b: native PDF renderer, opt-in) ──────────────────────────
+if(TEXTFABRIC_ENABLE_NATIVE_PDF)
+    find_package(podofo CONFIG QUIET)
+    if(podofo_FOUND)
+        message(STATUS "  [dep] PoDoFo: found via find_package")
+        set(TEXTFABRIC_HAVE_PODOFO ON CACHE INTERNAL "Native PDF renderer available")
+    else()
+        message(FATAL_ERROR
+            "TEXTFABRIC_ENABLE_NATIVE_PDF=ON but PoDoFo was not found "
+            "(vcpkg: podofo | nixpkgs: podofo). Install it or turn the "
+            "option off.")
+    endif()
+else()
+    set(TEXTFABRIC_HAVE_PODOFO OFF CACHE INTERNAL "Native PDF renderer available")
 endif()
 
 # ── Catch2 (tests only) ──────────────────────────────────────────────────────

@@ -19,6 +19,12 @@
           nlohmann_json  # JSON        — nixpkgs attr: "nlohmann_json"
           fmt            # Formatting  — nixpkgs attr: "fmt"
           libtiff        # TIFF decode (Stage 5) — nixpkgs attr: "libtiff"
+          # PoDoFo: native OOXML->PDF rendering with no MS Word/LibreOffice
+          # installed, opt-in via -DTEXTFABRIC_ENABLE_NATIVE_PDF=ON (see
+          # PLAN.md). Dual-licensed LGPL-2.0-or-later OR MPL-2.0 upstream —
+          # this project consumes it under the MPL-2.0 option to keep static
+          # linking free of relinking obligations.
+          podofo         # nixpkgs attr: "podofo"
           # inja: not packaged → fetched by CMake FetchContent automatically.
           # stb: not packaged as a CMake config — fetched via FetchContent.
         ];

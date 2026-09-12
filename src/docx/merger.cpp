@@ -1,5 +1,6 @@
 #include "docx/merger.hpp"
 #include "docx/image.hpp"
+#include "docx/pdf_native.hpp"
 #include "textfabric/error.hpp"
 
 #include <zip.h>
@@ -522,6 +523,18 @@ void DocxMerger::save(const std::string& path) {
     if (ext == ".pdf" || ext == ".html" || ext == ".htm") {
         const Converter conv = find_converter();
         if (conv.kind == ConverterKind::None) {
+#if defined(TEXTFABRIC_HAVE_PODOFO)
+            // Fallback tried only after Word/LibreOffice come up empty, and
+            // only for ".pdf" — the native renderer doesn't do HTML. See
+            // PLAN.md ("Proposed direction") for why this is scoped this way.
+            // TEXTFABRIC_DISABLE_CONVERTERS is a master kill switch (tests
+            // rely on it to assert the NoConverter path) — it must suppress
+            // this fallback too, not just Word/LibreOffice detection.
+            if (ext == ".pdf" && !env_nonempty("TEXTFABRIC_DISABLE_CONVERTERS")) {
+                docx::render_native_pdf(document_, parts_, p);
+                return;
+            }
+#endif
             throw ReportException(
                 ReportError::NoConverter,
                 fmt::format(

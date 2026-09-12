@@ -1,11 +1,12 @@
 # TextFabric examples
 
-Two minimal binaries that show how the library is meant to be consumed.
+Minimal binaries that show how the library is meant to be consumed.
 
 | Binary | Purpose | Library used |
 |---|---|---|
 | `generate_template` | Produces a valid OOXML `template.docx` with 4 header bookmarks + a 2-column table with a template `<w:tr>` | libzip (no textfabric) |
 | `basic_report` | Loads a template, fills header bookmarks, clones a table row per data entry, saves `.docx` + (if LibreOffice is available) `.pdf` + `.html` | `textfabric` public API only |
+| `native_pdf_report` | Builds its own chart-free template, fills it, and saves straight to `.pdf` via the native PoDoFo backend with Microsoft Word/LibreOffice detection explicitly disabled — proves the PDF really was produced without either. Only built when `-DTEXTFABRIC_ENABLE_NATIVE_PDF=ON` (see [PLAN.md](../PLAN.md)); a sample output sits alongside this file at [`native_report.pdf`](native_report.pdf). | `textfabric` public API + libzip (to build its own template) |
 
 ## Build
 

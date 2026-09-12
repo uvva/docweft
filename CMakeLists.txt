@@ -28,6 +28,7 @@ option(TEXTFABRIC_BUILD_TESTS    "Build the test suite"               ON)
 option(TEXTFABRIC_BUILD_EXAMPLES "Build example programs"             OFF)
 option(TEXTFABRIC_BUILD_SHARED   "Build as shared library"            OFF)
 option(TEXTFABRIC_USE_FETCHCONTENT "Fall back to FetchContent for deps not found via find_package" ON)
+option(TEXTFABRIC_ENABLE_NATIVE_PDF "Native OOXML->PDF rendering via PoDoFo, no Microsoft Word/LibreOffice required (see PLAN.md)" OFF)
 
 # ============================================================
 # Platform diagnostics
@@ -78,6 +79,7 @@ target_sources(textfabric
         src/error.cpp
         src/docx/merger.cpp
         src/docx/image.cpp
+        src/docx/pdf_native.cpp
         src/docx/reader.cpp
         src/docx/writer.cpp
         src/template/engine.cpp
@@ -106,6 +108,7 @@ set(_tf_required_deps
 set(_tf_optional_deps
     inja::inja            # Stage 3+: Jinja2-style placeholders
     TIFF::TIFF            # Stage 5 Phase 2: TIFF decode
+    podofo::podofo         # Stage 6b: native PDF rendering (opt-in, see PLAN.md)
 )
 
 foreach(_dep IN LISTS _tf_required_deps)
@@ -141,6 +144,9 @@ endif()
 if(TARGET TIFF::TIFF)
     target_compile_definitions(textfabric PRIVATE TEXTFABRIC_HAVE_TIFF=1)
 endif()
+if(TARGET podofo::podofo)
+    target_compile_definitions(textfabric PRIVATE TEXTFABRIC_HAVE_PODOFO=1)
+endif()
 
 textfabric_apply_compiler_options(textfabric)
 
@@ -159,6 +165,7 @@ if(TEXTFABRIC_BUILD_SHARED AND TEXTFABRIC_BUILD_TESTS)
         src/error.cpp
         src/docx/merger.cpp
         src/docx/image.cpp
+        src/docx/pdf_native.cpp
         src/docx/reader.cpp
         src/docx/writer.cpp
         src/template/engine.cpp
@@ -190,6 +197,9 @@ if(TEXTFABRIC_BUILD_SHARED AND TEXTFABRIC_BUILD_TESTS)
     endif()
     if(TARGET TIFF::TIFF)
         target_compile_definitions(textfabric_internal PUBLIC TEXTFABRIC_HAVE_TIFF=1)
+    endif()
+    if(TARGET podofo::podofo)
+        target_compile_definitions(textfabric_internal PUBLIC TEXTFABRIC_HAVE_PODOFO=1)
     endif()
 
     set_target_properties(textfabric_internal PROPERTIES

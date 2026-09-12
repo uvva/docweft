@@ -1,13 +1,15 @@
 @PACKAGE_INIT@
 
 set(TextFabric_SHARED   @TEXTFABRIC_BUILD_SHARED@)
-set(TextFabric_HAS_TIFF @TEXTFABRIC_HAVE_TIFF@)
+set(TextFabric_HAS_TIFF   @TEXTFABRIC_HAVE_TIFF@)
+set(TextFabric_HAS_PODOFO @TEXTFABRIC_HAVE_PODOFO@)
 
 # When TextFabric is built SHARED, the private deps (pugixml, libzip, fmt,
-# nlohmann_json, inja, libtiff) are baked into the .dll/.so and CMake does
-# not surface them on the imported target — consumers don't need to resolve
-# them. When built STATIC, those PRIVATE link libs become real transitive
-# link requirements and must be locatable on the consumer's prefix.
+# nlohmann_json, inja, libtiff, podofo) are baked into the .dll/.so and CMake
+# does not surface them on the imported target — consumers don't need to
+# resolve them. When built STATIC, those PRIVATE link libs become real
+# transitive link requirements and must be locatable on the consumer's
+# prefix.
 if(NOT TextFabric_SHARED)
     include(CMakeFindDependencyMacro)
     find_dependency(pugixml)
@@ -17,6 +19,9 @@ if(NOT TextFabric_SHARED)
     find_dependency(inja)
     if(TextFabric_HAS_TIFF)
         find_dependency(TIFF)
+    endif()
+    if(TextFabric_HAS_PODOFO)
+        find_dependency(podofo CONFIG)
     endif()
 endif()
 

@@ -9,9 +9,23 @@ target_link_libraries(generate_template PRIVATE libzip::zip)
 add_executable(basic_report basic_report.cpp)
 target_link_libraries(basic_report PRIVATE TextFabric::textfabric)
 
+set(_tf_example_targets generate_template basic_report)
+
+# ── native_pdf_report — demonstrates the native PoDoFo PDF backend, i.e.
+# save(".pdf") producing real output with no Microsoft Word or LibreOffice
+# installed at all. Only built when that backend is compiled in — see
+# PLAN.md — since the whole point of the example is exercising that path;
+# without it, save() would just throw NoConverter once the demo disables
+# LibreOffice detection.
+if(TEXTFABRIC_HAVE_PODOFO)
+    add_executable(native_pdf_report native_pdf_report.cpp)
+    target_link_libraries(native_pdf_report PRIVATE TextFabric::textfabric libzip::zip)
+    list(APPEND _tf_example_targets native_pdf_report)
+endif()
+
 # Place example binaries + the generated template together so running
 # `./basic_report` out-of-the-box just works.
-set_target_properties(generate_template basic_report PROPERTIES
+set_target_properties(${_tf_example_targets} PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
 )
 
@@ -19,7 +33,11 @@ set_target_properties(generate_template basic_report PROPERTIES
 # next to every example executable so they run out-of-the-box without
 # touching PATH. No-op on Linux/macOS: rpath handles shared-lib lookup there.
 if(WIN32 AND TEXTFABRIC_BUILD_SHARED)
-    foreach(_tf_example basic_report)
+    set(_tf_dll_copy_targets basic_report)
+    if(TARGET native_pdf_report)
+        list(APPEND _tf_dll_copy_targets native_pdf_report)
+    endif()
+    foreach(_tf_example ${_tf_dll_copy_targets})
         add_custom_command(TARGET ${_tf_example} POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                     $<TARGET_RUNTIME_DLLS:${_tf_example}>
