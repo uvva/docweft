@@ -1,5 +1,5 @@
 #include "docx/pdf_native.hpp"
-#include "textfabric/error.hpp"
+#include "docweft/error.hpp"
 
 #include <fmt/format.h>
 
@@ -14,13 +14,13 @@
 #include <string_view>
 #include <vector>
 
-#if defined(TEXTFABRIC_HAVE_PODOFO)
+#if defined(DOCWEFT_HAVE_PODOFO)
 #include <podofo/podofo.h>
 #endif
 
-namespace textfabric::docx {
+namespace docweft::docx {
 
-#if defined(TEXTFABRIC_HAVE_PODOFO)
+#if defined(DOCWEFT_HAVE_PODOFO)
 
 namespace {
 
@@ -158,7 +158,7 @@ struct ImageBlock {
 
 // Only called when the caller (draw_paragraph) has already established the
 // drawing isn't a chart. Throws NotImplemented if it's neither a picture nor
-// a chart (some DrawingML shape TextFabric never produces itself).
+// a chart (some DrawingML shape DocWeft never produces itself).
 ImageBlock resolve_image(pugi::xml_node drawing, const RelMap& rels, const PartMap& parts) {
     pugi::xml_node blip = find_descendant(drawing, "a:blip");
     if (!blip) {
@@ -521,15 +521,15 @@ std::vector<double> cell_widths_for_row(const std::vector<pugi::xml_node>& cells
     return widths;
 }
 
-// Explicit env override (mirrors the TEXTFABRIC_SOFFICE pattern) first, then
+// Explicit env override (mirrors the DOCWEFT_SOFFICE pattern) first, then
 // a short list of Unicode TrueType fonts commonly present per platform.
 // DejaVu Sans is the priority candidate specifically because it covers
-// Cyrillic — TextFabric's own example templates rely on Cyrillic to
+// Cyrillic — DocWeft's own example templates rely on Cyrillic to
 // demonstrate UTF-8 support, and Standard 14 PDF fonts (WinAnsi-only) can't
 // render it at all.
 std::optional<std::string> discover_font_path(bool bold) {
-    const char* env = std::getenv(bold ? "TEXTFABRIC_NATIVE_PDF_FONT_BOLD"
-                                        : "TEXTFABRIC_NATIVE_PDF_FONT");
+    const char* env = std::getenv(bold ? "DOCWEFT_NATIVE_PDF_FONT_BOLD"
+                                        : "DOCWEFT_NATIVE_PDF_FONT");
     if (env != nullptr && *env != '\0' && std::filesystem::exists(env)) {
         return std::string(env);
     }
@@ -610,7 +610,7 @@ public:
     void draw_paragraph(pugi::xml_node p, const RelMap& rels, const PartMap& parts) {
         if (pugi::xml_node drawing = find_descendant(p, "w:drawing")) {
             // A paragraph carrying a picture/chart is treated as that block
-            // alone — TextFabric never puts running text and a drawing in
+            // alone — DocWeft never puts running text and a drawing in
             // the same paragraph itself (setImage clears the run range
             // first), so this covers every document this library produces.
             if (pugi::xml_node chart_ref = find_descendant(drawing, "c:chart")) {
@@ -1237,19 +1237,19 @@ private:
 
 } // namespace
 
-#endif  // TEXTFABRIC_HAVE_PODOFO
+#endif  // DOCWEFT_HAVE_PODOFO
 
 void render_native_pdf(const pugi::xml_document& document,
                         const std::unordered_map<std::string, std::string>& parts,
                         const std::filesystem::path& output_path) {
-#if !defined(TEXTFABRIC_HAVE_PODOFO)
+#if !defined(DOCWEFT_HAVE_PODOFO)
     (void)document;
     (void)parts;
     (void)output_path;
     throw ReportException(
         ReportError::NotImplemented,
         "native PDF backend not compiled in — rebuild with "
-        "-DTEXTFABRIC_ENABLE_NATIVE_PDF=ON (requires PoDoFo)");
+        "-DDOCWEFT_ENABLE_NATIVE_PDF=ON (requires PoDoFo)");
 #else
     using namespace PoDoFo;
 
@@ -1312,4 +1312,4 @@ void render_native_pdf(const pugi::xml_document& document,
 #endif
 }
 
-} // namespace textfabric::docx
+} // namespace docweft::docx

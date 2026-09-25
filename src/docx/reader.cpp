@@ -1,6 +1,6 @@
-#include "textfabric/docx/reader.hpp"
+#include "docweft/docx/reader.hpp"
 
-namespace textfabric::docx {
+namespace docweft::docx {
 
 Reader::Reader(const std::filesystem::path& docx_path)
     : path_(docx_path)
@@ -15,4 +15,4 @@ std::string Reader::document_xml() const {
     return {};
 }
 
-} // namespace textfabric::docx
+} // namespace docweft::docx

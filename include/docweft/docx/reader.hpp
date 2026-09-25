@@ -3,7 +3,7 @@
 #include <filesystem>
 #include <string>
 
-namespace textfabric::docx {
+namespace docweft::docx {
 
 /// Placeholder: will read and parse a .docx archive.
 class Reader {
@@ -22,4 +22,4 @@ private:
     bool open_ = false;
 };
 
-} // namespace textfabric::docx
+} // namespace docweft::docx

@@ -1,4 +1,4 @@
-// Tests for textfabric::IReportMerger (v1 — Stage 2 of the migration roadmap).
+// Tests for docweft::IReportMerger (v1 — Stage 2 of the migration roadmap).
 // Covers: load/save, setClipboardValue, paste, and error paths.
 
 #include <catch2/catch_test_macros.hpp>
@@ -6,8 +6,8 @@
 #include <pugixml.hpp>
 #include <zip.h>
 
-#include "textfabric/merger.hpp"
-#include "textfabric/error.hpp"
+#include "docweft/merger.hpp"
+#include "docweft/error.hpp"
 
 // Internal header — OK from tests because the test TU is built against
 // the same include path as the library and has access to its source tree.
@@ -15,11 +15,13 @@
 
 #include "fixture_helpers.hpp"
 
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <thread>
 
 namespace fs = std::filesystem;
 
@@ -97,14 +99,14 @@ constexpr const char* kBodyMultiRun = R"(
 // ── load / save ────────────────────────────────────────────────────────────
 
 TEST_CASE("load rejects missing file", "[merger][load]") {
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     REQUIRE_THROWS_AS(
         merger->load("/path/does/not/exist.docx"),
-        textfabric::ReportException);
+        docweft::ReportException);
 
     try { merger->load("/no/such.docx"); }
-    catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::CantOpenTemplate);
+    catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::CantOpenTemplate);
     }
 }
 
@@ -115,8 +117,8 @@ TEST_CASE("load rejects non-zip file", "[merger][load]") {
         ofs << "this is not a zip archive";
     }
 
-    auto merger = textfabric::make_docx_merger();
-    REQUIRE_THROWS_AS(merger->load(path.string()), textfabric::ReportException);
+    auto merger = docweft::make_docx_merger();
+    REQUIRE_THROWS_AS(merger->load(path.string()), docweft::ReportException);
     fs::remove(path);
 }
 
@@ -126,12 +128,12 @@ TEST_CASE("load rejects zip without word/document.xml", "[merger][load]") {
         {"README.txt", "not a real docx"}
     });
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     try {
         merger->load(path.string());
         FAIL("expected ReportException");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::CantCopyDocxTemplate);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::CantCopyDocxTemplate);
     }
     fs::remove(path);
 }
@@ -141,12 +143,12 @@ TEST_CASE("load then save produces a valid DOCX round-trip", "[merger][load][sav
     const auto out = tmp_file("roundtrip_out", ".docx");
     tf_test::write_minimal_docx(in, kBodyWithHeaderBookmark);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     REQUIRE_NOTHROW(merger->load(in.string()));
     REQUIRE_NOTHROW(merger->save(out.string()));
 
     // The output must be a valid zip that can be re-loaded.
-    auto merger2 = textfabric::make_docx_merger();
+    auto merger2 = docweft::make_docx_merger();
     REQUIRE_NOTHROW(merger2->load(out.string()));
 
     fs::remove(in);
@@ -158,14 +160,14 @@ TEST_CASE("save rejects unknown extension", "[merger][save]") {
     const auto out = tmp_file("ext_bad", ".xyz");
     tf_test::write_minimal_docx(in, kBodyWithHeaderBookmark);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
 
     try {
         merger->save(out.string());
         FAIL("expected ReportException");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::SaveFailed);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::SaveFailed);
     }
     fs::remove(in);
 }
@@ -216,17 +218,17 @@ TEST_CASE("save('.pdf') returns NoConverter when all converters are disabled",
     const auto out = tmp_file("pdf_nocv_out", ".pdf");
     tf_test::write_minimal_docx(in, kBodyWithHeaderBookmark);
 
-    ScopedEnv kill("TEXTFABRIC_DISABLE_CONVERTERS");
+    ScopedEnv kill("DOCWEFT_DISABLE_CONVERTERS");
     kill.set("1");  // forces find_converter() → None regardless of the host
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
 
     try {
         merger->save(out.string());
         FAIL("expected NoConverter");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::NoConverter);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::NoConverter);
     }
     fs::remove(in);
 }
@@ -237,17 +239,17 @@ TEST_CASE("save('.html') returns NoConverter when all converters are disabled",
     const auto out = tmp_file("html_nocv_out", ".html");
     tf_test::write_minimal_docx(in, kBodyWithHeaderBookmark);
 
-    ScopedEnv kill("TEXTFABRIC_DISABLE_CONVERTERS");
+    ScopedEnv kill("DOCWEFT_DISABLE_CONVERTERS");
     kill.set("1");
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
 
     try {
         merger->save(out.string());
         FAIL("expected NoConverter");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::NoConverter);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::NoConverter);
     }
     fs::remove(in);
 }
@@ -284,12 +286,12 @@ TEST_CASE("save('.pdf') gives the converter a theme when charts have none",
     REQUIRE(read_docx_part(in, "word/theme/theme1.xml").empty());
 
     const auto fake = write_fake_soffice("fake_soffice_theme");
-    ScopedEnv no_word("TEXTFABRIC_NO_MSWORD");
+    ScopedEnv no_word("DOCWEFT_NO_MSWORD");
     no_word.set("1");
-    ScopedEnv soffice("TEXTFABRIC_SOFFICE");
+    ScopedEnv soffice("DOCWEFT_SOFFICE");
     soffice.set(fake.string().c_str());
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     REQUIRE_NOTHROW(merger->save(out.string()));
 
@@ -320,22 +322,22 @@ TEST_CASE("save('.pdf') moves on down the chain when LibreOffice fails",
     fs::permissions(fail, fs::perms::owner_all);
     tf_test::write_minimal_docx(in, kBodyWithHeaderBookmark);
 
-    ScopedEnv no_word("TEXTFABRIC_NO_MSWORD");
+    ScopedEnv no_word("DOCWEFT_NO_MSWORD");
     no_word.set("1");
-    ScopedEnv soffice("TEXTFABRIC_SOFFICE");
+    ScopedEnv soffice("DOCWEFT_SOFFICE");
     soffice.set(fail.string().c_str());
-    ScopedEnv remote("TEXTFABRIC_CONVERTER_URL");
+    ScopedEnv remote("DOCWEFT_CONVERTER_URL");
     remote.set(nullptr);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     try {
         merger->save(out.string());
         // Only possible when the native renderer is compiled in: it is the
         // next link after LibreOffice.
         REQUIRE(fs::file_size(out) > 256);
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::SaveFailed);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::SaveFailed);
         REQUIRE(std::string(e.what()).find("LibreOffice") != std::string::npos);
         REQUIRE_FALSE(fs::exists(out));
     }
@@ -343,6 +345,61 @@ TEST_CASE("save('.pdf') moves on down the chain when LibreOffice fails",
     fs::remove(in);
     fs::remove(out);
     fs::remove(fail);
+}
+
+TEST_CASE("save('.pdf') stops a hanging LibreOffice after DOCWEFT_SOFFICE_TIMEOUT",
+          "[merger][save][pdf]") {
+    const auto in   = tmp_file("pdf_hang_in",  ".docx");
+    const auto out  = tmp_file("pdf_hang_out", ".html");  // .html: no native fallback
+    const auto hang = tmp_file("hang_soffice", ".sh");
+    const auto pid_file = tmp_file("hang_soffice", ".pid");
+    {
+        // Like the real soffice wrapper: the work happens in a child process.
+        std::ofstream os(hang);
+        os << "#!/bin/sh\n"
+              "sleep 60 &\n"
+              "echo $! > " << pid_file.string() << "\n"
+              "wait\n";
+    }
+    fs::permissions(hang, fs::perms::owner_all);
+    tf_test::write_minimal_docx(in, kBodyWithHeaderBookmark);
+
+    ScopedEnv no_word("DOCWEFT_NO_MSWORD");
+    no_word.set("1");
+    ScopedEnv soffice("DOCWEFT_SOFFICE");
+    soffice.set(hang.string().c_str());
+    ScopedEnv timeout("DOCWEFT_SOFFICE_TIMEOUT");
+    timeout.set("1");
+
+    auto merger = docweft::make_docx_merger();
+    merger->load(in.string());
+    const auto started = std::chrono::steady_clock::now();
+    try {
+        merger->save(out.string());
+        FAIL("expected SaveFailed");
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::SaveFailed);
+        REQUIRE(std::string(e.what()).find("DOCWEFT_SOFFICE_TIMEOUT") != std::string::npos);
+    }
+    REQUIRE(std::chrono::steady_clock::now() - started < std::chrono::seconds(10));
+
+    // The child the wrapper started must be gone too, not left running.
+    std::ifstream pid_in(pid_file);
+    std::string child;
+    pid_in >> child;
+    REQUIRE_FALSE(child.empty());
+    // Poll briefly: a killed orphan stays a zombie until init reaps it.
+    const std::string probe = "kill -0 " + child + " 2>/dev/null";
+    bool alive = true;
+    for (int i = 0; i < 40 && alive; ++i) {
+        alive = std::system(probe.c_str()) == 0;
+        if (alive) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    REQUIRE_FALSE(alive);
+
+    fs::remove(in);
+    fs::remove(hang);
+    fs::remove(pid_file);
 }
 
 TEST_CASE("save('.html') NoConverter names every converter it checked",
@@ -353,18 +410,18 @@ TEST_CASE("save('.html') NoConverter names every converter it checked",
 
     // Neither the native renderer nor the remote converter produce HTML, so
     // with Word and LibreOffice off nothing is left in any build.
-    ScopedEnv no_word("TEXTFABRIC_NO_MSWORD");
+    ScopedEnv no_word("DOCWEFT_NO_MSWORD");
     no_word.set("1");
-    ScopedEnv soffice("TEXTFABRIC_SOFFICE");
+    ScopedEnv soffice("DOCWEFT_SOFFICE");
     soffice.set("");
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     try {
         merger->save(out.string());
         FAIL("expected NoConverter");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::NoConverter);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::NoConverter);
         const std::string msg = e.what();
         REQUIRE(msg.find("Microsoft Word") != std::string::npos);
         REQUIRE(msg.find("LibreOffice") != std::string::npos);
@@ -381,12 +438,12 @@ TEST_CASE("save('.pdf') adds no theme to a document without charts",
     tf_test::write_minimal_docx(in, kBodyWithHeaderBookmark);
 
     const auto fake = write_fake_soffice("fake_soffice_notheme");
-    ScopedEnv no_word("TEXTFABRIC_NO_MSWORD");
+    ScopedEnv no_word("DOCWEFT_NO_MSWORD");
     no_word.set("1");
-    ScopedEnv soffice("TEXTFABRIC_SOFFICE");
+    ScopedEnv soffice("DOCWEFT_SOFFICE");
     soffice.set(fake.string().c_str());
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     REQUIRE_NOTHROW(merger->save(out.string()));
     REQUIRE(read_docx_part(out, "word/theme/theme1.xml").empty());
@@ -406,7 +463,7 @@ TEST_CASE("save('.pdf') via any available converter produces a non-empty PDF",
     const auto out = tmp_file("pdf_ok_out", ".pdf");
     tf_test::write_minimal_docx(in, kBodyWithHeaderBookmark);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     merger->setClipboardValue("_Header.User", "{{user}}", "Alice");
     REQUIRE_NOTHROW(merger->save(out.string()));
@@ -427,9 +484,9 @@ TEST_CASE("save('.pdf') via any available converter produces a non-empty PDF",
 TEST_CASE("save('.pdf') falls back to LibreOffice when MSWord is suppressed",
           "[merger][save][pdf][integration]") {
 #ifdef _WIN32
-    // On Windows with Word + LibreOffice both present, TEXTFABRIC_NO_MSWORD
+    // On Windows with Word + LibreOffice both present, DOCWEFT_NO_MSWORD
     // must route to LibreOffice. Skip if LibreOffice is missing on host.
-    ScopedEnv no_word("TEXTFABRIC_NO_MSWORD");
+    ScopedEnv no_word("DOCWEFT_NO_MSWORD");
     no_word.set("1");
     const bool soffice_ok =
         std::system("soffice --version >nul 2>nul") == 0;
@@ -447,7 +504,7 @@ TEST_CASE("save('.pdf') falls back to LibreOffice when MSWord is suppressed",
     const auto out = tmp_file("pdf_fb_out", ".pdf");
     tf_test::write_minimal_docx(in, kBodyWithHeaderBookmark);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     REQUIRE_NOTHROW(merger->save(out.string()));
     REQUIRE(fs::exists(out));
@@ -466,7 +523,7 @@ TEST_CASE("save('.html') via any available converter produces an HTML file",
     const auto out = tmp_file("html_ok_out", ".html");
     tf_test::write_minimal_docx(in, kBodyWithHeaderBookmark);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     merger->setClipboardValue("_Header.User", "{{user}}", "Борис");
     REQUIRE_NOTHROW(merger->save(out.string()));
@@ -487,17 +544,17 @@ TEST_CASE("save('.html') via any available converter produces an HTML file",
 // ── setCodePage ────────────────────────────────────────────────────────────
 
 TEST_CASE("setCodePage accepts UTF-8", "[merger][codepage]") {
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     REQUIRE_NOTHROW(merger->setCodePage("UTF-8"));
 }
 
 TEST_CASE("setCodePage rejects non-UTF-8", "[merger][codepage]") {
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     try {
         merger->setCodePage("CP1251");
         FAIL("expected ReportException");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::NotImplemented);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::NotImplemented);
     }
 }
 
@@ -507,7 +564,7 @@ TEST_CASE("setClipboardValue replaces placeholder in bookmark", "[merger][clipbo
     const auto in = tmp_file("clip_in", ".docx");
     tf_test::write_minimal_docx(in, kBodyWithHeaderBookmark);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     REQUIRE_NOTHROW(
         merger->setClipboardValue("_Header.User", "{{user}}", "Alice"));
@@ -517,7 +574,7 @@ TEST_CASE("setClipboardValue replaces placeholder in bookmark", "[merger][clipbo
     const auto out = tmp_file("clip_out", ".docx");
     merger->save(out.string());
 
-    auto verifier = textfabric::make_docx_merger();
+    auto verifier = docweft::make_docx_merger();
     verifier->load(out.string());
 
     // Access document.xml via a downcast-free helper: re-save into string
@@ -525,7 +582,7 @@ TEST_CASE("setClipboardValue replaces placeholder in bookmark", "[merger][clipbo
     // the public document_xml() on the concrete type. For v1 tests we
     // include the concrete header directly.
     #include "docx/merger.hpp"  // ok for test TU
-    auto* concrete = dynamic_cast<textfabric::docx::DocxMerger*>(verifier.get());
+    auto* concrete = dynamic_cast<docweft::docx::DocxMerger*>(verifier.get());
     REQUIRE(concrete != nullptr);
 
     const auto xml = concrete->document_xml();
@@ -540,12 +597,12 @@ TEST_CASE("setClipboardValue handles placeholder split across runs", "[merger][c
     const auto in = tmp_file("clip_multi_in", ".docx");
     tf_test::write_minimal_docx(in, kBodyMultiRun);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     merger->setClipboardValue("_Header.ReportName", "{{title}}", "Q1 Summary");
     merger->setClipboardValue("_Header.UKDate",    "{{date}}",  "2026-04-21");
 
-    auto* concrete = dynamic_cast<textfabric::docx::DocxMerger*>(merger.get());
+    auto* concrete = dynamic_cast<docweft::docx::DocxMerger*>(merger.get());
     REQUIRE(concrete != nullptr);
     const auto xml = concrete->document_xml();
     REQUIRE(xml.find("Q1 Summary")  != std::string::npos);
@@ -560,11 +617,11 @@ TEST_CASE("setClipboardValue preserves UTF-8 / Cyrillic", "[merger][clipboard][u
     const auto in = tmp_file("clip_utf8_in", ".docx");
     tf_test::write_minimal_docx(in, kBodyWithHeaderBookmark);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     merger->setClipboardValue("_Header.User", "{{user}}", "Алексей");
 
-    auto* concrete = dynamic_cast<textfabric::docx::DocxMerger*>(merger.get());
+    auto* concrete = dynamic_cast<docweft::docx::DocxMerger*>(merger.get());
     const auto xml = concrete->document_xml();
     REQUIRE(xml.find("Алексей") != std::string::npos);
 
@@ -592,7 +649,7 @@ TEST_CASE("setClipboardValue preserves text nodes in overlapping bookmarks",
     )";
     tf_test::write_minimal_docx(in, kBody);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     REQUIRE_NOTHROW(merger->setClipboardValue("outer", "{outer}", "Outer!"));
     // Without the targeted-run-only replacement fix, this call used to hit
@@ -671,7 +728,7 @@ TEST_CASE("setClipboardValue fills _Header / _Footer parts that carry no bookmar
         {"word/footer1.xml",             kFooter1},
     });
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     REQUIRE_NOTHROW(merger->setClipboardValue("_Header", "{User}", "Operator"));
     REQUIRE_NOTHROW(merger->setClipboardValue("_Header", "{ReportName}",
@@ -703,14 +760,14 @@ TEST_CASE("setClipboardValue on _Header throws InvalidBookmark when the archive 
     const auto in = tmp_file("header_none_in", ".docx");
     tf_test::write_minimal_docx(in, kBodyWithHeaderBookmark);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
 
     try {
         merger->setClipboardValue("_Header", "{User}", "x");
         FAIL("expected InvalidBookmark");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::InvalidBookmark);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::InvalidBookmark);
     }
     fs::remove(in);
 }
@@ -748,14 +805,14 @@ TEST_CASE("setClipboardValue on _Header throws InvalidField when no header part 
         {"word/header1.xml",             kHeader1},
     });
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
 
     try {
         merger->setClipboardValue("_Header", "{User}", "x");
         FAIL("expected InvalidField");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::InvalidField);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::InvalidField);
     }
     fs::remove(in);
 }
@@ -764,14 +821,14 @@ TEST_CASE("setClipboardValue throws on unknown bookmark", "[merger][clipboard][e
     const auto in = tmp_file("clip_err_in", ".docx");
     tf_test::write_minimal_docx(in, kBodyWithHeaderBookmark);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
 
     try {
         merger->setClipboardValue("_NoSuch.Bookmark", "{{user}}", "x");
         FAIL("expected InvalidBookmark");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::InvalidBookmark);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::InvalidBookmark);
     }
     fs::remove(in);
 }
@@ -780,14 +837,14 @@ TEST_CASE("setClipboardValue throws on unknown field", "[merger][clipboard][erro
     const auto in = tmp_file("clip_field_err_in", ".docx");
     tf_test::write_minimal_docx(in, kBodyWithHeaderBookmark);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
 
     try {
         merger->setClipboardValue("_Header.User", "{{nope}}", "x");
         FAIL("expected InvalidField");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::InvalidField);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::InvalidField);
     }
     fs::remove(in);
 }
@@ -814,7 +871,7 @@ TEST_CASE("setTableRow clones template row per data row", "[merger][table]") {
     const auto in = tmp_file("tbl_three", ".docx");
     tf_test::write_table_template_docx(in);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
 
     merger->setTableRow("TableRow",
@@ -825,7 +882,7 @@ TEST_CASE("setTableRow clones template row per data row", "[merger][table]") {
             {"Carol", "77"},
         });
 
-    auto* concrete = dynamic_cast<textfabric::docx::DocxMerger*>(merger.get());
+    auto* concrete = dynamic_cast<docweft::docx::DocxMerger*>(merger.get());
     REQUIRE(concrete != nullptr);
     const auto xml = concrete->document_xml();
 
@@ -847,11 +904,11 @@ TEST_CASE("setTableRow with empty rows drops the template row", "[merger][table]
     const auto in = tmp_file("tbl_empty", ".docx");
     tf_test::write_table_template_docx(in);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     merger->setTableRow("TableRow", {"{{name}}", "{{score}}"}, {});
 
-    auto* concrete = dynamic_cast<textfabric::docx::DocxMerger*>(merger.get());
+    auto* concrete = dynamic_cast<docweft::docx::DocxMerger*>(merger.get());
     const auto xml = concrete->document_xml();
     // Only the header row remains.
     REQUIRE(count_substr(xml, "<w:tr>") == 1);
@@ -866,13 +923,13 @@ TEST_CASE("setTableRow strips bookmarks from clones (no duplicate w:id)",
     const auto in = tmp_file("tbl_bmk", ".docx");
     tf_test::write_table_template_docx(in);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     merger->setTableRow("TableRow",
         {"{{name}}", "{{score}}"},
         {{"Alice", "95"}, {"Bob", "82"}});
 
-    auto* concrete = dynamic_cast<textfabric::docx::DocxMerger*>(merger.get());
+    auto* concrete = dynamic_cast<docweft::docx::DocxMerger*>(merger.get());
     const auto xml = concrete->document_xml();
     // Cloned rows must not carry the original bookmark — otherwise Word
     // refuses to open the file on duplicate w:id.
@@ -887,16 +944,16 @@ TEST_CASE("setTableRow round-trips through save/load", "[merger][table][save]") 
     const auto out = tmp_file("tbl_rt_out", ".docx");
     tf_test::write_table_template_docx(in);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     merger->setTableRow("TableRow",
         {"{{name}}", "{{score}}"},
         {{"Алиса", "95"}, {"Борис", "82"}});
     merger->save(out.string());
 
-    auto verifier = textfabric::make_docx_merger();
+    auto verifier = docweft::make_docx_merger();
     verifier->load(out.string());
-    auto* concrete = dynamic_cast<textfabric::docx::DocxMerger*>(verifier.get());
+    auto* concrete = dynamic_cast<docweft::docx::DocxMerger*>(verifier.get());
     const auto xml = concrete->document_xml();
     REQUIRE(xml.find("Алиса") != std::string::npos);
     REQUIRE(xml.find("Борис") != std::string::npos);
@@ -910,14 +967,14 @@ TEST_CASE("setTableRow throws on unknown bookmark", "[merger][table][error]") {
     const auto in = tmp_file("tbl_nobmk", ".docx");
     tf_test::write_table_template_docx(in);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
 
     try {
         merger->setTableRow("NoSuch", {"{{name}}"}, {{"x"}});
         FAIL("expected InvalidBookmark");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::InvalidBookmark);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::InvalidBookmark);
     }
     fs::remove(in);
 }
@@ -929,14 +986,14 @@ TEST_CASE("setTableRow throws when bookmark is not in a <w:tr>",
     const auto in = tmp_file("tbl_not_tr", ".docx");
     tf_test::write_minimal_docx(in, kBodyWithHeaderBookmark);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
 
     try {
         merger->setTableRow("_Header.User", {"{{user}}"}, {{"Alice"}});
         FAIL("expected InvalidBookmark");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::InvalidBookmark);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::InvalidBookmark);
     }
     fs::remove(in);
 }
@@ -945,7 +1002,7 @@ TEST_CASE("setTableRow throws on row width mismatch", "[merger][table][error]") 
     const auto in = tmp_file("tbl_mismatch", ".docx");
     tf_test::write_table_template_docx(in);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
 
     try {
@@ -953,8 +1010,8 @@ TEST_CASE("setTableRow throws on row width mismatch", "[merger][table][error]") 
             {"{{name}}", "{{score}}"},
             {{"Alice", "95"}, {"Bob"}});  // second row is too short
         FAIL("expected InvalidField");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::InvalidField);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::InvalidField);
     }
     fs::remove(in);
 }
@@ -964,15 +1021,15 @@ TEST_CASE("setTableRow throws when a field is absent from the row template",
     const auto in = tmp_file("tbl_bad_field", ".docx");
     tf_test::write_table_template_docx(in);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
 
     try {
         // {{nope}} is not present in any cell of the template row.
         merger->setTableRow("TableRow", {"{{nope}}"}, {{"x"}});
         FAIL("expected InvalidField");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::InvalidField);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::InvalidField);
     }
     fs::remove(in);
 }
@@ -998,11 +1055,11 @@ TEST_CASE("setImage inserts a <w:drawing> and registers the relationship",
     tf_test::write_minimal_docx(docx, kBodyWithImageBookmark);
     tf_test::write_tiny_png(png);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(docx.string());
     REQUIRE_NOTHROW(merger->setImage("Body.Image", png));
 
-    auto* concrete = dynamic_cast<textfabric::docx::DocxMerger*>(merger.get());
+    auto* concrete = dynamic_cast<docweft::docx::DocxMerger*>(merger.get());
     REQUIRE(concrete != nullptr);
     const auto xml = concrete->document_xml();
 
@@ -1026,13 +1083,13 @@ TEST_CASE("setImage saves a round-trippable DOCX with embedded PNG",
     tf_test::write_minimal_docx(in_docx, kBodyWithImageBookmark);
     tf_test::write_tiny_png(png);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in_docx.string());
     merger->setImage("Body.Image", png);
     REQUIRE_NOTHROW(merger->save(out_docx.string()));
 
     // Re-load the saved .docx and inspect the archive via a fresh merger.
-    auto verifier = textfabric::make_docx_merger();
+    auto verifier = docweft::make_docx_merger();
     REQUIRE_NOTHROW(verifier->load(out_docx.string()));
 
     // Pull the raw archive via libzip to validate media + rels + content-types.
@@ -1081,7 +1138,7 @@ TEST_CASE("setImage preserves existing content-type entries",
     tf_test::write_minimal_docx(docx, kBodyWithImageBookmark);
     tf_test::write_tiny_png(png);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(docx.string());
     merger->setImage("Body.Image", png);
     // Call again with the same PNG to ensure idempotency of content-type insert.
@@ -1135,7 +1192,7 @@ TEST_CASE("setImage allocates unique media paths for multiple calls",
     tf_test::write_minimal_docx(docx, kBody);
     tf_test::write_tiny_png(png);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(docx.string());
     merger->setImage("Body.One", png);
     merger->setImage("Body.Two", png);
@@ -1165,14 +1222,14 @@ TEST_CASE("setImage throws InvalidBookmark on unknown bookmark",
     tf_test::write_minimal_docx(docx, kBodyWithImageBookmark);
     tf_test::write_tiny_png(png);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(docx.string());
 
     try {
         merger->setImage("Body.NotHere", png);
         FAIL("expected InvalidBookmark");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::InvalidBookmark);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::InvalidBookmark);
     }
     fs::remove(docx);
     fs::remove(png);
@@ -1183,14 +1240,14 @@ TEST_CASE("setImage throws CantOpenTemplate when the image file is missing",
     const auto docx = tmp_file("img_err_file", ".docx");
     tf_test::write_minimal_docx(docx, kBodyWithImageBookmark);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(docx.string());
 
     try {
         merger->setImage("Body.Image", "/no/such/image.png");
         FAIL("expected CantOpenTemplate");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::CantOpenTemplate);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::CantOpenTemplate);
     }
     fs::remove(docx);
 }
@@ -1226,11 +1283,11 @@ TEST_CASE("setImage with default ImageSize{} uses intrinsic pixel size",
     tf_test::write_minimal_docx(docx, kBodyWithImageBookmark);
     tf_test::write_tiny_png(png);  // 2×2
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(docx.string());
     merger->setImage("Body.Image", png);  // no bounds
 
-    auto* concrete = dynamic_cast<textfabric::docx::DocxMerger*>(merger.get());
+    auto* concrete = dynamic_cast<docweft::docx::DocxMerger*>(merger.get());
     std::uint64_t cx = 0, cy = 0;
     extract_extent(concrete->document_xml(), cx, cy);
     REQUIRE(cx == 2 * kEmuPerPx);
@@ -1247,12 +1304,12 @@ TEST_CASE("setImage downscales when max bound is smaller than native",
     tf_test::write_minimal_docx(docx, kBodyWithImageBookmark);
     tf_test::write_tiny_png(png);  // 2×2
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(docx.string());
     // max_width_px=1 → scale must become 0.5 → displayed extent 1×1 px.
-    merger->setImage("Body.Image", png, textfabric::ImageSize{0, 0, 1, 0});
+    merger->setImage("Body.Image", png, docweft::ImageSize{0, 0, 1, 0});
 
-    auto* concrete = dynamic_cast<textfabric::docx::DocxMerger*>(merger.get());
+    auto* concrete = dynamic_cast<docweft::docx::DocxMerger*>(merger.get());
     std::uint64_t cx = 0, cy = 0;
     extract_extent(concrete->document_xml(), cx, cy);
     REQUIRE(cx == kEmuPerPx);  // 1 px worth of EMU
@@ -1269,12 +1326,12 @@ TEST_CASE("setImage upscales when min bound is larger than native",
     tf_test::write_minimal_docx(docx, kBodyWithImageBookmark);
     tf_test::write_tiny_png(png);  // 2×2
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(docx.string());
     // min_width_px=10 → scale=5, displayed extent 10×10 px.
-    merger->setImage("Body.Image", png, textfabric::ImageSize{10, 0, 0, 0});
+    merger->setImage("Body.Image", png, docweft::ImageSize{10, 0, 0, 0});
 
-    auto* concrete = dynamic_cast<textfabric::docx::DocxMerger*>(merger.get());
+    auto* concrete = dynamic_cast<docweft::docx::DocxMerger*>(merger.get());
     std::uint64_t cx = 0, cy = 0;
     extract_extent(concrete->document_xml(), cx, cy);
     REQUIRE(cx == 10 * kEmuPerPx);
@@ -1291,13 +1348,13 @@ TEST_CASE("setImage keeps intrinsic size when native fits inside bounds",
     tf_test::write_minimal_docx(docx, kBodyWithImageBookmark);
     tf_test::write_tiny_png(png);  // 2×2
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(docx.string());
     // 1×1 ≤ 2×2 ≤ 100×100 — intrinsic scale=1 is in the band, no change.
     merger->setImage("Body.Image", png,
-                     textfabric::ImageSize{1, 1, 100, 100});
+                     docweft::ImageSize{1, 1, 100, 100});
 
-    auto* concrete = dynamic_cast<textfabric::docx::DocxMerger*>(merger.get());
+    auto* concrete = dynamic_cast<docweft::docx::DocxMerger*>(merger.get());
     std::uint64_t cx = 0, cy = 0;
     extract_extent(concrete->document_xml(), cx, cy);
     REQUIRE(cx == 2 * kEmuPerPx);
@@ -1314,16 +1371,16 @@ TEST_CASE("setImage throws InvalidField on contradictory bounds",
     tf_test::write_minimal_docx(docx, kBodyWithImageBookmark);
     tf_test::write_tiny_png(png);  // 2×2
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(docx.string());
 
     try {
         // min_width 20 → scale ≥ 10; max_height 5 → scale ≤ 2.5. Impossible.
         merger->setImage("Body.Image", png,
-                         textfabric::ImageSize{20, 0, 0, 5});
+                         docweft::ImageSize{20, 0, 0, 5});
         FAIL("expected InvalidField");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::InvalidField);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::InvalidField);
     }
 
     fs::remove(docx);
@@ -1339,17 +1396,17 @@ TEST_CASE("setImage leaves document unmutated on contradictory bounds",
     tf_test::write_minimal_docx(docx, kBodyWithImageBookmark);
     tf_test::write_tiny_png(png);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(docx.string());
 
     try {
         merger->setImage("Body.Image", png,
-                         textfabric::ImageSize{20, 0, 0, 5});
-    } catch (const textfabric::ReportException&) {
+                         docweft::ImageSize{20, 0, 0, 5});
+    } catch (const docweft::ReportException&) {
         // Expected — fall through to verification.
     }
 
-    auto* concrete = dynamic_cast<textfabric::docx::DocxMerger*>(merger.get());
+    auto* concrete = dynamic_cast<docweft::docx::DocxMerger*>(merger.get());
     const auto xml = concrete->document_xml();
     // Original {{image}} placeholder must still be there; no <w:drawing>
     // inserted; no new relationship.
@@ -1360,7 +1417,7 @@ TEST_CASE("setImage leaves document unmutated on contradictory bounds",
     fs::remove(png);
 }
 
-#if defined(TEXTFABRIC_HAVE_STB)
+#if defined(DOCWEFT_HAVE_STB)
 TEST_CASE("setImage transcodes BMP to PNG (Phase 2, stb path)",
           "[merger][image][bmp]") {
     const auto docx = tmp_file("img_bmp_in",  ".docx");
@@ -1368,7 +1425,7 @@ TEST_CASE("setImage transcodes BMP to PNG (Phase 2, stb path)",
     tf_test::write_minimal_docx(docx, kBodyWithImageBookmark);
     tf_test::write_tiny_bmp(bmp);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(docx.string());
     REQUIRE_NOTHROW(merger->setImage("Body.Image", bmp));
 
@@ -1406,21 +1463,21 @@ TEST_CASE("setImage rejects non-PNG when stb decoder is not compiled in",
     tf_test::write_minimal_docx(docx, kBodyWithImageBookmark);
     tf_test::write_tiny_bmp(bmp);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(docx.string());
 
     try {
         merger->setImage("Body.Image", bmp);
         FAIL("expected NotImplemented");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::NotImplemented);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::NotImplemented);
     }
     fs::remove(docx);
     fs::remove(bmp);
 }
 #endif
 
-#if defined(TEXTFABRIC_HAVE_STB)
+#if defined(DOCWEFT_HAVE_STB)
 TEST_CASE("setImage rejects corrupt JPEG bytes with CantCopyDocxTemplate",
           "[merger][image][error]") {
     const auto docx = tmp_file("img_bad_jpg", ".docx");
@@ -1433,14 +1490,14 @@ TEST_CASE("setImage rejects corrupt JPEG bytes with CantCopyDocxTemplate",
         f.write(reinterpret_cast<const char*>(head), sizeof(head));
     }
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(docx.string());
 
     try {
         merger->setImage("Body.Image", bad);
         FAIL("expected CantCopyDocxTemplate");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::CantCopyDocxTemplate);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::CantCopyDocxTemplate);
     }
     fs::remove(docx);
     fs::remove(bad);
@@ -1457,14 +1514,14 @@ TEST_CASE("setImage rejects non-image files",
         f << "this is not any known image format";
     }
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(docx.string());
 
     try {
         merger->setImage("Body.Image", junk);
         FAIL("expected CantCopyDocxTemplate");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::CantCopyDocxTemplate);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::CantCopyDocxTemplate);
     }
     fs::remove(docx);
     fs::remove(junk);
@@ -1478,7 +1535,7 @@ TEST_CASE("setChartValue rewrites a bar chart numeric cache",
     const auto out = tmp_file("chart_bar_out", ".docx");
     tf_test::write_chart_template_docx(in);   // Bar, 2×2, Sales/Costs × Q1/Q2
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     REQUIRE_NOTHROW(merger->setChartValue(
         "kStatChart", "ChartField", "Sales", "Q1", 99.0));
@@ -1503,7 +1560,7 @@ TEST_CASE("setChartValue updates the second series in a multi-series chart",
     const auto out = tmp_file("chart_multi_out", ".docx");
     tf_test::write_chart_template_docx(in);   // Costs row: {5, 15}
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     REQUIRE_NOTHROW(merger->setChartValue(
         "kStatChart", "ChartField", "Costs", "Q2", 77.5));
@@ -1528,13 +1585,13 @@ TEST_CASE("setChartValue survives a round-trip through save/load",
     const auto out2 = tmp_file("chart_rt_m2",  ".docx");
     tf_test::write_chart_template_docx(in);
 
-    auto m1 = textfabric::make_docx_merger();
+    auto m1 = docweft::make_docx_merger();
     m1->load(in.string());
     m1->setChartValue("kStatChart", "ChartField", "Sales", "Q1", 42.0);
     m1->save(out1.string());
 
     // Re-open and mutate again — the value we wrote must be what we see.
-    auto m2 = textfabric::make_docx_merger();
+    auto m2 = docweft::make_docx_merger();
     m2->load(out1.string());
     m2->setChartValue("kStatChart", "ChartField", "Sales", "Q2", 43.0);
     m2->save(out2.string());
@@ -1561,7 +1618,7 @@ TEST_CASE("setChartValue preserves Cyrillic series and category names",
     fx.data           = {{100, 200}, {50, 60}};
     tf_test::write_chart_template_docx(in, fx);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     REQUIRE_NOTHROW(merger->setChartValue(
         "kStatChart", "ChartField", "Продажи", "Февраль", 250.0));
@@ -1585,7 +1642,7 @@ TEST_CASE("setChartValue works on a line chart", "[merger][chart]") {
     fx.kind = tf_test::ChartKind::Line;
     tf_test::write_chart_template_docx(in, fx);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     REQUIRE_NOTHROW(merger->setChartValue(
         "kStatChart", "ChartField", "Sales", "Q1", 33.0));
@@ -1609,7 +1666,7 @@ TEST_CASE("setChartValue works on a pie chart", "[merger][chart]") {
     fx.data          = {{30, 70}};
     tf_test::write_chart_template_docx(in, fx);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     REQUIRE_NOTHROW(merger->setChartValue(
         "kStatChart", "ChartField", "Share", "Q2", 65.0));
@@ -1629,13 +1686,13 @@ TEST_CASE("setChartValue throws InvalidBookmark on unknown bookmark",
     const auto in = tmp_file("chart_nobmk_in", ".docx");
     tf_test::write_chart_template_docx(in);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     try {
         merger->setChartValue("NoSuchBmk", "f", "Sales", "Q1", 1.0);
         FAIL("expected InvalidBookmark");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::InvalidBookmark);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::InvalidBookmark);
     }
     fs::remove(in);
 }
@@ -1646,13 +1703,13 @@ TEST_CASE("setChartValue throws InvalidBookmark when bookmark has no chart",
     // Bookmark in a plain text paragraph, no drawing anywhere.
     tf_test::write_minimal_docx(in, kBodyWithHeaderBookmark);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     try {
         merger->setChartValue("_Header.User", "f", "Sales", "Q1", 1.0);
         FAIL("expected InvalidBookmark");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::InvalidBookmark);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::InvalidBookmark);
     }
     fs::remove(in);
 }
@@ -1662,13 +1719,13 @@ TEST_CASE("setChartValue throws InvalidField on unknown series",
     const auto in = tmp_file("chart_noser_in", ".docx");
     tf_test::write_chart_template_docx(in);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     try {
         merger->setChartValue("kStatChart", "f", "NoSuchSeries", "Q1", 1.0);
         FAIL("expected InvalidField");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::InvalidField);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::InvalidField);
     }
     fs::remove(in);
 }
@@ -1678,13 +1735,13 @@ TEST_CASE("setChartValue throws InvalidField on unknown category",
     const auto in = tmp_file("chart_nocat_in", ".docx");
     tf_test::write_chart_template_docx(in);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     try {
         merger->setChartValue("kStatChart", "f", "Sales", "NoSuchCat", 1.0);
         FAIL("expected InvalidField");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::InvalidField);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::InvalidField);
     }
     fs::remove(in);
 }
@@ -1696,25 +1753,25 @@ TEST_CASE("setChartValue throws NotImplemented on scatter chart",
     fx.kind = tf_test::ChartKind::Scatter;
     tf_test::write_chart_template_docx(in, fx);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     try {
         merger->setChartValue("kStatChart", "f", "Sales", "Q1", 1.0);
         FAIL("expected NotImplemented");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::NotImplemented);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::NotImplemented);
     }
     fs::remove(in);
 }
 
 TEST_CASE("setChartValue before load throws CantOpenTemplate",
           "[merger][chart][error]") {
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     try {
         merger->setChartValue("b", "f", "s", "c", 1.0);
         FAIL("expected CantOpenTemplate");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::CantOpenTemplate);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::CantOpenTemplate);
     }
 }
 
@@ -1726,7 +1783,7 @@ TEST_CASE("setChartSeriesName renames a series without touching its data",
     const auto out = tmp_file("chart_rename_out", ".docx");
     tf_test::write_chart_template_docx(in);   // Sales/Costs × Q1/Q2
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     REQUIRE_NOTHROW(merger->setChartSeriesName("kStatChart", "Sales", "Revenue"));
     REQUIRE_NOTHROW(merger->save(out.string()));
@@ -1755,13 +1812,13 @@ TEST_CASE("setChartSeriesName throws InvalidField on unknown series",
     const auto in = tmp_file("chart_rename_bad", ".docx");
     tf_test::write_chart_template_docx(in);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     try {
         merger->setChartSeriesName("kStatChart", "NoSuchSeries", "X");
         FAIL("expected InvalidField");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::InvalidField);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::InvalidField);
     }
     fs::remove(in);
 }
@@ -1773,25 +1830,25 @@ TEST_CASE("setChartSeriesName throws NotImplemented on scatter chart",
     fx.kind = tf_test::ChartKind::Scatter;
     tf_test::write_chart_template_docx(in, fx);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     try {
         merger->setChartSeriesName("kStatChart", "Sales", "X");
         FAIL("expected NotImplemented");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::NotImplemented);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::NotImplemented);
     }
     fs::remove(in);
 }
 
 TEST_CASE("setChartSeriesName before load throws CantOpenTemplate",
           "[merger][chart][error]") {
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     try {
         merger->setChartSeriesName("b", "s", "n");
         FAIL("expected CantOpenTemplate");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::CantOpenTemplate);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::CantOpenTemplate);
     }
 }
 
@@ -1803,7 +1860,7 @@ TEST_CASE("setChartTitle creates a title and clears autoTitleDeleted",
     const auto out = tmp_file("chart_title_out", ".docx");
     tf_test::write_chart_template_docx(in);   // no <c:title> in the fixture
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     REQUIRE_NOTHROW(merger->setChartTitle("kStatChart", "Quarterly Sales"));
     REQUIRE_NOTHROW(merger->save(out.string()));
@@ -1827,7 +1884,7 @@ TEST_CASE("setChartTitle replaces an existing title instead of duplicating it",
     const auto out = tmp_file("chart_title_replace_out", ".docx");
     tf_test::write_chart_template_docx(in);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     REQUIRE_NOTHROW(merger->setChartTitle("kStatChart", "First Title"));
     REQUIRE_NOTHROW(merger->setChartTitle("kStatChart", "Second Title"));
@@ -1859,7 +1916,7 @@ TEST_CASE("setChartTitle preserves the template's existing title formatting",
     fx.initial_title = "Old Title";   // fixture styles this red/bold/14pt/centered/rotated
     tf_test::write_chart_template_docx(in, fx);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     REQUIRE_NOTHROW(merger->setChartTitle("kStatChart", "New Title"));
     REQUIRE_NOTHROW(merger->save(out.string()));
@@ -1891,13 +1948,13 @@ TEST_CASE("setChartTitle throws NotImplemented on scatter chart",
     fx.kind = tf_test::ChartKind::Scatter;
     tf_test::write_chart_template_docx(in, fx);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     try {
         merger->setChartTitle("kStatChart", "X");
         FAIL("expected NotImplemented");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::NotImplemented);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::NotImplemented);
     }
     fs::remove(in);
 }
@@ -1910,10 +1967,10 @@ TEST_CASE("setChartAxisTitle sets the category axis title",
     const auto out = tmp_file("chart_axtitle_cat_out", ".docx");
     tf_test::write_chart_template_docx(in);   // bar: has catAx/valAx
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     REQUIRE_NOTHROW(merger->setChartAxisTitle(
-        "kStatChart", textfabric::IReportMerger::ChartAxis::Category, "Quarter"));
+        "kStatChart", docweft::IReportMerger::ChartAxis::Category, "Quarter"));
     REQUIRE_NOTHROW(merger->save(out.string()));
 
     const auto xml = read_docx_part(out, "word/charts/chart1.xml");
@@ -1935,10 +1992,10 @@ TEST_CASE("setChartAxisTitle sets the value axis title",
     const auto out = tmp_file("chart_axtitle_val_out", ".docx");
     tf_test::write_chart_template_docx(in);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     REQUIRE_NOTHROW(merger->setChartAxisTitle(
-        "kStatChart", textfabric::IReportMerger::ChartAxis::Value, "USD"));
+        "kStatChart", docweft::IReportMerger::ChartAxis::Value, "USD"));
     REQUIRE_NOTHROW(merger->save(out.string()));
 
     const auto xml = read_docx_part(out, "word/charts/chart1.xml");
@@ -1960,14 +2017,14 @@ TEST_CASE("setChartAxisTitle throws InvalidField when the chart has no such axis
     fx.kind = tf_test::ChartKind::Pie;   // pie has neither catAx nor valAx
     tf_test::write_chart_template_docx(in, fx);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     try {
         merger->setChartAxisTitle(
-            "kStatChart", textfabric::IReportMerger::ChartAxis::Category, "X");
+            "kStatChart", docweft::IReportMerger::ChartAxis::Category, "X");
         FAIL("expected InvalidField");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::InvalidField);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::InvalidField);
     }
     fs::remove(in);
 }
@@ -1979,14 +2036,14 @@ TEST_CASE("setChartAxisTitle throws NotImplemented on scatter chart",
     fx.kind = tf_test::ChartKind::Scatter;
     tf_test::write_chart_template_docx(in, fx);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     try {
         merger->setChartAxisTitle(
-            "kStatChart", textfabric::IReportMerger::ChartAxis::Value, "X");
+            "kStatChart", docweft::IReportMerger::ChartAxis::Value, "X");
         FAIL("expected NotImplemented");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::NotImplemented);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::NotImplemented);
     }
     fs::remove(in);
 }
@@ -2004,7 +2061,7 @@ TEST_CASE("setChartData clears a stale per-point <c:dPt> override on reshape",
     // Sanity: the fixture really does carry the override before we touch it.
     REQUIRE(read_docx_part(in, "word/charts/chart1.xml").find("c:dPt") != std::string::npos);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     REQUIRE_NOTHROW(merger->setChartData(
         "kStatChart", {"Q1", "Q2", "Q3"},
@@ -2024,7 +2081,7 @@ TEST_CASE("setChartData reshapes to more categories than the template had",
     const auto out = tmp_file("chart_data_more_out", ".docx");
     tf_test::write_chart_template_docx(in);   // 2 series × 2 categories
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     REQUIRE_NOTHROW(merger->setChartData(
         "kStatChart",
@@ -2061,7 +2118,7 @@ TEST_CASE("setChartData reshapes to fewer categories than the template had",
     const auto out = tmp_file("chart_data_fewer_out", ".docx");
     tf_test::write_chart_template_docx(in);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     REQUIRE_NOTHROW(merger->setChartData(
         "kStatChart", {"Only"}, {{"Sales", {42.0}}, {"Costs", {7.0}}}));
@@ -2088,7 +2145,7 @@ TEST_CASE("setChartData adds a series cloning the template's visual style",
     const auto out = tmp_file("chart_data_addser_out", ".docx");
     tf_test::write_chart_template_docx(in);   // Sales, Costs
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     REQUIRE_NOTHROW(merger->setChartData(
         "kStatChart", {"Q1", "Q2"},
@@ -2120,7 +2177,7 @@ TEST_CASE("setChartData drops a surplus template series",
     const auto out = tmp_file("chart_data_dropser_out", ".docx");
     tf_test::write_chart_template_docx(in);   // Sales, Costs
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     REQUIRE_NOTHROW(merger->setChartData(
         "kStatChart", {"Q1", "Q2"}, {{"OnlyOne", {1, 2}}}));
@@ -2143,13 +2200,13 @@ TEST_CASE("setChartData throws InvalidField on empty categories",
           "[merger][chart][error]") {
     const auto in = tmp_file("chart_data_empty_cats", ".docx");
     tf_test::write_chart_template_docx(in);
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     try {
         merger->setChartData("kStatChart", {}, {{"Sales", {}}});
         FAIL("expected InvalidField");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::InvalidField);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::InvalidField);
     }
     fs::remove(in);
 }
@@ -2158,13 +2215,13 @@ TEST_CASE("setChartData throws InvalidField on empty series",
           "[merger][chart][error]") {
     const auto in = tmp_file("chart_data_empty_series", ".docx");
     tf_test::write_chart_template_docx(in);
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     try {
         merger->setChartData("kStatChart", {"Q1"}, {});
         FAIL("expected InvalidField");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::InvalidField);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::InvalidField);
     }
     fs::remove(in);
 }
@@ -2173,13 +2230,13 @@ TEST_CASE("setChartData throws InvalidField when a series' value count mismatche
           "[merger][chart][error]") {
     const auto in = tmp_file("chart_data_mismatch", ".docx");
     tf_test::write_chart_template_docx(in);
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     try {
         merger->setChartData("kStatChart", {"Q1", "Q2"}, {{"Sales", {1.0}}});
         FAIL("expected InvalidField");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::InvalidField);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::InvalidField);
     }
     fs::remove(in);
 }
@@ -2190,25 +2247,25 @@ TEST_CASE("setChartData throws NotImplemented on scatter chart",
     tf_test::ChartFixture fx;
     fx.kind = tf_test::ChartKind::Scatter;
     tf_test::write_chart_template_docx(in, fx);
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     try {
         merger->setChartData("kStatChart", {"Q1"}, {{"Sales", {1.0}}});
         FAIL("expected NotImplemented");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::NotImplemented);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::NotImplemented);
     }
     fs::remove(in);
 }
 
 TEST_CASE("setChartData before load throws CantOpenTemplate",
           "[merger][chart][error]") {
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     try {
         merger->setChartData("b", {"c"}, {{"s", {1.0}}});
         FAIL("expected CantOpenTemplate");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::CantOpenTemplate);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::CantOpenTemplate);
     }
 }
 
@@ -2218,7 +2275,7 @@ TEST_CASE("setChartData syncs the embedded workbook when the chart has one",
     const auto out = tmp_file("chart_data_xlsx_out", ".docx");
     tf_test::write_chart_template_docx_with_workbook(in);   // Sales/Costs × Q1/Q2
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     REQUIRE_NOTHROW(merger->setChartData(
         "kStatChart", {"Q1", "Q2", "Q3"},
@@ -2268,7 +2325,7 @@ TEST_CASE("setChartData leaves a chart with no embedded workbook alone (no error
     const auto out = tmp_file("chart_data_noxlsx_out", ".docx");
     tf_test::write_chart_template_docx(in);   // no <c:externalData> at all
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     REQUIRE_NOTHROW(merger->setChartData("kStatChart", {"Q1"}, {{"Sales", {1.0}}}));
     REQUIRE_NOTHROW(merger->save(out.string()));
@@ -2285,11 +2342,11 @@ TEST_CASE("paste records bookmark activation", "[merger][paste]") {
     const auto in = tmp_file("paste_in", ".docx");
     tf_test::write_minimal_docx(in, kBodyWithHeaderBookmark);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     REQUIRE_NOTHROW(merger->paste("_Header.User"));
 
-    auto* concrete = dynamic_cast<textfabric::docx::DocxMerger*>(merger.get());
+    auto* concrete = dynamic_cast<docweft::docx::DocxMerger*>(merger.get());
     REQUIRE(concrete->pasted_bookmarks().size() == 1);
     REQUIRE(concrete->pasted_bookmarks().front() == "_Header.User");
     fs::remove(in);
@@ -2299,13 +2356,13 @@ TEST_CASE("paste throws on unknown bookmark", "[merger][paste][error]") {
     const auto in = tmp_file("paste_err_in", ".docx");
     tf_test::write_minimal_docx(in, kBodyWithHeaderBookmark);
 
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
     merger->load(in.string());
     try {
         merger->paste("_NoSuch");
         FAIL("expected InvalidBookmark");
-    } catch (const textfabric::ReportException& e) {
-        REQUIRE(e.code() == textfabric::ReportError::InvalidBookmark);
+    } catch (const docweft::ReportException& e) {
+        REQUIRE(e.code() == docweft::ReportError::InvalidBookmark);
     }
     fs::remove(in);
 }
@@ -2313,8 +2370,8 @@ TEST_CASE("paste throws on unknown bookmark", "[merger][paste][error]") {
 // ── error enum round-trip ──────────────────────────────────────────────────
 
 TEST_CASE("ReportError to_string covers all values", "[error]") {
-    using textfabric::ReportError;
-    using textfabric::to_string;
+    using docweft::ReportError;
+    using docweft::to_string;
     REQUIRE(to_string(ReportError::None)                 == "None");
     REQUIRE(to_string(ReportError::CantOpenTemplate)     == "CantOpenTemplate");
     REQUIRE(to_string(ReportError::CantCopyDocxTemplate) == "CantCopyDocxTemplate");

@@ -1,26 +1,26 @@
-# TextFabric examples
+# DocWeft examples
 
 Minimal binaries that show how the library is meant to be consumed.
 
 | Binary | Purpose | Library used |
 |---|---|---|
-| `generate_template` | Produces a valid OOXML `template.docx` with 4 header bookmarks + a 2-column table with a template `<w:tr>` | libzip (no textfabric) |
-| `basic_report` | Loads a template, fills header bookmarks, clones a table row per data entry, saves `.docx` + (if LibreOffice is available) `.pdf` + `.html` | `textfabric` public API only |
-| `native_pdf_report` | Builds its own chart-free template, fills it, and saves straight to `.pdf` via the native PoDoFo backend with Microsoft Word/LibreOffice detection explicitly disabled — proves the PDF really was produced without either. Only built when `-DTEXTFABRIC_ENABLE_NATIVE_PDF=ON` (see [PLAN.md](../PLAN.md)); a sample output sits alongside this file at [`native_report.pdf`](native_report.pdf). | `textfabric` public API + libzip (to build its own template) |
+| `generate_template` | Produces a valid OOXML `template.docx` with 4 header bookmarks + a 2-column table with a template `<w:tr>` | libzip (no docweft) |
+| `basic_report` | Loads a template, fills header bookmarks, clones a table row per data entry, saves `.docx` + (if LibreOffice is available) `.pdf` + `.html` | `docweft` public API only |
+| `native_pdf_report` | Builds its own chart-free template, fills it, and saves straight to `.pdf` via the native PoDoFo backend with Microsoft Word/LibreOffice detection explicitly disabled — proves the PDF really was produced without either. Only built when `-DDOCWEFT_ENABLE_NATIVE_PDF=ON` (see [PLAN.md](../PLAN.md)); a sample output sits alongside this file at [`native_report.pdf`](native_report.pdf). | `docweft` public API + libzip (to build its own template) |
 
 ## Build
 
 From the repository root:
 
 ```bash
-cmake --preset linux-x64 -DTEXTFABRIC_BUILD_EXAMPLES=ON
+cmake --preset linux-x64 -DDOCWEFT_BUILD_EXAMPLES=ON
 cmake --build --preset linux-x64
 ```
 
 or (without presets):
 
 ```bash
-cmake -B build -DTEXTFABRIC_BUILD_EXAMPLES=ON -DTEXTFABRIC_USE_FETCHCONTENT=ON
+cmake -B build -DDOCWEFT_BUILD_EXAMPLES=ON -DDOCWEFT_USE_FETCHCONTENT=ON
 cmake --build build -j
 ```
 
@@ -37,7 +37,7 @@ cd build/examples
 Expected output (with LibreOffice installed):
 
 ```
-TextFabric v0.1.0
+DocWeft v0.1.0
   template: template.docx
   output:   report.docx
 
@@ -56,11 +56,11 @@ Wrote report.pdf (PDF via Word or LibreOffice, whichever was found)
 Wrote report.html (HTML via Word or LibreOffice, whichever was found)
 ```
 
-Without LibreOffice (or with `TEXTFABRIC_SOFFICE=""`) the last two lines become:
+Without LibreOffice (or with `DOCWEFT_SOFFICE=""`) the last two lines become:
 
 ```
-PDF: skipped — LibreOffice not found. Install soffice or set TEXTFABRIC_SOFFICE to enable PDF/HTML export.
-HTML: skipped — LibreOffice not found. Install soffice or set TEXTFABRIC_SOFFICE to enable PDF/HTML export.
+PDF: skipped — LibreOffice not found. Install soffice or set DOCWEFT_SOFFICE to enable PDF/HTML export.
+HTML: skipped — LibreOffice not found. Install soffice or set DOCWEFT_SOFFICE to enable PDF/HTML export.
 ```
 
 The `.docx` is still written in both cases — PDF/HTML are derived outputs that never block the primary save path.
@@ -97,17 +97,17 @@ Bookmarks and placeholders inside `word/document.xml` (the `Body.Logo` picture i
 ## Integrating in your own CMake project
 
 ```cmake
-find_package(TextFabric 0.1 CONFIG REQUIRED)
+find_package(DocWeft 0.1 CONFIG REQUIRED)
 
 add_executable(my_app main.cpp)
-target_link_libraries(my_app PRIVATE TextFabric::textfabric)
+target_link_libraries(my_app PRIVATE DocWeft::docweft)
 ```
 
 ```cpp
-#include <textfabric/merger.hpp>
-#include <textfabric/error.hpp>
+#include <docweft/merger.hpp>
+#include <docweft/error.hpp>
 
-auto merger = textfabric::make_docx_merger();
+auto merger = docweft::make_docx_merger();
 merger->load("template.docx");
 
 // Header substitution — single value per bookmark/field.

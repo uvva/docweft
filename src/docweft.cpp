@@ -1,9 +1,9 @@
-#include "textfabric/textfabric.hpp"
+#include "docweft/docweft.hpp"
 
 #include <fstream>
 #include <sstream>
 
-namespace textfabric {
+namespace docweft {
 
 bool file_exists(const std::filesystem::path& path) {
     return std::filesystem::exists(path) && std::filesystem::is_regular_file(path);
@@ -18,4 +18,4 @@ std::string read_file(const std::filesystem::path& path) {
     return ss.str();
 }
 
-} // namespace textfabric
+} // namespace docweft

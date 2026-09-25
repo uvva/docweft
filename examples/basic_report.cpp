@@ -1,4 +1,4 @@
-// basic_report — the canonical consumer-side example of TextFabric.
+// basic_report — the canonical consumer-side example of DocWeft.
 //
 // Loads a template .docx, fills four header bookmarks with runtime values,
 // clones a table row three times with per-row data, and saves the result
@@ -11,9 +11,9 @@
 // Defaults: template.docx → report.docx (.pdf / .html are derived from the
 // same stem and skipped gracefully if soffice is absent).
 
-#include <textfabric/error.hpp>
-#include <textfabric/merger.hpp>
-#include <textfabric/textfabric.hpp>   // version
+#include <docweft/error.hpp>
+#include <docweft/merger.hpp>
+#include <docweft/docweft.hpp>   // version
 
 #include <array>
 #include <chrono>
@@ -27,12 +27,12 @@ int main(int argc, char** argv) {
     const std::string tpl_path = (argc > 1) ? argv[1] : "template.docx";
     const std::string out_path = (argc > 2) ? argv[2] : "report.docx";
 
-    std::cout << "TextFabric v" << textfabric::version << "\n"
+    std::cout << "DocWeft v" << docweft::version << "\n"
               << "  template: " << tpl_path << "\n"
               << "  output:   " << out_path << "\n\n";
 
     // ── 1. Build the merger via the library factory ──────────────────────
-    auto merger = textfabric::make_docx_merger();
+    auto merger = docweft::make_docx_merger();
 
     try {
         merger->setCodePage("UTF-8");
@@ -64,7 +64,7 @@ int main(int argc, char** argv) {
         const fs::path logo_path = fs::path(out_path).replace_filename("logo.png");
         const bool logo_embedded = fs::exists(logo_path);
         if (!logo_embedded) {
-            std::cerr << "[TextFabric] warning: " << logo_path.string()
+            std::cerr << "[DocWeft] warning: " << logo_path.string()
                       << " not found — skipping setImage demo. "
                          "Run this binary from examples/ in the build tree, "
                          "or copy examples/logo.png next to it.\n";
@@ -73,7 +73,7 @@ int main(int argc, char** argv) {
             // which would render as a dust speck in Word. min_width_px=64
             // scales it up uniformly to 64×64, preserving the 1:1 aspect.
             merger->setImage("Body.Logo", logo_path,
-                             textfabric::ImageSize{/*min_w*/64, /*min_h*/64,
+                             docweft::ImageSize{/*min_w*/64, /*min_h*/64,
                                                    /*max_w*/256, /*max_h*/256});
         }
 
@@ -158,8 +158,8 @@ int main(int argc, char** argv) {
                 std::cout << "Wrote " << target.string()
                           << " (" << label
                           << " via Word or LibreOffice, whichever was found)\n";
-            } catch (const textfabric::ReportException& e) {
-                if (e.code() == textfabric::ReportError::NoConverter) {
+            } catch (const docweft::ReportException& e) {
+                if (e.code() == docweft::ReportError::NoConverter) {
                     std::cout << label
                               << ": skipped — no converter available. "
                                  "Install Microsoft Word (Windows) or "
@@ -171,9 +171,9 @@ int main(int argc, char** argv) {
         }
         return 0;
     }
-    catch (const textfabric::ReportException& e) {
-        std::cerr << "[TextFabric error] "
-                  << textfabric::to_string(e.code()) << ": "
+    catch (const docweft::ReportException& e) {
+        std::cerr << "[DocWeft error] "
+                  << docweft::to_string(e.code()) << ": "
                   << e.what() << "\n";
         return 1;
     }

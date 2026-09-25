@@ -1,5 +1,5 @@
 {
-  description = "TextFabric — cross-platform C++20 DOCX template library";
+  description = "DocWeft — cross-platform C++20 DOCX template library";
 
   inputs = {
     nixpkgs.url     = "github:NixOS/nixpkgs/nixos-unstable";
@@ -20,7 +20,7 @@
           fmt            # Formatting  — nixpkgs attr: "fmt"
           libtiff        # TIFF decode (Stage 5) — nixpkgs attr: "libtiff"
           # PoDoFo: native OOXML->PDF rendering with no MS Word/LibreOffice
-          # installed, opt-in via -DTEXTFABRIC_ENABLE_NATIVE_PDF=ON (see
+          # installed, opt-in via -DDOCWEFT_ENABLE_NATIVE_PDF=ON (see
           # PLAN.md). Dual-licensed LGPL-2.0-or-later OR MPL-2.0 upstream —
           # this project consumes it under the MPL-2.0 option to keep static
           # linking free of relinking obligations.
@@ -40,8 +40,10 @@
         ];
 
         devTools = with pkgs; [
-          clang_17
-          clang-tools_17   # clang-tidy, clang-format, clangd
+          # Unversioned: follows nixpkgs' default LLVM, so the shell doesn't
+          # break when an old pinned version (e.g. clang_17) is dropped.
+          clang
+          clang-tools      # clang-tidy, clang-format, clangd
           gdb
           valgrind
           cmake-format
@@ -52,13 +54,13 @@
         # ─── Development shell ────────────────────────────────────────────────
         # Enter with: nix develop
         devShells.default = pkgs.mkShell {
-          name = "textfabric-dev";
+          name = "docweft-dev";
 
           packages = nativeBuildDeps ++ buildDeps ++ testDeps ++ devTools;
 
           shellHook = ''
             echo ""
-            echo "  TextFabric dev environment (Linux / Nix)"
+            echo "  DocWeft dev environment (Linux / Nix)"
             echo ""
             echo "  Build (Release):"
             echo "    cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release"
@@ -69,7 +71,7 @@
             echo "    cmake --build build-debug && ctest --test-dir build-debug -V"
             echo ""
             echo "  Note: 'inja' is not in nixpkgs — CMake will fetch it via FetchContent."
-            echo "        Set TEXTFABRIC_USE_FETCHCONTENT=OFF to disable this fallback."
+            echo "        Set DOCWEFT_USE_FETCHCONTENT=OFF to disable this fallback."
             echo ""
           '';
         };
@@ -77,7 +79,7 @@
         # ─── Library derivation ───────────────────────────────────────────────
         # Build with: nix build
         packages.default = pkgs.stdenv.mkDerivation {
-          pname   = "textfabric";
+          pname   = "docweft";
           version = "0.1.0";
           src     = ./.;
 
@@ -86,11 +88,11 @@
 
           cmakeFlags = [
             "-DCMAKE_BUILD_TYPE=Release"
-            "-DTEXTFABRIC_BUILD_TESTS=OFF"
-            "-DTEXTFABRIC_BUILD_EXAMPLES=OFF"
+            "-DDOCWEFT_BUILD_TESTS=OFF"
+            "-DDOCWEFT_BUILD_EXAMPLES=OFF"
             # FetchContent is allowed so inja can be fetched during the build.
             # In a hermetic Nix build you may want to pre-vendor inja instead.
-            "-DTEXTFABRIC_USE_FETCHCONTENT=ON"
+            "-DDOCWEFT_USE_FETCHCONTENT=ON"
           ];
 
           meta = with pkgs.lib; {
@@ -107,7 +109,7 @@
             set -euo pipefail
             echo "Checking C++ formatting..."
             find src include tests -name '*.cpp' -o -name '*.hpp' | \
-              xargs ${pkgs.clang-tools_17}/bin/clang-format --dry-run --Werror
+              xargs ${pkgs.clang-tools}/bin/clang-format --dry-run --Werror
             echo "All files formatted correctly."
           '';
         };

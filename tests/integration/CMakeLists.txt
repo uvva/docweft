@@ -7,8 +7,8 @@
 #     └─ integration_consumer_configure   cmake -S <consumer> -B <build>
 #           └─ integration_consumer_build   cmake --build <build>
 #
-# Failure at any step means the exported package (TextFabricConfig.cmake,
-# TextFabricTargets.cmake, generated export.h, find_dependency chain) is
+# Failure at any step means the exported package (DocWeftConfig.cmake,
+# DocWeftTargets.cmake, generated export.h, find_dependency chain) is
 # broken for downstream users.
 
 set(_install_stage "${CMAKE_CURRENT_BINARY_DIR}/install_stage")
@@ -33,7 +33,7 @@ add_test(NAME integration_install
         --config  $<CONFIG>
 )
 set_tests_properties(integration_install PROPERTIES
-    FIXTURES_SETUP TextFabricInstalled
+    FIXTURES_SETUP DocWeftInstalled
     LABELS         "integration"
 )
 
@@ -47,8 +47,8 @@ add_test(NAME integration_consumer_configure
         ${_forward_args}
 )
 set_tests_properties(integration_consumer_configure PROPERTIES
-    FIXTURES_REQUIRED TextFabricInstalled
-    FIXTURES_SETUP    TextFabricConsumerConfigured
+    FIXTURES_REQUIRED DocWeftInstalled
+    FIXTURES_SETUP    DocWeftConsumerConfigured
     LABELS            "integration"
 )
 
@@ -58,6 +58,6 @@ add_test(NAME integration_consumer_build
         --config $<CONFIG>
 )
 set_tests_properties(integration_consumer_build PROPERTIES
-    FIXTURES_REQUIRED TextFabricConsumerConfigured
+    FIXTURES_REQUIRED DocWeftConsumerConfigured
     LABELS            "integration"
 )

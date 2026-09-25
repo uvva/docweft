@@ -3,7 +3,7 @@
 #include <string>
 #include <string_view>
 
-namespace textfabric::tmpl {
+namespace docweft::tmpl {
 
 /// Placeholder: will render inja/Jinja2-style templates.
 class Engine {
@@ -16,4 +16,4 @@ public:
                                      std::string_view json_data) const;
 };
 
-} // namespace textfabric::tmpl
+} // namespace docweft::tmpl

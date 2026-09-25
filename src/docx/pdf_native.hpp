@@ -6,10 +6,10 @@
 #include <string>
 #include <unordered_map>
 
-namespace textfabric::docx {
+namespace docweft::docx {
 
 /// Renders the loaded document straight to PDF via PoDoFo, without shelling
-/// out to Microsoft Word or LibreOffice. Scoped to what TextFabric itself
+/// out to Microsoft Word or LibreOffice. Scoped to what DocWeft itself
 /// understands: paragraphs/runs (font size + bold, first run's style wins
 /// per paragraph — same convention as the rest of the merger), simple grid
 /// tables, embedded PNG images, and bar/line/area/pie/doughnut charts (3D
@@ -27,7 +27,7 @@ namespace textfabric::docx {
 /// `word/media/imageN.png` bytes themselves.
 ///
 /// Only meaningfully implemented when built with
-/// TEXTFABRIC_ENABLE_NATIVE_PDF (which defines TEXTFABRIC_HAVE_PODOFO) —
+/// DOCWEFT_ENABLE_NATIVE_PDF (which defines DOCWEFT_HAVE_PODOFO) —
 /// otherwise every call throws ReportException{NotImplemented}, so callers
 /// don't need to guard the call site with an #ifdef.
 ///
@@ -42,4 +42,4 @@ void render_native_pdf(const pugi::xml_document& document,
                         const std::unordered_map<std::string, std::string>& parts,
                         const std::filesystem::path& output_path);
 
-} // namespace textfabric::docx
+} // namespace docweft::docx

@@ -4,7 +4,7 @@
 #include <filesystem>
 #include <string>
 
-namespace textfabric::docx {
+namespace docweft::docx {
 
 /// Image format detected by magic bytes.
 enum class ImageFormat {
@@ -38,4 +38,4 @@ struct PngBuffer {
 ///   * NotImplemented    — format detected but baseline build cannot decode
 [[nodiscard]] PngBuffer load_as_png(const std::filesystem::path& path);
 
-} // namespace textfabric::docx
+} // namespace docweft::docx

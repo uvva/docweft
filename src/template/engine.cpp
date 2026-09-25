@@ -1,6 +1,6 @@
-#include "textfabric/template/engine.hpp"
+#include "docweft/template/engine.hpp"
 
-namespace textfabric::tmpl {
+namespace docweft::tmpl {
 
 Engine::Engine()  = default;
 Engine::~Engine() = default;
@@ -11,4 +11,4 @@ std::string Engine::render([[maybe_unused]] std::string_view tpl,
     return std::string(tpl);
 }
 
-} // namespace textfabric::tmpl
+} // namespace docweft::tmpl

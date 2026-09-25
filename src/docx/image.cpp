@@ -1,5 +1,5 @@
 #include "docx/image.hpp"
-#include "textfabric/error.hpp"
+#include "docweft/error.hpp"
 
 #include <fmt/format.h>
 
@@ -10,7 +10,7 @@
 #include <vector>
 
 // ── Optional decoders (wired up by Dependencies.cmake + CMakeLists.txt) ─────
-#if defined(TEXTFABRIC_HAVE_STB)
+#if defined(DOCWEFT_HAVE_STB)
 #  define STB_IMAGE_IMPLEMENTATION
 #  define STB_IMAGE_WRITE_IMPLEMENTATION
 #  define STBI_NO_HDR
@@ -23,14 +23,14 @@
 #  include <stb_image_write.h>
 #endif
 
-#if defined(TEXTFABRIC_HAVE_TIFF)
+#if defined(DOCWEFT_HAVE_TIFF)
 #  include <tiffio.h>
 #endif
 
 // ── Native-crash containment (Windows only) ──────────────────────────────
 // stb_image and libtiff are third-party C decoders; malformed/corrupt input
 // has been observed (via user crash dumps, not local repro — see
-// TEXTFABRIC_UPSTREAM_FEEDBACK.md item 10) to trigger a genuine hardware
+// DOCWEFT_UPSTREAM_FEEDBACK.md item 10) to trigger a genuine hardware
 // exception (EXCEPTION_ACCESS_VIOLATION deep in stb_image's Huffman
 // decoding) rather than a clean decode failure. That bypasses every
 // try/catch a caller might have — it's a process-killing SEH, not a C++
@@ -43,7 +43,7 @@
 #  include <eh.h>
 #endif
 
-namespace textfabric::docx {
+namespace docweft::docx {
 
 namespace {
 
@@ -136,7 +136,7 @@ ImageFormat detect_format(const std::filesystem::path& path) {
 
 namespace {
 
-#if defined(TEXTFABRIC_HAVE_STB)
+#if defined(DOCWEFT_HAVE_STB)
 
 // Accumulator that stb_image_write can pump PNG bytes into via a callback,
 // without dragging in FILE* or a temp file on disk.
@@ -188,9 +188,9 @@ PngBuffer decode_via_stb(const std::string& bytes, const char* format_label) {
     out.bytes  = encode_png_from_rgba(raw_owner.get(), w, h);
     return out;
 }
-#endif  // TEXTFABRIC_HAVE_STB
+#endif  // DOCWEFT_HAVE_STB
 
-#if defined(TEXTFABRIC_HAVE_TIFF) && defined(TEXTFABRIC_HAVE_STB)
+#if defined(DOCWEFT_HAVE_TIFF) && defined(DOCWEFT_HAVE_STB)
 
 // In-memory TIFF source so libtiff can read from our std::string buffer
 // without touching the filesystem twice (we already slurped it).
@@ -228,7 +228,7 @@ PngBuffer decode_via_libtiff(const std::string& bytes) {
     TiffMem mem{reinterpret_cast<const unsigned char*>(bytes.data()),
                  static_cast<toff_t>(bytes.size()), 0};
     TIFF* tif = TIFFClientOpen(
-        "textfabric-memory", "r", &mem,
+        "docweft-memory", "r", &mem,
         tiff_mem_read, tiff_mem_write, tiff_mem_seek, tiff_mem_close,
         tiff_mem_filesize, tiff_mem_map, tiff_mem_unmap);
     if (!tif) {
@@ -276,7 +276,7 @@ PngBuffer decode_via_libtiff(const std::string& bytes) {
     return out;
 }
 
-#endif  // TEXTFABRIC_HAVE_TIFF && TEXTFABRIC_HAVE_STB
+#endif  // DOCWEFT_HAVE_TIFF && DOCWEFT_HAVE_STB
 
 [[noreturn]] void throw_missing_decoder(const std::filesystem::path& path,
                                         const char* fmt,
@@ -331,7 +331,7 @@ PngBuffer load_as_png(const std::filesystem::path& path) {
     }
 
     if (starts_with(bytes, kJpegSignature)) {
-#if defined(TEXTFABRIC_HAVE_STB)
+#if defined(DOCWEFT_HAVE_STB)
         return decode_via_stb(bytes, "JPEG");
 #else
         throw_missing_decoder(path, "JPEG", "stb_image");
@@ -339,7 +339,7 @@ PngBuffer load_as_png(const std::filesystem::path& path) {
     }
 
     if (starts_with(bytes, kBmpSignature)) {
-#if defined(TEXTFABRIC_HAVE_STB)
+#if defined(DOCWEFT_HAVE_STB)
         return decode_via_stb(bytes, "BMP");
 #else
         throw_missing_decoder(path, "BMP", "stb_image");
@@ -347,7 +347,7 @@ PngBuffer load_as_png(const std::filesystem::path& path) {
     }
 
     if (starts_with(bytes, kTiffLeSig) || starts_with(bytes, kTiffBeSig)) {
-#if defined(TEXTFABRIC_HAVE_TIFF) && defined(TEXTFABRIC_HAVE_STB)
+#if defined(DOCWEFT_HAVE_TIFF) && defined(DOCWEFT_HAVE_STB)
         return decode_via_libtiff(bytes);
 #else
         throw_missing_decoder(path, "TIFF", "libtiff + stb_image_write");
@@ -359,4 +359,4 @@ PngBuffer load_as_png(const std::filesystem::path& path) {
         fmt::format("unrecognised image format: {}", path.string()));
 }
 
-} // namespace textfabric::docx
+} // namespace docweft::docx

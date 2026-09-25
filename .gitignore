@@ -25,7 +25,7 @@ _deps/
 CMakeUserPresets.json
 
 # Generated export header (emitted into build dir, but just in case)
-textfabric/export.h
+docweft/export.h
 
 # Ninja
 .ninja_deps

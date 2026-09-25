@@ -1,9 +1,9 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(TextFabric
+project(DocWeft
     VERSION 0.1.0
     DESCRIPTION "Cross-platform library for DOCX template manipulation"
-    HOMEPAGE_URL "https://github.com/yourusername/TextFabric"
+    HOMEPAGE_URL "https://github.com/uvva/docweft"
     LANGUAGES CXX
 )
 
@@ -24,23 +24,23 @@ endif()
 # ============================================================
 # Options
 # ============================================================
-option(TEXTFABRIC_BUILD_TESTS    "Build the test suite"               ON)
-option(TEXTFABRIC_BUILD_EXAMPLES "Build example programs"             OFF)
-option(TEXTFABRIC_BUILD_SHARED   "Build as shared library"            OFF)
-option(TEXTFABRIC_USE_FETCHCONTENT "Fall back to FetchContent for deps not found via find_package" ON)
-option(TEXTFABRIC_ENABLE_NATIVE_PDF "Native OOXML->PDF rendering via PoDoFo, no Microsoft Word/LibreOffice required (see PLAN.md)" OFF)
-option(TEXTFABRIC_ENABLE_REMOTE_CONVERTER "HTTP converter fallback (Gotenberg-compatible endpoint from TEXTFABRIC_CONVERTER_URL, via the curl CLI)" OFF)
+option(DOCWEFT_BUILD_TESTS    "Build the test suite"               ON)
+option(DOCWEFT_BUILD_EXAMPLES "Build example programs"             OFF)
+option(DOCWEFT_BUILD_SHARED   "Build as shared library"            OFF)
+option(DOCWEFT_USE_FETCHCONTENT "Fall back to FetchContent for deps not found via find_package" ON)
+option(DOCWEFT_ENABLE_NATIVE_PDF "Native OOXML->PDF rendering via PoDoFo, no Microsoft Word/LibreOffice required (see PLAN.md)" OFF)
+option(DOCWEFT_ENABLE_REMOTE_CONVERTER "HTTP converter fallback (Gotenberg-compatible endpoint from DOCWEFT_CONVERTER_URL, via the curl CLI)" OFF)
 
 # ============================================================
 # Platform diagnostics
 # ============================================================
 if(WIN32)
-    message(STATUS "[TextFabric] Platform: Windows — use vcpkg toolchain")
+    message(STATUS "[DocWeft] Platform: Windows — use vcpkg toolchain")
     message(STATUS "  cmake -B build -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake")
 elseif(APPLE)
-    message(STATUS "[TextFabric] Platform: macOS — use vcpkg or Homebrew")
+    message(STATUS "[DocWeft] Platform: macOS — use vcpkg or Homebrew")
 elseif(UNIX)
-    message(STATUS "[TextFabric] Platform: Linux — use Nix dev shell (flake.nix) or system packages")
+    message(STATUS "[DocWeft] Platform: Linux — use Nix dev shell (flake.nix) or system packages")
 endif()
 
 # ============================================================
@@ -54,13 +54,13 @@ include(cmake/CompilerOptions.cmake)
 # ============================================================
 # Library target
 # ============================================================
-if(TEXTFABRIC_BUILD_SHARED)
-    add_library(textfabric SHARED)
+if(DOCWEFT_BUILD_SHARED)
+    add_library(docweft SHARED)
 else()
-    add_library(textfabric STATIC)
+    add_library(docweft STATIC)
 endif()
 
-add_library(TextFabric::textfabric ALIAS textfabric)
+add_library(DocWeft::docweft ALIAS docweft)
 
 # stb_image / libtiff are third-party C decoders that have crashed (not
 # thrown) on malformed/corrupt input in the field — a hardware exception
@@ -74,9 +74,9 @@ if(MSVC)
     set_source_files_properties(src/docx/image.cpp PROPERTIES COMPILE_OPTIONS /EHa)
 endif()
 
-target_sources(textfabric
+target_sources(docweft
     PRIVATE
-        src/textfabric.cpp
+        src/docweft.cpp
         src/error.cpp
         src/docx/merger.cpp
         src/docx/image.cpp
@@ -86,7 +86,7 @@ target_sources(textfabric
         src/template/engine.cpp
 )
 
-target_include_directories(textfabric
+target_include_directories(docweft
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
@@ -115,7 +115,7 @@ set(_tf_optional_deps
 foreach(_dep IN LISTS _tf_required_deps)
     if(NOT TARGET ${_dep})
         message(FATAL_ERROR "Required dependency target '${_dep}' not found. "
-                            "Enable TEXTFABRIC_USE_FETCHCONTENT=ON or install via vcpkg/Nix.")
+                            "Enable DOCWEFT_USE_FETCHCONTENT=ON or install via vcpkg/Nix.")
     endif()
 endforeach()
 
@@ -126,7 +126,7 @@ foreach(_dep IN LISTS _tf_optional_deps)
     endif()
 endforeach()
 
-target_link_libraries(textfabric
+target_link_libraries(docweft
     PUBLIC
         # nothing public-facing yet — keep the ABI clean
     PRIVATE
@@ -137,24 +137,24 @@ target_link_libraries(textfabric
 # Feature-flag the optional decoders. stb is included via BUILD_INTERFACE so
 # it never leaks into the installed consumer's include paths; libtiff is linked
 # normally (its CMake target properly propagates through install).
-if(TEXTFABRIC_HAVE_STB)
-    target_include_directories(textfabric
-        PRIVATE $<BUILD_INTERFACE:${TEXTFABRIC_STB_INCLUDE_DIR}>)
-    target_compile_definitions(textfabric PRIVATE TEXTFABRIC_HAVE_STB=1)
+if(DOCWEFT_HAVE_STB)
+    target_include_directories(docweft
+        PRIVATE $<BUILD_INTERFACE:${DOCWEFT_STB_INCLUDE_DIR}>)
+    target_compile_definitions(docweft PRIVATE DOCWEFT_HAVE_STB=1)
 endif()
 if(TARGET TIFF::TIFF)
-    target_compile_definitions(textfabric PRIVATE TEXTFABRIC_HAVE_TIFF=1)
+    target_compile_definitions(docweft PRIVATE DOCWEFT_HAVE_TIFF=1)
 endif()
 if(TARGET podofo::podofo)
-    target_compile_definitions(textfabric PRIVATE TEXTFABRIC_HAVE_PODOFO=1)
+    target_compile_definitions(docweft PRIVATE DOCWEFT_HAVE_PODOFO=1)
 endif()
-if(TEXTFABRIC_ENABLE_REMOTE_CONVERTER)
-    target_compile_definitions(textfabric PRIVATE TEXTFABRIC_HAVE_REMOTE_CONVERTER=1)
+if(DOCWEFT_ENABLE_REMOTE_CONVERTER)
+    target_compile_definitions(docweft PRIVATE DOCWEFT_HAVE_REMOTE_CONVERTER=1)
 endif()
 
-textfabric_apply_compiler_options(textfabric)
+docweft_apply_compiler_options(docweft)
 
-set_target_properties(textfabric PROPERTIES
+set_target_properties(docweft PROPERTIES
     VERSION   ${PROJECT_VERSION}
     SOVERSION ${PROJECT_VERSION_MAJOR}
 )
@@ -163,9 +163,9 @@ set_target_properties(textfabric PROPERTIES
 # Internal static twin (for tests that need access to internal symbols).
 # Only built when building SHARED — otherwise the main target is already STATIC.
 # ============================================================
-if(TEXTFABRIC_BUILD_SHARED AND TEXTFABRIC_BUILD_TESTS)
-    add_library(textfabric_internal STATIC
-        src/textfabric.cpp
+if(DOCWEFT_BUILD_SHARED AND DOCWEFT_BUILD_TESTS)
+    add_library(docweft_internal STATIC
+        src/docweft.cpp
         src/error.cpp
         src/docx/merger.cpp
         src/docx/image.cpp
@@ -174,9 +174,9 @@ if(TEXTFABRIC_BUILD_SHARED AND TEXTFABRIC_BUILD_TESTS)
         src/docx/writer.cpp
         src/template/engine.cpp
     )
-    add_library(TextFabric::textfabric_internal ALIAS textfabric_internal)
+    add_library(DocWeft::docweft_internal ALIAS docweft_internal)
 
-    target_include_directories(textfabric_internal
+    target_include_directories(docweft_internal
         PUBLIC
             $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
             $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/export>
@@ -184,32 +184,32 @@ if(TEXTFABRIC_BUILD_SHARED AND TEXTFABRIC_BUILD_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/src
     )
     # STATIC ⇒ macro expansions are empty ⇒ all symbols are visible.
-    target_compile_definitions(textfabric_internal PUBLIC TEXTFABRIC_STATIC_DEFINE)
+    target_compile_definitions(docweft_internal PUBLIC DOCWEFT_STATIC_DEFINE)
 
-    target_link_libraries(textfabric_internal
+    target_link_libraries(docweft_internal
         PUBLIC
             ${_tf_required_deps}
             ${_tf_optional_resolved}
     )
     # Same HAVE_* propagation as the main target. PUBLIC here so the test TU
-    # that links textfabric_internal also sees these flags — the BMP/TIFF
-    # test cases need TEXTFABRIC_HAVE_STB at compile time.
-    if(TEXTFABRIC_HAVE_STB)
-        target_include_directories(textfabric_internal
-            PUBLIC $<BUILD_INTERFACE:${TEXTFABRIC_STB_INCLUDE_DIR}>)
-        target_compile_definitions(textfabric_internal PUBLIC TEXTFABRIC_HAVE_STB=1)
+    # that links docweft_internal also sees these flags — the BMP/TIFF
+    # test cases need DOCWEFT_HAVE_STB at compile time.
+    if(DOCWEFT_HAVE_STB)
+        target_include_directories(docweft_internal
+            PUBLIC $<BUILD_INTERFACE:${DOCWEFT_STB_INCLUDE_DIR}>)
+        target_compile_definitions(docweft_internal PUBLIC DOCWEFT_HAVE_STB=1)
     endif()
     if(TARGET TIFF::TIFF)
-        target_compile_definitions(textfabric_internal PUBLIC TEXTFABRIC_HAVE_TIFF=1)
+        target_compile_definitions(docweft_internal PUBLIC DOCWEFT_HAVE_TIFF=1)
     endif()
     if(TARGET podofo::podofo)
-        target_compile_definitions(textfabric_internal PUBLIC TEXTFABRIC_HAVE_PODOFO=1)
+        target_compile_definitions(docweft_internal PUBLIC DOCWEFT_HAVE_PODOFO=1)
     endif()
-    if(TEXTFABRIC_ENABLE_REMOTE_CONVERTER)
-        target_compile_definitions(textfabric_internal PUBLIC TEXTFABRIC_HAVE_REMOTE_CONVERTER=1)
+    if(DOCWEFT_ENABLE_REMOTE_CONVERTER)
+        target_compile_definitions(docweft_internal PUBLIC DOCWEFT_HAVE_REMOTE_CONVERTER=1)
     endif()
 
-    set_target_properties(textfabric_internal PROPERTIES
+    set_target_properties(docweft_internal PROPERTIES
         POSITION_INDEPENDENT_CODE ON
     )
 endif()
@@ -217,7 +217,7 @@ endif()
 # ============================================================
 # Tests
 # ============================================================
-if(TEXTFABRIC_BUILD_TESTS)
+if(DOCWEFT_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
 endif()
@@ -225,7 +225,7 @@ endif()
 # ============================================================
 # Examples
 # ============================================================
-if(TEXTFABRIC_BUILD_EXAMPLES)
+if(DOCWEFT_BUILD_EXAMPLES)
     add_subdirectory(examples)
 endif()
 
@@ -235,7 +235,7 @@ endif()
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
-# On a Windows SHARED build `textfabric.dll` links privately against fmt.dll,
+# On a Windows SHARED build `docweft.dll` links privately against fmt.dll,
 # pugixml.dll, tiff.dll, zlib1.dll, libzip.dll, etc. — `cmake --install` needs
 # to copy those alongside our own DLL so the installed prefix is self-contained.
 # RUNTIME_DEPENDENCIES (CMake 3.21+) scans the binary for imports and resolves
@@ -253,17 +253,17 @@ include(CMakePackageConfigHelpers)
 # installed by <port>" ownership conflicts. There's no "resolve but don't
 # copy" flag, so not entering this block is the only correct fix.
 set(_tf_runtime_deps "")
-if(WIN32 AND TEXTFABRIC_BUILD_SHARED AND NOT VCPKG_TOOLCHAIN)
+if(WIN32 AND DOCWEFT_BUILD_SHARED AND NOT VCPKG_TOOLCHAIN)
     set(_tf_runtime_deps
         RUNTIME_DEPENDENCIES
             PRE_EXCLUDE_REGEXES  "api-ms-.*" "ext-ms-.*"
             POST_EXCLUDE_REGEXES ".*[Ss]ystem32.*" ".*SYSWOW64.*"
-            DIRECTORIES          "$<TARGET_FILE_DIR:textfabric>"
+            DIRECTORIES          "$<TARGET_FILE_DIR:docweft>"
     )
 endif()
 
-install(TARGETS textfabric
-    EXPORT   TextFabricTargets
+install(TARGETS docweft
+    EXPORT   DocWeftTargets
     ${_tf_runtime_deps}
     ARCHIVE  DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT Development
     LIBRARY  DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT Runtime
@@ -280,43 +280,43 @@ install(DIRECTORY include/
 
 # Auto-generated export header. GenerateExportHeader writes it into the build
 # dir only; without this install step every consumer gets a compile error on
-# `#include "textfabric/export.h"` (used by merger.hpp / error.hpp /
-# textfabric.hpp for the TEXTFABRIC_API dllexport macro).
-install(FILES "${CMAKE_CURRENT_BINARY_DIR}/export/textfabric/export.h"
-    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/textfabric
+# `#include "docweft/export.h"` (used by merger.hpp / error.hpp /
+# docweft.hpp for the DOCWEFT_API dllexport macro).
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/export/docweft/export.h"
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/docweft
     COMPONENT   Development
 )
 
-install(EXPORT TextFabricTargets
-    FILE        TextFabricTargets.cmake
-    NAMESPACE   TextFabric::
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/TextFabric
+install(EXPORT DocWeftTargets
+    FILE        DocWeftTargets.cmake
+    NAMESPACE   DocWeft::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/DocWeft
     COMPONENT   Development
 )
 
 configure_package_config_file(
-    cmake/TextFabricConfig.cmake.in
-    ${CMAKE_CURRENT_BINARY_DIR}/TextFabricConfig.cmake
-    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/TextFabric
+    cmake/DocWeftConfig.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/DocWeftConfig.cmake
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/DocWeft
 )
 
 write_basic_package_version_file(
-    ${CMAKE_CURRENT_BINARY_DIR}/TextFabricConfigVersion.cmake
+    ${CMAKE_CURRENT_BINARY_DIR}/DocWeftConfigVersion.cmake
     VERSION       ${PROJECT_VERSION}
     COMPATIBILITY SameMajorVersion
 )
 
 install(FILES
-    ${CMAKE_CURRENT_BINARY_DIR}/TextFabricConfig.cmake
-    ${CMAKE_CURRENT_BINARY_DIR}/TextFabricConfigVersion.cmake
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/TextFabric
+    ${CMAKE_CURRENT_BINARY_DIR}/DocWeftConfig.cmake
+    ${CMAKE_CURRENT_BINARY_DIR}/DocWeftConfigVersion.cmake
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/DocWeft
     COMPONENT   Development
 )
 
-# Build-tree export: projects pulling TextFabric via add_subdirectory() or
-# FetchContent can call find_package(TextFabric) against the build dir without
+# Build-tree export: projects pulling DocWeft via add_subdirectory() or
+# FetchContent can call find_package(DocWeft) against the build dir without
 # installing first.
-export(EXPORT TextFabricTargets
-    FILE      "${CMAKE_CURRENT_BINARY_DIR}/TextFabricTargets.cmake"
-    NAMESPACE TextFabric::
+export(EXPORT DocWeftTargets
+    FILE      "${CMAKE_CURRENT_BINARY_DIR}/DocWeftTargets.cmake"
+    NAMESPACE DocWeft::
 )

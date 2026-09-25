@@ -10,9 +10,9 @@
       "binaryDir": "${sourceDir}/build/${presetName}",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE":              "Release",
-        "TEXTFABRIC_BUILD_SHARED":       "ON",
-        "TEXTFABRIC_BUILD_TESTS":        "ON",
-        "TEXTFABRIC_USE_FETCHCONTENT":   "ON"
+        "DOCWEFT_BUILD_SHARED":       "ON",
+        "DOCWEFT_BUILD_TESTS":        "ON",
+        "DOCWEFT_USE_FETCHCONTENT":   "ON"
       }
     },
 
@@ -43,7 +43,7 @@
       "cacheVariables": {
         "CMAKE_TOOLCHAIN_FILE":         "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
         "VCPKG_TARGET_TRIPLET":         "x64-windows",
-        "TEXTFABRIC_USE_FETCHCONTENT":  "OFF"
+        "DOCWEFT_USE_FETCHCONTENT":  "OFF"
       },
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
     },
@@ -57,7 +57,7 @@
       "cacheVariables": {
         "CMAKE_TOOLCHAIN_FILE":         "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
         "VCPKG_TARGET_TRIPLET":         "x86-windows",
-        "TEXTFABRIC_USE_FETCHCONTENT":  "OFF"
+        "DOCWEFT_USE_FETCHCONTENT":  "OFF"
       },
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
     },

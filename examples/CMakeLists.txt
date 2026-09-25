@@ -1,13 +1,13 @@
 # examples/CMakeLists.txt
-# Two small binaries that show how to consume the TextFabric library.
+# Two small binaries that show how to consume the DocWeft library.
 
-# ── generate_template — uses libzip directly (no textfabric dependency) ────
+# ── generate_template — uses libzip directly (no docweft dependency) ────
 add_executable(generate_template generate_template.cpp)
 target_link_libraries(generate_template PRIVATE libzip::zip)
 
-# ── basic_report — uses the textfabric public API only ────────────────────
+# ── basic_report — uses the docweft public API only ────────────────────
 add_executable(basic_report basic_report.cpp)
-target_link_libraries(basic_report PRIVATE TextFabric::textfabric)
+target_link_libraries(basic_report PRIVATE DocWeft::docweft)
 
 set(_tf_example_targets generate_template basic_report)
 
@@ -17,9 +17,9 @@ set(_tf_example_targets generate_template basic_report)
 # PLAN.md — since the whole point of the example is exercising that path;
 # without it, save() would just throw NoConverter once the demo disables
 # LibreOffice detection.
-if(TEXTFABRIC_HAVE_PODOFO)
+if(DOCWEFT_HAVE_PODOFO)
     add_executable(native_pdf_report native_pdf_report.cpp)
-    target_link_libraries(native_pdf_report PRIVATE TextFabric::textfabric libzip::zip)
+    target_link_libraries(native_pdf_report PRIVATE DocWeft::docweft libzip::zip)
     list(APPEND _tf_example_targets native_pdf_report)
 endif()
 
@@ -29,10 +29,10 @@ set_target_properties(${_tf_example_targets} PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
 )
 
-# ── Windows: copy textfabric.dll (and its transitive runtime DLLs) ────────
+# ── Windows: copy docweft.dll (and its transitive runtime DLLs) ────────
 # next to every example executable so they run out-of-the-box without
 # touching PATH. No-op on Linux/macOS: rpath handles shared-lib lookup there.
-if(WIN32 AND TEXTFABRIC_BUILD_SHARED)
+if(WIN32 AND DOCWEFT_BUILD_SHARED)
     set(_tf_dll_copy_targets basic_report)
     if(TARGET native_pdf_report)
         list(APPEND _tf_dll_copy_targets native_pdf_report)

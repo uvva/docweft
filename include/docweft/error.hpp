@@ -1,12 +1,12 @@
 #pragma once
 
-#include "textfabric/export.h"
+#include "docweft/export.h"
 
 #include <stdexcept>
 #include <string>
 #include <string_view>
 
-namespace textfabric {
+namespace docweft {
 
 /// Error codes returned across the library boundary.
 /// Values are stable; new codes append at the end.
@@ -22,11 +22,11 @@ enum class ReportError : int {
     Unknown               = 99,
 };
 
-[[nodiscard]] TEXTFABRIC_API std::string_view to_string(ReportError e) noexcept;
+[[nodiscard]] DOCWEFT_API std::string_view to_string(ReportError e) noexcept;
 
 /// Exception thrown across the library boundary.
 /// External code should catch this and translate to its own error type.
-class TEXTFABRIC_API ReportException : public std::runtime_error {
+class DOCWEFT_API ReportException : public std::runtime_error {
 public:
     ReportException(ReportError code, std::string msg)
         : std::runtime_error(std::move(msg))
@@ -38,4 +38,4 @@ private:
     ReportError code_;
 };
 
-} // namespace textfabric
+} // namespace docweft

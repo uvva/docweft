@@ -1,6 +1,6 @@
-#include "textfabric/docx/writer.hpp"
+#include "docweft/docx/writer.hpp"
 
-namespace textfabric::docx {
+namespace docweft::docx {
 
 Writer::Writer(const std::filesystem::path& output_path)
     : path_(output_path) {}
@@ -14,4 +14,4 @@ bool Writer::set_document_xml([[maybe_unused]] std::string_view xml) {
     return false;
 }
 
-} // namespace textfabric::docx
+} // namespace docweft::docx

@@ -1,4 +1,4 @@
-# Building TextFabric on Windows
+# Building DocWeft on Windows
 
 Пошаговый гайд: полная сборка + тесты + пример (`basic_report.exe` + `template.docx` + `report.docx`), идентичная тому, что уже проверено на Linux.
 
@@ -43,8 +43,8 @@ echo $env:VCPKG_ROOT
 
 ```powershell
 cd C:\src
-git clone <url-репозитория> TextFabric
-cd TextFabric
+git clone <url-репозитория> DocWeft
+cd DocWeft
 ```
 
 ### Вариант A — через CMakePresets (рекомендуется)
@@ -67,20 +67,20 @@ cmake -B build\win-x64 `
   -G "Visual Studio 17 2022" -A x64 `
   -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
   -DVCPKG_TARGET_TRIPLET=x64-windows `
-  -DTEXTFABRIC_BUILD_SHARED=ON `
-  -DTEXTFABRIC_BUILD_TESTS=ON `
-  -DTEXTFABRIC_BUILD_EXAMPLES=ON `
-  -DTEXTFABRIC_USE_FETCHCONTENT=OFF
+  -DDOCWEFT_BUILD_SHARED=ON `
+  -DDOCWEFT_BUILD_TESTS=ON `
+  -DDOCWEFT_BUILD_EXAMPLES=ON `
+  -DDOCWEFT_USE_FETCHCONTENT=OFF
 
 # x86
 cmake -B build\win-x86 `
   -G "Visual Studio 17 2022" -A Win32 `
   -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
   -DVCPKG_TARGET_TRIPLET=x86-windows `
-  -DTEXTFABRIC_BUILD_SHARED=ON `
-  -DTEXTFABRIC_BUILD_TESTS=ON `
-  -DTEXTFABRIC_BUILD_EXAMPLES=ON `
-  -DTEXTFABRIC_USE_FETCHCONTENT=OFF
+  -DDOCWEFT_BUILD_SHARED=ON `
+  -DDOCWEFT_BUILD_TESTS=ON `
+  -DDOCWEFT_BUILD_EXAMPLES=ON `
+  -DDOCWEFT_USE_FETCHCONTENT=OFF
 ```
 
 ---
@@ -103,19 +103,19 @@ cmake --build build\win-x86 --config Release -j
 Артефакты:
 
 ```
-build\win-x64\Release\textfabric.dll         # главная библиотека (SHARED)
-build\win-x64\Release\textfabric.lib         # import-lib для линковки
-build\win-x64\tests\Release\textfabric_tests.exe
+build\win-x64\Release\docweft.dll         # главная библиотека (SHARED)
+build\win-x64\Release\docweft.lib         # import-lib для линковки
+build\win-x64\tests\Release\docweft_tests.exe
 build\win-x64\examples\Release\basic_report.exe
 build\win-x64\examples\Release\generate_template.exe
 build\win-x64\examples\Release\template.docx  ← сгенерирован автоматически
 build\win-x64\examples\Release\logo.png       ← скопирован из examples\logo.png (75 B, 2×2 PNG)
-build\win-x64\examples\Release\textfabric.dll ← скопирован рядом с basic_report.exe
+build\win-x64\examples\Release\docweft.dll ← скопирован рядом с basic_report.exe
 build\win-x64\examples\Release\pugixml.dll    ← транзитивные DLL (если vcpkg-порт shared)
 build\win-x64\examples\Release\zip.dll
 ```
 
-CMake автоматически копирует `textfabric.dll` и все транзитивные runtime-DLL рядом с `basic_report.exe` (см. `examples/CMakeLists.txt`). Ничего руками делать не нужно.
+CMake автоматически копирует `docweft.dll` и все транзитивные runtime-DLL рядом с `basic_report.exe` (см. `examples/CMakeLists.txt`). Ничего руками делать не нужно.
 
 ---
 
@@ -137,7 +137,7 @@ Total Test time (real) =   0.15 sec
 ```
 
 > **Почему тесты не ломаются без PATH'а?**
-> `textfabric_tests.exe` линкуется со *статическим* зеркалом `textfabric_internal.lib` (см. `CMakeLists.txt` §"Internal static twin"). Это сделано специально: тесты нуждаются во внутренних символах (`DocxMerger`, `docx::Reader`), которые SHARED-`textfabric.dll` не экспортирует (`visibility=hidden` + `TEXTFABRIC_API`).
+> `docweft_tests.exe` линкуется со *статическим* зеркалом `docweft_internal.lib` (см. `CMakeLists.txt` §"Internal static twin"). Это сделано специально: тесты нуждаются во внутренних символах (`DocxMerger`, `docx::Reader`), которые SHARED-`docweft.dll` не экспортирует (`visibility=hidden` + `DOCWEFT_API`).
 
 ---
 
@@ -150,7 +150,7 @@ cd build\win-x64\examples\Release
 
 Вывод (если LibreOffice установлен и виден через `PATH` или `C:\Program Files\LibreOffice\program\soffice.exe`):
 ```
-TextFabric v0.1.0
+DocWeft v0.1.0
   template: template.docx
   output:   report.docx
 
@@ -209,11 +209,11 @@ CMAKE_TOOLCHAIN_FILE: C:\vcpkg\scripts\buildsystems\vcpkg.cmake
 
 Это vcpkg собирает зависимости из исходников. Прогресс виден в `build\<preset>\vcpkg-manifest-install.log`. В среднем 15–30 минут первый раз, затем вcpkg кэширует бинарники в `%LOCALAPPDATA%\vcpkg\archives\`.
 
-### `The code execution cannot proceed because textfabric.dll was not found`
+### `The code execution cannot proceed because docweft.dll was not found`
 
 Вы запускаете `basic_report.exe` из другой директории. Либо:
 1. `cd` в папку с exe-файлом (CMake копирует DLL туда автоматически).
-2. Или добавьте путь к `textfabric.dll` в PATH:
+2. Или добавьте путь к `docweft.dll` в PATH:
    ```powershell
    $env:PATH = "build\win-x64\Release;$env:PATH"
    .\build\win-x64\examples\Release\basic_report.exe
@@ -236,7 +236,7 @@ chcp 65001
 | Build | `cmake --build --preset linux-x64` | `cmake --build --preset win-x64-vcpkg` |
 | Test | `ctest --preset linux-x64` | `ctest --preset win-x64-vcpkg` |
 | Run example | `cd build/.../examples && LD_LIBRARY_PATH=.. ./basic_report` | `cd build\...\examples\Release && .\basic_report.exe` |
-| Артефакт либы | `libtextfabric.so.0.1.0` | `textfabric.dll` + `textfabric.lib` |
+| Артефакт либы | `libdocweft.so.0.1.0` | `docweft.dll` + `docweft.lib` |
 | Package manager | Nix / FetchContent | vcpkg |
 | Lookup зависимостей | `rpath` / `LD_LIBRARY_PATH` | PATH / DLL рядом с exe |
 

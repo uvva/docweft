@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="assets/logo.png" alt="TextFabric logo" width="140">
+  <img src="assets/logo.png" alt="DocWeft logo" width="140">
 </p>
 
-<h1 align="center">TextFabric</h1>
+<h1 align="center">DocWeft</h1>
 <p align="center"><b>Fill Word templates by bookmark name — no template engine, no intermediate format.</b></p>
 
 <p align="center">
@@ -14,7 +14,7 @@
 
 Cross-platform C++20 library for filling DOCX templates: text substitution, table row cloning, embedded chart updates, and image insertion — all addressed by named Word bookmarks, with no intermediate format. Optionally converts the result to PDF/HTML via Microsoft Word or LibreOffice.
 
-**Confirmed platforms (v0.1.0):** Linux x86_64 (GCC + Nix) — `ctest` **69/69 ✅**, covering charts, image handling (PNG/JPEG/BMP/TIFF), the PDF/HTML converters, and 3 integration tests against `find_package(TextFabric)` from an install prefix. Windows x64 (MSVC 2022 + vcpkg) — builds and passes the core suite; the JPEG/BMP/TIFF branches are still waiting on a dedicated Windows-host run. Windows x86 and macOS — CMake presets are ready, untested.
+**Confirmed platforms (v0.1.0):** Linux x86_64 (GCC + Nix) — `ctest` **69/69 ✅**, covering charts, image handling (PNG/JPEG/BMP/TIFF), the PDF/HTML converters, and 3 integration tests against `find_package(DocWeft)` from an install prefix. Windows x64 (MSVC 2022 + vcpkg) — builds and passes the core suite; the JPEG/BMP/TIFF branches are still waiting on a dedicated Windows-host run. Windows x86 and macOS — CMake presets are ready, untested.
 
 ## Features
 
@@ -58,22 +58,22 @@ ctest   --preset win-x64-vcpkg
 Consuming from another CMake project:
 
 ```cmake
-find_package(TextFabric 0.1 CONFIG REQUIRED)
-target_link_libraries(my_app PRIVATE TextFabric::textfabric)
+find_package(DocWeft 0.1 CONFIG REQUIRED)
+target_link_libraries(my_app PRIVATE DocWeft::docweft)
 ```
 
 Or via a vcpkg manifest (`vcpkg.json`):
 
 ```json
-{ "dependencies": ["textfabric"] }
+{ "dependencies": ["docweft"] }
 ```
 
 Minimal call:
 
 ```cpp
-#include <textfabric/merger.hpp>
+#include <docweft/merger.hpp>
 
-auto m = textfabric::make_docx_merger();
+auto m = docweft::make_docx_merger();
 m->setCodePage("UTF-8");
 m->load("template.docx");
 m->setClipboardValue("Body.Greeting", "{{name}}", "Alice");
@@ -138,7 +138,7 @@ The on-page size (`<wp:extent cx cy>`) defaults to the source file's pixel dimen
 
 ## API
 
-Full header: [include/textfabric/merger.hpp](include/textfabric/merger.hpp). The factory `textfabric::make_docx_merger()` returns `std::unique_ptr<IReportMerger>`. All strings are UTF-8.
+Full header: [include/docweft/merger.hpp](include/docweft/merger.hpp). The factory `docweft::make_docx_merger()` returns `std::unique_ptr<IReportMerger>`. All strings are UTF-8.
 
 | Method | What it does |
 |---|---|
@@ -161,11 +161,11 @@ Full header: [include/textfabric/merger.hpp](include/textfabric/merger.hpp). The
 See working code in [examples/basic_report.cpp](examples/basic_report.cpp) and the template factory in [examples/generate_template.cpp](examples/generate_template.cpp). Abridged skeleton:
 
 ```cpp
-#include <textfabric/error.hpp>
-#include <textfabric/merger.hpp>
+#include <docweft/error.hpp>
+#include <docweft/merger.hpp>
 
 try {
-    auto m = textfabric::make_docx_merger();
+    auto m = docweft::make_docx_merger();
     m->setCodePage("UTF-8");
     m->load("template.docx");
 
@@ -191,13 +191,13 @@ try {
     // No bounds → displayed size = pixel size. With bounds → aspect-
     // preserving clamp (upscales tiny icons, downscales large photos).
     m->setImage("Body.Logo", "logo.png",
-                textfabric::ImageSize{/*min*/64, 64, /*max*/512, 512});
+                docweft::ImageSize{/*min*/64, 64, /*max*/512, 512});
 
     m->paste("Body.Greeting");
     m->save("report.docx");
 }
-catch (const textfabric::ReportException& e) {
-    std::cerr << textfabric::to_string(e.code()) << ": " << e.what() << "\n";
+catch (const docweft::ReportException& e) {
+    std::cerr << docweft::to_string(e.code()) << ": " << e.what() << "\n";
 }
 ```
 
@@ -224,29 +224,30 @@ Format detection is by magic bytes on the input file, not by extension. The arch
 | Step | Converter | Formats | How |
 |---|---|---|---|
 | 1 | **Microsoft Word** (Windows, macOS) | pdf, html | **Windows:** `reg query HKCR\Word.Application`; conversion through a generated `.vbs` + `cscript //B //Nologo` → `Documents.Open` → `SaveAs2`, headless. **macOS:** `Microsoft Word.app` in `/Applications` or `~/Applications`; conversion through AppleScript (`osascript`) → `open` → `save as`, Word is quit afterwards if it wasn't already running. |
-| 2 | **LibreOffice `soffice`** (all platforms) | pdf, html | `TEXTFABRIC_SOFFICE` env var (absolute path; an empty value disables this branch) → Windows `C:\Program Files[(x86)]\LibreOffice\program\soffice.exe` → macOS `[~]/Applications/LibreOffice.app/Contents/MacOS/soffice` → PATH probe (`soffice --version`). Conversion runs `soffice --headless --convert-to pdf/html --outdir <scratch> <input>`. |
-| 3 | **Native PDF renderer** (PoDoFo) | pdf | Built in with `-DTEXTFABRIC_ENABLE_NATIVE_PDF=ON` (default OFF). Best-effort layout, no external program; see [PLAN.md](PLAN.md) for the supported subset. |
-| 4 | **Remote converter** | pdf | Built in with `-DTEXTFABRIC_ENABLE_REMOTE_CONVERTER=ON` (default OFF) and active only when `TEXTFABRIC_CONVERTER_URL` is set — there is no default endpoint. Sends a multipart POST with the `.docx` in the `files` field and expects PDF bytes back ([Gotenberg](https://gotenberg.dev)'s `/forms/libreoffice/convert` contract), using the `curl` command-line tool. |
+| 2 | **LibreOffice `soffice`** (all platforms) | pdf, html | `DOCWEFT_SOFFICE` env var (absolute path; an empty value disables this branch) → Windows `C:\Program Files[(x86)]\LibreOffice\program\soffice.exe` → macOS `[~]/Applications/LibreOffice.app/Contents/MacOS/soffice` → PATH probe (`soffice --version`). Conversion runs `soffice --headless --convert-to pdf/html --outdir <scratch> <input>`. |
+| 3 | **Native PDF renderer** (PoDoFo) | pdf | Built in with `-DDOCWEFT_ENABLE_NATIVE_PDF=ON` (default OFF). Best-effort layout, no external program; see [PLAN.md](PLAN.md) for the supported subset. |
+| 4 | **Remote converter** | pdf | Built in with `-DDOCWEFT_ENABLE_REMOTE_CONVERTER=ON` (default OFF) and active only when `DOCWEFT_CONVERTER_URL` is set — there is no default endpoint. Sends a multipart POST with the `.docx` in the `files` field and expects PDF bytes back ([Gotenberg](https://gotenberg.dev)'s `/forms/libreoffice/convert` contract), using the `curl` command-line tool. |
 | — | nothing available | | `ReportError::NoConverter`; the message lists each converter and why it was skipped. If converters were available but all of them failed — `SaveFailed` with each failure listed (or that converter's own code when only one was tried). |
 
 Environment variables:
 
 | Name | Effect |
 |---|---|
-| `TEXTFABRIC_DISABLE_CONVERTERS=1` | Master switch: the whole chain is off, `save("*.pdf")` → `NoConverter`. Used by tests. |
-| `TEXTFABRIC_NO_MSWORD=1` | Skips the Word branch (Windows and macOS). Useful when Word is installed but you need LibreOffice-compatible rendering. |
-| `TEXTFABRIC_SOFFICE=<path>` | If set non-empty — use only this binary as LibreOffice, skipping PATH/Program Files/app bundle lookups. If set empty — disable the LibreOffice branch entirely. |
-| `TEXTFABRIC_CONVERTER_URL=<url>` | Remote converter endpoint, e.g. `http://localhost:3000/forms/libreoffice/convert`. |
-| `TEXTFABRIC_CONVERTER_TOKEN=<token>` | Optional; sent as `Authorization: Bearer <token>`. Passed to curl through a config file, never on the command line, and never included in error messages. |
-| `TEXTFABRIC_CONVERTER_TIMEOUT=<seconds>` | Remote request timeout, default 120. |
+| `DOCWEFT_DISABLE_CONVERTERS=1` | Master switch: the whole chain is off, `save("*.pdf")` → `NoConverter`. Used by tests. |
+| `DOCWEFT_NO_MSWORD=1` | Skips the Word branch (Windows and macOS). Useful when Word is installed but you need LibreOffice-compatible rendering. |
+| `DOCWEFT_SOFFICE=<path>` | If set non-empty — use only this binary as LibreOffice, skipping PATH/Program Files/app bundle lookups. If set empty — disable the LibreOffice branch entirely. |
+| `DOCWEFT_SOFFICE_TIMEOUT=<seconds>` | LibreOffice time limit, default 120. On expiry `soffice` and the processes it started are killed and the chain moves on to the next converter. |
+| `DOCWEFT_CONVERTER_URL=<url>` | Remote converter endpoint, e.g. `http://localhost:3000/forms/libreoffice/convert`. |
+| `DOCWEFT_CONVERTER_TOKEN=<token>` | Optional; sent as `Authorization: Bearer <token>`. Passed to curl through a config file, never on the command line, and never included in error messages. |
+| `DOCWEFT_CONVERTER_TIMEOUT=<seconds>` | Remote request timeout, default 120. |
 
-The MSWord branch is a deliberate trade-off: on workstations with Office installed it produces output identical to what the user sees interactively in Word, without requiring LibreOffice alongside it. The cost is a possible rendering difference between machines with and without Word; for scenarios where cross-platform rendering parity matters, set `TEXTFABRIC_NO_MSWORD=1` and deploy LibreOffice everywhere.
+The MSWord branch is a deliberate trade-off: on workstations with Office installed it produces output identical to what the user sees interactively in Word, without requiring LibreOffice alongside it. The cost is a possible rendering difference between machines with and without Word; for scenarios where cross-platform rendering parity matters, set `DOCWEFT_NO_MSWORD=1` and deploy LibreOffice everywhere.
 
 On macOS the first conversion through Word shows the system prompt allowing your app to control Microsoft Word (Automation). If it's denied, the Word step fails with a hint to allow it in System Settings → Privacy & Security → Automation, and the chain moves on to LibreOffice. Your app bundle needs `NSAppleEventsUsageDescription` in `Info.plist`, and under hardened runtime the `com.apple.security.automation.apple-events` entitlement — without them macOS rejects the request silently. Word is sandboxed, so it may also ask once to grant access to the temp folder.
 
 ## Error Codes
 
-Every exception is a [`textfabric::ReportException`](include/textfabric/error.hpp) carrying a `code()` of type `ReportError`:
+Every exception is a [`docweft::ReportException`](include/docweft/error.hpp) carrying a `code()` of type `ReportError`:
 
 | Code | Thrown when |
 |---|---|
@@ -255,10 +256,10 @@ Every exception is a [`textfabric::ReportException`](include/textfabric/error.hp
 | `InvalidBookmark`      | The bookmark wasn't found; or `setTableRow` targets a bookmark outside a `<w:tr>` |
 | `InvalidField`         | The placeholder is missing from the bookmark; or `rows[i].size() != fields.size()` |
 | `SaveFailed`           | An unrecognized extension was passed to `save()`, or the zip write failed |
-| `NoConverter`          | No conversion tool is available for `save("*.pdf")` / `save("*.html")` — see [PDF / HTML export](#pdf--html-export). Fix: install MS Word (Windows/macOS) or LibreOffice, set `TEXTFABRIC_SOFFICE=/abs/path/to/soffice`, build with the native/remote converter (PDF only), or unset `TEXTFABRIC_DISABLE_CONVERTERS`. |
+| `NoConverter`          | No conversion tool is available for `save("*.pdf")` / `save("*.html")` — see [PDF / HTML export](#pdf--html-export). Fix: install MS Word (Windows/macOS) or LibreOffice, set `DOCWEFT_SOFFICE=/abs/path/to/soffice`, build with the native/remote converter (PDF only), or unset `DOCWEFT_DISABLE_CONVERTERS`. |
 | `NotImplemented`       | The scenario isn't supported by the current implementation: `setCodePage(≠ "UTF-8")`; `setChartValue` on a scatter/bubble/stock/surface chart; JPEG/BMP/TIFF in `setImage` when the library was built without stb_image/libtiff. |
 
-`textfabric::to_string(ReportError)` returns the code's name — handy for logs and user-facing messages.
+`docweft::to_string(ReportError)` returns the code's name — handy for logs and user-facing messages.
 
 ---
 

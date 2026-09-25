@@ -2,9 +2,9 @@
 # Applies compiler warnings and hardening flags per target.
 #
 # Usage:
-#   textfabric_apply_compiler_options(<target>)
+#   docweft_apply_compiler_options(<target>)
 
-function(textfabric_apply_compiler_options target)
+function(docweft_apply_compiler_options target)
     # ── MSVC (Windows) ───────────────────────────────────────────────────────
     if(MSVC)
         target_compile_options(${target} PRIVATE
@@ -59,14 +59,14 @@ function(textfabric_apply_compiler_options target)
     endif()
 
     # ── Export header (works for both STATIC and SHARED) ─────────────────────
-    # When STATIC: TEXTFABRIC_STATIC_DEFINE is added → TEXTFABRIC_API is empty.
-    # When SHARED: TEXTFABRIC_API expands to __declspec(dllexport/dllimport)
+    # When STATIC: DOCWEFT_STATIC_DEFINE is added → DOCWEFT_API is empty.
+    # When SHARED: DOCWEFT_API expands to __declspec(dllexport/dllimport)
     #              on Windows, __attribute__((visibility("default"))) elsewhere.
     include(GenerateExportHeader)
     generate_export_header(${target}
-        EXPORT_MACRO_NAME     TEXTFABRIC_API
-        EXPORT_FILE_NAME      ${CMAKE_CURRENT_BINARY_DIR}/export/textfabric/export.h
-        DEPRECATED_MACRO_NAME TEXTFABRIC_DEPRECATED
+        EXPORT_MACRO_NAME     DOCWEFT_API
+        EXPORT_FILE_NAME      ${CMAKE_CURRENT_BINARY_DIR}/export/docweft/export.h
+        DEPRECATED_MACRO_NAME DOCWEFT_DEPRECATED
     )
     target_include_directories(${target} PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/export>
@@ -76,11 +76,11 @@ function(textfabric_apply_compiler_options target)
     # Signal STATIC-builds to the macro machinery.
     get_target_property(_tf_type ${target} TYPE)
     if(_tf_type STREQUAL "STATIC_LIBRARY")
-        target_compile_definitions(${target} PUBLIC TEXTFABRIC_STATIC_DEFINE)
+        target_compile_definitions(${target} PUBLIC DOCWEFT_STATIC_DEFINE)
     endif()
 
     # ── Default-hidden visibility for SHARED builds (Linux/macOS) ────────────
-    # Only explicitly TEXTFABRIC_API-annotated symbols get exported.
+    # Only explicitly DOCWEFT_API-annotated symbols get exported.
     # Matches the dllexport-on-demand behavior of Windows.
     set_target_properties(${target} PROPERTIES
         CXX_VISIBILITY_PRESET    hidden

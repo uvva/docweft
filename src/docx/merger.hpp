@@ -1,6 +1,6 @@
 #pragma once
 
-#include "textfabric/merger.hpp"
+#include "docweft/merger.hpp"
 
 #include <pugixml.hpp>
 
@@ -10,7 +10,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace textfabric::docx {
+namespace docweft::docx {
 
 /// Name of the main document part inside every .docx archive.
 inline constexpr const char* kDocumentPart = "word/document.xml";
@@ -106,4 +106,4 @@ private:
     [[nodiscard]] std::string locate_chart_part(const std::string& bookmark) const;
 };
 
-} // namespace textfabric::docx
+} // namespace docweft::docx

@@ -1,7 +1,7 @@
 #include "docx/merger.hpp"
 #include "docx/image.hpp"
 #include "docx/pdf_native.hpp"
-#include "textfabric/error.hpp"
+#include "docweft/error.hpp"
 
 #include <zip.h>
 
@@ -18,9 +18,25 @@
 #include <limits>
 #include <regex>
 #include <sstream>
+#include <thread>
 #include <vector>
 
-namespace textfabric::docx {
+#ifdef _WIN32
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#else
+#  include <csignal>
+#  include <fcntl.h>
+#  include <sys/wait.h>
+#  include <unistd.h>
+#endif
+
+namespace docweft::docx {
 
 namespace {
 
@@ -230,32 +246,35 @@ void DocxMerger::write_archive(
 //                 NSAppleEventsUsageDescription (and, under hardened runtime,
 //                 com.apple.security.automation.apple-events).
 //   2. LibreOffice `soffice --headless --convert-to` (all platforms).
-//      Detected via `TEXTFABRIC_SOFFICE` override, Program Files lookups
+//      Detected via `DOCWEFT_SOFFICE` override, Program Files lookups
 //      (Windows), LibreOffice.app bundle lookups (macOS), and finally a
 //      `soffice --version` PATH probe.
 //   3. Native PDF renderer (PoDoFo) — .pdf only; compiled in with
-//      TEXTFABRIC_ENABLE_NATIVE_PDF=ON.
+//      DOCWEFT_ENABLE_NATIVE_PDF=ON.
 //   4. Remote converter — .pdf only; compiled in with
-//      TEXTFABRIC_ENABLE_REMOTE_CONVERTER=ON and active only when
-//      TEXTFABRIC_CONVERTER_URL is set (no default endpoint). Contract is
+//      DOCWEFT_ENABLE_REMOTE_CONVERTER=ON and active only when
+//      DOCWEFT_CONVERTER_URL is set (no default endpoint). Contract is
 //      Gotenberg's LibreOffice route: multipart POST with the .docx in the
 //      `files` field, PDF bytes in the response body. Sent with the `curl`
 //      CLI.
 //
 // Env overrides:
-//   TEXTFABRIC_DISABLE_CONVERTERS — any non-empty value disables the whole
-//                                   chain. Used by tests to assert the
-//                                   NoConverter path.
-//   TEXTFABRIC_NO_MSWORD          — any non-empty value skips Word.
-//   TEXTFABRIC_SOFFICE            — absolute path to soffice. If set non-empty
-//                                   it is used as-is (no other LibreOffice
-//                                   probe). Empty value disables the
-//                                   LibreOffice branch entirely.
-//   TEXTFABRIC_CONVERTER_URL      — remote converter endpoint, e.g.
-//                                   http://localhost:3000/forms/libreoffice/convert
-//   TEXTFABRIC_CONVERTER_TOKEN    — optional; sent as `Authorization: Bearer`.
-//                                   Never included in error messages.
-//   TEXTFABRIC_CONVERTER_TIMEOUT  — remote request timeout, seconds (default 120).
+//   DOCWEFT_DISABLE_CONVERTERS — any non-empty value disables the whole
+//                                chain. Used by tests to assert the
+//                                NoConverter path.
+//   DOCWEFT_NO_MSWORD          — any non-empty value skips Word.
+//   DOCWEFT_SOFFICE            — absolute path to soffice. If set non-empty
+//                                it is used as-is (no other LibreOffice
+//                                probe). Empty value disables the
+//                                LibreOffice branch entirely.
+//   DOCWEFT_SOFFICE_TIMEOUT    — LibreOffice time limit, seconds (default
+//                                120). On expiry soffice and its child
+//                                processes are killed and the chain moves on.
+//   DOCWEFT_CONVERTER_URL      — remote converter endpoint, e.g.
+//                                http://localhost:3000/forms/libreoffice/convert
+//   DOCWEFT_CONVERTER_TOKEN    — optional; sent as `Authorization: Bearer`.
+//                                Never included in error messages.
+//   DOCWEFT_CONVERTER_TIMEOUT  — remote request timeout, seconds (default 120).
 //
 // If nothing in the chain is available, save() throws `NoConverter` listing
 // why each converter was skipped; if everything available failed, it throws
@@ -283,6 +302,14 @@ const char* converter_label(ConverterKind kind) {
 [[nodiscard]] bool env_nonempty(const char* name) {
     const char* v = std::getenv(name);
     return v != nullptr && *v != '\0';
+}
+
+// Positive number of seconds from env var `name`, or `fallback` when unset
+// or not a number.
+[[nodiscard]] int env_seconds(const char* name, int fallback) {
+    const char* v = std::getenv(name);
+    if (v == nullptr) return fallback;
+    try { return std::max(1, std::stoi(v)); } catch (...) { return fallback; }
 }
 
 #ifdef __APPLE__
@@ -315,7 +342,7 @@ const char* converter_label(ConverterKind kind) {
 
 // soffice to run, or empty when LibreOffice is not found / disabled.
 [[nodiscard]] std::string find_soffice() {
-    const char* const override_path = std::getenv("TEXTFABRIC_SOFFICE");
+    const char* const override_path = std::getenv("DOCWEFT_SOFFICE");
     if (override_path != nullptr) {
         if (*override_path == '\0') return {};  // explicit opt-out
         if (std::filesystem::exists(override_path)) return override_path;
@@ -359,17 +386,17 @@ struct ConverterChain {
 ConverterChain find_converters(const std::string& format) {
     (void)format;  // only consulted by the .pdf-only backends, if compiled in
     ConverterChain chain;
-    if (env_nonempty("TEXTFABRIC_DISABLE_CONVERTERS")) {
+    if (env_nonempty("DOCWEFT_DISABLE_CONVERTERS")) {
         chain.skipped.emplace_back(
-            "all converters: disabled by TEXTFABRIC_DISABLE_CONVERTERS");
+            "all converters: disabled by DOCWEFT_DISABLE_CONVERTERS");
         return chain;
     }
     auto skip = [&](ConverterKind kind, const std::string& why) {
         chain.skipped.push_back(fmt::format("{}: {}", converter_label(kind), why));
     };
 
-    if (env_nonempty("TEXTFABRIC_NO_MSWORD")) {
-        skip(ConverterKind::MSWord, "disabled by TEXTFABRIC_NO_MSWORD");
+    if (env_nonempty("DOCWEFT_NO_MSWORD")) {
+        skip(ConverterKind::MSWord, "disabled by DOCWEFT_NO_MSWORD");
     } else if (std::string word = find_msword(); !word.empty()) {
         chain.available.push_back({ConverterKind::MSWord, std::move(word)});
     } else {
@@ -382,35 +409,35 @@ ConverterChain find_converters(const std::string& format) {
 
     if (std::string soffice = find_soffice(); !soffice.empty()) {
         chain.available.push_back({ConverterKind::LibreOffice, std::move(soffice)});
-    } else if (const char* o = std::getenv("TEXTFABRIC_SOFFICE"); o != nullptr) {
+    } else if (const char* o = std::getenv("DOCWEFT_SOFFICE"); o != nullptr) {
         skip(ConverterKind::LibreOffice,
-             *o == '\0' ? "disabled by empty TEXTFABRIC_SOFFICE"
-                        : "TEXTFABRIC_SOFFICE points to a missing file");
+             *o == '\0' ? "disabled by empty DOCWEFT_SOFFICE"
+                        : "DOCWEFT_SOFFICE points to a missing file");
     } else {
         skip(ConverterKind::LibreOffice, "not installed");
     }
 
-#if defined(TEXTFABRIC_HAVE_PODOFO)
+#if defined(DOCWEFT_HAVE_PODOFO)
     if (format == "pdf") {
         chain.available.push_back({ConverterKind::NativePdf, {}});
     } else {
         skip(ConverterKind::NativePdf, "produces .pdf only");
     }
 #else
-    skip(ConverterKind::NativePdf, "not built (TEXTFABRIC_ENABLE_NATIVE_PDF=OFF)");
+    skip(ConverterKind::NativePdf, "not built (DOCWEFT_ENABLE_NATIVE_PDF=OFF)");
 #endif
 
-#if defined(TEXTFABRIC_HAVE_REMOTE_CONVERTER)
+#if defined(DOCWEFT_HAVE_REMOTE_CONVERTER)
     if (format != "pdf") {
         skip(ConverterKind::Remote, "produces .pdf only");
-    } else if (!env_nonempty("TEXTFABRIC_CONVERTER_URL")) {
-        skip(ConverterKind::Remote, "TEXTFABRIC_CONVERTER_URL is not set");
+    } else if (!env_nonempty("DOCWEFT_CONVERTER_URL")) {
+        skip(ConverterKind::Remote, "DOCWEFT_CONVERTER_URL is not set");
     } else {
         chain.available.push_back(
-            {ConverterKind::Remote, std::getenv("TEXTFABRIC_CONVERTER_URL")});
+            {ConverterKind::Remote, std::getenv("DOCWEFT_CONVERTER_URL")});
     }
 #else
-    skip(ConverterKind::Remote, "not built (TEXTFABRIC_ENABLE_REMOTE_CONVERTER=OFF)");
+    skip(ConverterKind::Remote, "not built (DOCWEFT_ENABLE_REMOTE_CONVERTER=OFF)");
 #endif
 
     return chain;
@@ -513,7 +540,7 @@ void add_default_theme(std::unordered_map<std::string, std::string>& parts) {
     pugi::xml_document rels;
     rels.load_buffer(rels_xml.data(), rels_xml.size());
     auto rel = rels.child("Relationships").append_child("Relationship");
-    rel.append_attribute("Id").set_value("rIdTextFabricTheme");
+    rel.append_attribute("Id").set_value("rIdDocWeftTheme");
     rel.append_attribute("Type").set_value(kThemeRelType);
     rel.append_attribute("Target").set_value(part_name.substr(std::strlen("word/")).c_str());
     std::ostringstream rels_out;
@@ -531,6 +558,7 @@ void add_default_theme(std::unordered_map<std::string, std::string>& parts) {
     ct_xml = ct_out.str();
 }
 
+#if defined(_WIN32) || defined(__APPLE__) || defined(DOCWEFT_HAVE_REMOTE_CONVERTER)
 // Minimal shell-safe quoting. Rejects embedded double quotes rather than
 // trying to escape them portably (cmd.exe and POSIX sh have different rules).
 std::string shell_quote(const std::string& s) {
@@ -541,27 +569,180 @@ std::string shell_quote(const std::string& s) {
     }
     return "\"" + s + "\"";
 }
+#endif
+
+// Read the entirety of a file into a string, in binary mode.
+std::string read_file_bytes(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::string((std::istreambuf_iterator<char>(in)),
+                        std::istreambuf_iterator<char>());
+}
+
+// Captured stderr of a converter, trimmed, for error messages.
+std::string read_error_text(const std::filesystem::path& path) {
+    std::string text = read_file_bytes(path);
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) {
+        text.pop_back();
+    }
+    constexpr std::size_t kMaxLen = 500;
+    if (text.size() > kMaxLen) text = text.substr(0, kMaxLen) + "...";
+    return text;
+}
+
+// Outcome of run_with_timeout().
+struct ProcessResult {
+    bool started   = false;
+    bool timed_out = false;
+    int  exit_code = -1;
+};
+
+// Run `args` (args[0] is looked up in PATH) with stdin/stdout on the null
+// device and stderr into `stderr_file`, killing it — together with every
+// process it started — once `timeout` expires. Arguments are passed as
+// paths so they reach the OS in its native encoding (UTF-16 on Windows).
+ProcessResult run_with_timeout(const std::vector<std::filesystem::path>& args,
+                               const std::filesystem::path&              stderr_file,
+                               std::chrono::seconds                      timeout)
+{
+    ProcessResult result;
+#ifdef _WIN32
+    // CommandLineToArgvW quoting: wrap in quotes, double the backslashes
+    // that precede a quote, escape the quote itself.
+    std::wstring cmdline;
+    for (const auto& arg : args) {
+        if (!cmdline.empty()) cmdline += L' ';
+        cmdline += L'"';
+        std::size_t backslashes = 0;
+        for (const wchar_t c : arg.wstring()) {
+            if (c == L'\\') { ++backslashes; continue; }
+            if (c == L'"') cmdline.append(backslashes * 2 + 1, L'\\');
+            else           cmdline.append(backslashes, L'\\');
+            backslashes = 0;
+            cmdline += c;
+        }
+        cmdline.append(backslashes * 2, L'\\');
+        cmdline += L'"';
+    }
+
+    SECURITY_ATTRIBUTES inherit{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
+    HANDLE null_in  = CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                  &inherit, OPEN_EXISTING, 0, nullptr);
+    HANDLE err_out  = CreateFileW(stderr_file.wstring().c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+                                  &inherit, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    // A job object lets a timeout kill soffice.exe and the soffice.bin it
+    // spawns in one go.
+    HANDLE job = CreateJobObjectW(nullptr, nullptr);
+    if (job != nullptr) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits));
+    }
+
+    STARTUPINFOW si{};
+    si.cb         = sizeof(si);
+    si.dwFlags    = STARTF_USESTDHANDLES;
+    si.hStdInput  = null_in;
+    si.hStdOutput = null_in;
+    si.hStdError  = (err_out != INVALID_HANDLE_VALUE) ? err_out : null_in;
+    PROCESS_INFORMATION pi{};
+    if (CreateProcessW(nullptr, cmdline.data(), nullptr, nullptr, TRUE,
+                       CREATE_SUSPENDED | CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        result.started = true;
+        if (job != nullptr) AssignProcessToJobObject(job, pi.hProcess);
+        ResumeThread(pi.hThread);
+        const auto ms = static_cast<DWORD>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(timeout).count());
+        if (WaitForSingleObject(pi.hProcess, ms) == WAIT_TIMEOUT) {
+            result.timed_out = true;
+            if (job != nullptr) TerminateJobObject(job, 1);
+            else                TerminateProcess(pi.hProcess, 1);
+            WaitForSingleObject(pi.hProcess, INFINITE);
+        }
+        DWORD code = 0;
+        GetExitCodeProcess(pi.hProcess, &code);
+        result.exit_code = static_cast<int>(code);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+    if (job != nullptr) CloseHandle(job);
+    if (err_out != INVALID_HANDLE_VALUE) CloseHandle(err_out);
+    if (null_in != INVALID_HANDLE_VALUE) CloseHandle(null_in);
+#else
+    // Everything the child needs is prepared before fork(): only
+    // async-signal-safe calls are allowed between fork() and exec().
+    std::vector<std::string> storage;
+    storage.reserve(args.size());
+    for (const auto& a : args) storage.push_back(a.string());
+    std::vector<char*> argv;
+    for (auto& a : storage) argv.push_back(a.data());
+    argv.push_back(nullptr);
+    const std::string err_path = stderr_file.string();
+
+    const pid_t pid = fork();
+    if (pid < 0) return result;
+    if (pid == 0) {
+        // Own process group, so a timeout can kill soffice and the
+        // soffice.bin it starts together.
+        setpgid(0, 0);
+        const int null_fd = open("/dev/null", O_RDWR);
+        const int err_fd  = open(err_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (null_fd >= 0) { dup2(null_fd, 0); dup2(null_fd, 1); }
+        if (err_fd >= 0) dup2(err_fd, 2);
+        execvp(argv[0], argv.data());
+        _exit(127);
+    }
+    setpgid(pid, pid);  // also from the parent: no race with kill() below
+    result.started = true;
+
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    int status = 0;
+    for (;;) {
+        const pid_t done = waitpid(pid, &status, WNOHANG);
+        if (done == pid) break;
+        if (done < 0) return result;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            result.timed_out = true;
+            kill(-pid, SIGKILL);
+            waitpid(pid, &status, 0);
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    if (!result.timed_out) {
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+    }
+#endif
+    return result;
+}
 
 // Run `soffice --headless --convert-to <format> --outdir <outdir> <input>`.
-// Produces `<outdir>/<input-stem>.<format>`. Returns true on exit-code 0.
-bool run_soffice_conversion(const std::string& soffice,
-                            const std::string& format,  // "pdf" or "html"
-                            const std::filesystem::path& input,
-                            const std::filesystem::path& outdir)
+// Produces `<outdir>/<input-stem>.<format>`. Returns an empty string on
+// success, otherwise the reason. Bounded by DOCWEFT_SOFFICE_TIMEOUT —
+// soffice can hang on a dialog or a stuck profile lock, and save() must not
+// hang with it.
+std::string run_soffice_conversion(const std::string& soffice,
+                                   const std::string& format,  // "pdf" or "html"
+                                   const std::filesystem::path& input,
+                                   const std::filesystem::path& outdir)
 {
-#ifdef _WIN32
-    constexpr const char* kSilence = " >nul 2>nul";
-#else
-    constexpr const char* kSilence = " >/dev/null 2>&1";
-#endif
-    const std::string cmd = fmt::format(
-        "{} --headless --convert-to {} --outdir {} {}{}",
-        shell_quote(soffice),
-        format,
-        shell_quote(outdir.string()),
-        shell_quote(input.string()),
-        kSilence);
-    return std::system(cmd.c_str()) == 0;
+    const int timeout_s = env_seconds("DOCWEFT_SOFFICE_TIMEOUT", 120);
+    const std::filesystem::path err = outdir / "tf_soffice.err";
+    const ProcessResult r = run_with_timeout(
+        {soffice, "--headless", "--convert-to", format, "--outdir", outdir, input},
+        err, std::chrono::seconds(timeout_s));
+
+    if (!r.started) return "could not start soffice";
+    if (r.timed_out) {
+        return fmt::format("soffice did not finish within {} s "
+                           "(DOCWEFT_SOFFICE_TIMEOUT) and was stopped", timeout_s);
+    }
+    if (r.exit_code != 0) {
+        const std::string text = read_error_text(err);
+        return text.empty()
+            ? fmt::format("soffice exited with code {}", r.exit_code)
+            : fmt::format("soffice exited with code {}: {}", r.exit_code, text);
+    }
+    return {};
 }
 
 #ifdef _WIN32
@@ -623,7 +804,7 @@ std::filesystem::path make_scratch_dir() {
     const auto ts = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     auto dir = std::filesystem::temp_directory_path() /
-               fmt::format("textfabric-{}", ts);
+               fmt::format("docweft-{}", ts);
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     return dir;
@@ -672,16 +853,9 @@ std::string base64_encode(const std::string& data) {
     return out;
 }
 
-// Read the entirety of a file into a string, in binary mode.
-std::string read_file_bytes(const std::filesystem::path& path) {
-    std::ifstream in(path, std::ios::binary);
-    return std::string((std::istreambuf_iterator<char>(in)),
-                        std::istreambuf_iterator<char>());
-}
-
 // MIME type to use when embedding `bytes` (the contents of `path`) as a
 // data: URI. `image.hpp`'s detect_format() only recognizes the formats
-// TextFabric can re-encode for DOCX embedding (PNG/JPEG/BMP/TIFF); it
+// DocWeft can re-encode for DOCX embedding (PNG/JPEG/BMP/TIFF); it
 // doesn't know GIF, SVG or WebP, all of which LibreOffice's HTML/chart
 // export can still produce as sibling files. Sniff those separately by
 // magic bytes before falling back to the file extension.
@@ -749,18 +923,6 @@ void inline_sibling_images(const std::filesystem::path& html_path,
     out.write(html.data(), static_cast<std::streamsize>(html.size()));
 }
 
-#if defined(__APPLE__) || defined(TEXTFABRIC_HAVE_REMOTE_CONVERTER)
-// Captured stderr of a converter, trimmed, for error messages.
-std::string read_error_text(const std::filesystem::path& path) {
-    std::string text = read_file_bytes(path);
-    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) {
-        text.pop_back();
-    }
-    constexpr std::size_t kMaxLen = 500;
-    if (text.size() > kMaxLen) text = text.substr(0, kMaxLen) + "...";
-    return text;
-}
-#endif
 
 #ifdef __APPLE__
 // Run Word for Mac via AppleScript. Returns an empty string on success,
@@ -820,7 +982,7 @@ std::string run_msword_mac_conversion(const std::string& format,  // "pdf" or "h
 }
 #endif  // __APPLE__
 
-#if defined(TEXTFABRIC_HAVE_REMOTE_CONVERTER)
+#if defined(DOCWEFT_HAVE_REMOTE_CONVERTER)
 // Quote a value for a curl config file ("..." with backslash escapes).
 std::string curl_config_quote(const std::string& s) {
     std::string out = "\"";
@@ -841,10 +1003,7 @@ std::string run_remote_conversion(const std::string& url,
                                   const std::filesystem::path& input,
                                   const std::filesystem::path& output)
 {
-    int timeout_s = 120;
-    if (const char* t = std::getenv("TEXTFABRIC_CONVERTER_TIMEOUT"); t != nullptr) {
-        try { timeout_s = std::max(1, std::stoi(t)); } catch (...) { /* keep default */ }
-    }
+    const int timeout_s = env_seconds("DOCWEFT_CONVERTER_TIMEOUT", 120);
 
     const std::filesystem::path dir = output.parent_path();
     const std::filesystem::path cfg = dir / "tf_curl.cfg";
@@ -857,7 +1016,7 @@ std::string run_remote_conversion(const std::string& url,
            << "url = " << curl_config_quote(url) << "\n"
            << "form = " << curl_config_quote("files=@" + input.string()) << "\n"
            << "output = " << curl_config_quote(output.string()) << "\n";
-        if (const char* token = std::getenv("TEXTFABRIC_CONVERTER_TOKEN");
+        if (const char* token = std::getenv("DOCWEFT_CONVERTER_TOKEN");
             token != nullptr && *token != '\0') {
             os << "header = "
                << curl_config_quote(std::string("Authorization: Bearer ") + token) << "\n";
@@ -889,7 +1048,7 @@ std::string run_remote_conversion(const std::string& url,
     }
     return {};
 }
-#endif  // TEXTFABRIC_HAVE_REMOTE_CONVERTER
+#endif  // DOCWEFT_HAVE_REMOTE_CONVERTER
 
 } // namespace
 
@@ -966,18 +1125,16 @@ void DocxMerger::save(const std::string& path) {
 #endif
                         break;
                     case ConverterKind::LibreOffice:
-                        if (!run_soffice_conversion(conv.location, conv_format,
-                                                    scratch_docx, outdir)) {
-                            error = "soffice exited with an error";
-                        }
+                        error = run_soffice_conversion(conv.location, conv_format,
+                                                       scratch_docx, outdir);
                         break;
                     case ConverterKind::NativePdf:
-#if defined(TEXTFABRIC_HAVE_PODOFO)
+#if defined(DOCWEFT_HAVE_PODOFO)
                         docx::render_native_pdf(document_, parts_, target);
 #endif
                         break;
                     case ConverterKind::Remote:
-#if defined(TEXTFABRIC_HAVE_REMOTE_CONVERTER)
+#if defined(DOCWEFT_HAVE_REMOTE_CONVERTER)
                         error = run_remote_conversion(conv.location, scratch_docx, target);
 #endif
                         break;
@@ -2345,7 +2502,7 @@ public:
     explicit TempFile(const char* suffix) {
         const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
         path_ = std::filesystem::temp_directory_path() /
-                fmt::format("textfabric_{}_{}{}", unique,
+                fmt::format("docweft_{}_{}{}", unique,
                            reinterpret_cast<std::uintptr_t>(this), suffix);
     }
     ~TempFile() {
@@ -2873,14 +3030,14 @@ void DocxMerger::paste(const std::string& bookmark) {
     pasted_.push_back(bookmark);
 }
 
-} // namespace textfabric::docx
+} // namespace docweft::docx
 
 // ── factory ────────────────────────────────────────────────────────────────
 
-namespace textfabric {
+namespace docweft {
 
 std::unique_ptr<IReportMerger> make_docx_merger() {
     return std::make_unique<docx::DocxMerger>();
 }
 
-} // namespace textfabric
+} // namespace docweft

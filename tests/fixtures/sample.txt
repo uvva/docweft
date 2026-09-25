@@ -1,1 +1,1 @@
-This is a sample fixture file for TextFabric tests.
+This is a sample fixture file for DocWeft tests.

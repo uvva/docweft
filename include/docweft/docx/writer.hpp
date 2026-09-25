@@ -3,7 +3,7 @@
 #include <filesystem>
 #include <string_view>
 
-namespace textfabric::docx {
+namespace docweft::docx {
 
 /// Placeholder: will create/modify a .docx archive.
 class Writer {
@@ -21,4 +21,4 @@ private:
     std::filesystem::path path_;
 };
 
-} // namespace textfabric::docx
+} // namespace docweft::docx

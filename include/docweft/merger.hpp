@@ -1,6 +1,6 @@
 #pragma once
 
-#include "textfabric/export.h"
+#include "docweft/export.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-namespace textfabric {
+namespace docweft {
 
 /// Display-size bounds for `setImage`. All four fields are in pixels at a
 /// 96 DPI baseline (the same unit Word uses when importing images through
@@ -35,7 +35,7 @@ struct ImageSize {
 ///   - docx::DocxMerger — uses libzip + pugixml directly.
 ///
 /// All string parameters are UTF-8.
-class TEXTFABRIC_API IReportMerger {
+class DOCWEFT_API IReportMerger {
 public:
     virtual ~IReportMerger() = default;
 
@@ -52,9 +52,9 @@ public:
     ///   .docx → native save
     ///   .pdf / .html → first working converter of: Microsoft Word (Windows,
     ///                  macOS), LibreOffice, native PDF renderer
-    ///                  (TEXTFABRIC_ENABLE_NATIVE_PDF, .pdf only), remote
-    ///                  converter (TEXTFABRIC_ENABLE_REMOTE_CONVERTER +
-    ///                  TEXTFABRIC_CONVERTER_URL, .pdf only)
+    ///                  (DOCWEFT_ENABLE_NATIVE_PDF, .pdf only), remote
+    ///                  converter (DOCWEFT_ENABLE_REMOTE_CONVERTER +
+    ///                  DOCWEFT_CONVERTER_URL, .pdf only)
     /// Throws ReportException{SaveFailed | NoConverter | NotImplemented}.
     virtual void save(const std::string& path) = 0;
 
@@ -266,6 +266,6 @@ public:
 };
 
 /// Factory: builds a DOCX-backed merger.
-[[nodiscard]] TEXTFABRIC_API std::unique_ptr<IReportMerger> make_docx_merger();
+[[nodiscard]] DOCWEFT_API std::unique_ptr<IReportMerger> make_docx_merger();
 
-} // namespace textfabric
+} // namespace docweft

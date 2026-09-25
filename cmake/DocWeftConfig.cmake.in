@@ -1,30 +1,30 @@
 @PACKAGE_INIT@
 
-set(TextFabric_SHARED   @TEXTFABRIC_BUILD_SHARED@)
-set(TextFabric_HAS_TIFF   @TEXTFABRIC_HAVE_TIFF@)
-set(TextFabric_HAS_PODOFO @TEXTFABRIC_HAVE_PODOFO@)
+set(DocWeft_SHARED   @DOCWEFT_BUILD_SHARED@)
+set(DocWeft_HAS_TIFF   @DOCWEFT_HAVE_TIFF@)
+set(DocWeft_HAS_PODOFO @DOCWEFT_HAVE_PODOFO@)
 
-# When TextFabric is built SHARED, the private deps (pugixml, libzip, fmt,
+# When DocWeft is built SHARED, the private deps (pugixml, libzip, fmt,
 # nlohmann_json, inja, libtiff, podofo) are baked into the .dll/.so and CMake
 # does not surface them on the imported target — consumers don't need to
 # resolve them. When built STATIC, those PRIVATE link libs become real
 # transitive link requirements and must be locatable on the consumer's
 # prefix.
-if(NOT TextFabric_SHARED)
+if(NOT DocWeft_SHARED)
     include(CMakeFindDependencyMacro)
     find_dependency(pugixml)
     find_dependency(libzip)
     find_dependency(nlohmann_json)
     find_dependency(fmt)
     find_dependency(inja)
-    if(TextFabric_HAS_TIFF)
+    if(DocWeft_HAS_TIFF)
         find_dependency(TIFF)
     endif()
-    if(TextFabric_HAS_PODOFO)
+    if(DocWeft_HAS_PODOFO)
         find_dependency(podofo CONFIG)
     endif()
 endif()
 
-include("${CMAKE_CURRENT_LIST_DIR}/TextFabricTargets.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/DocWeftTargets.cmake")
 
-check_required_components(TextFabric)
+check_required_components(DocWeft)

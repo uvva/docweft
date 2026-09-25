@@ -1,9 +1,9 @@
 {
   "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg/master/scripts/vcpkg.schema.json",
-  "name": "textfabric",
+  "name": "docweft",
   "version": "0.1.0",
   "description": "Cross-platform C++20 library for DOCX template manipulation",
-  "homepage": "https://github.com/yourusername/TextFabric",
+  "homepage": "https://github.com/uvva/docweft",
   "license": "MIT",
   "supports": "!(uwp | arm)",
   "dependencies": [

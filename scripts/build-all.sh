@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build TextFabric as a SHARED library for all supported targets from the
+# Build DocWeft as a SHARED library for all supported targets from the
 # current host. Each target drops artifacts under build/<preset>/.
 #
 # Usage:

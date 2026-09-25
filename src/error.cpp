@@ -1,6 +1,6 @@
-#include "textfabric/error.hpp"
+#include "docweft/error.hpp"
 
-namespace textfabric {
+namespace docweft {
 
 std::string_view to_string(ReportError e) noexcept {
     switch (e) {
@@ -17,4 +17,4 @@ std::string_view to_string(ReportError e) noexcept {
     return "Unknown";
 }
 
-} // namespace textfabric
+} // namespace docweft

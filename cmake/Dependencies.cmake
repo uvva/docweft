@@ -4,7 +4,7 @@
 # Strategy (in order):
 #   1. find_package() — satisfied by vcpkg toolchain (Windows/macOS)
 #      or Nix / system packages (Linux).
-#   2. FetchContent fallback — only when TEXTFABRIC_USE_FETCHCONTENT=ON
+#   2. FetchContent fallback — only when DOCWEFT_USE_FETCHCONTENT=ON
 #      and the package was not found via find_package.
 #
 # Required packages
@@ -19,13 +19,13 @@
 #     stb_image_write  domain. Pulled via FetchContent from nothings/stb when
 #                      not found through find_package. If missing, setImage
 #                      falls back to PNG-only (NotImplemented for JPG/BMP).
-#                      Adds TEXTFABRIC_HAVE_STB compile definition.
+#                      Adds DOCWEFT_HAVE_STB compile definition.
 #   - TIFF (libtiff)   TIFF decode (vcpkg: tiff | nixpkgs: libtiff). If not
 #                      present, setImage throws NotImplemented for TIFF.
-#                      Adds TEXTFABRIC_HAVE_TIFF compile definition.
+#                      Adds DOCWEFT_HAVE_TIFF compile definition.
 #   - PoDoFo           Native OOXML→PDF rendering with no Microsoft Word or
 #     (opt-in via       LibreOffice installed — see PLAN.md. Only searched
-#     TEXTFABRIC_        when TEXTFABRIC_ENABLE_NATIVE_PDF=ON (default OFF);
+#     DOCWEFT_        when DOCWEFT_ENABLE_NATIVE_PDF=ON (default OFF);
 #     ENABLE_NATIVE_PDF) fails the configure step loudly if enabled but not
 #                        found, rather than silently degrading, since a user
 #                        who opted in clearly wants this path to work.
@@ -33,17 +33,17 @@
 #                        MPL-2.0 licensing option selected, not the
 #                        LGPL-2.0-or-later alternative — keeps static linking
 #                        free of relinking obligations (see PLAN.md).
-#                        Adds TEXTFABRIC_HAVE_PODOFO compile definition.
+#                        Adds DOCWEFT_HAVE_PODOFO compile definition.
 #
 # Optional (tests only):
 #   - Catch2 3.x       (vcpkg: catch2 | nixpkgs: catch2_3)
 
 include(FetchContent)
 
-# When building textfabric as SHARED on Linux/macOS, all static deps we pull
+# When building docweft as SHARED on Linux/macOS, all static deps we pull
 # into it must be compiled with -fPIC. Setting this globally before
 # FetchContent_MakeAvailable() ensures pugixml/libzip/fmt/etc. pick it up.
-if(BUILD_SHARED_LIBS OR TEXTFABRIC_BUILD_SHARED)
+if(BUILD_SHARED_LIBS OR DOCWEFT_BUILD_SHARED)
     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 endif()
 
@@ -61,7 +61,7 @@ find_package(pugixml CONFIG QUIET)
 _tf_dep_status("pugixml" pugixml_FOUND)
 
 if(NOT pugixml_FOUND)
-    if(TEXTFABRIC_USE_FETCHCONTENT)
+    if(DOCWEFT_USE_FETCHCONTENT)
         FetchContent_Declare(pugixml
             GIT_REPOSITORY https://github.com/zeux/pugixml.git
             GIT_TAG        v1.14
@@ -69,7 +69,7 @@ if(NOT pugixml_FOUND)
         )
         FetchContent_MakeAvailable(pugixml)
     else()
-        message(WARNING "pugixml not found — stubs will compile without it. Install via vcpkg/Nix or set TEXTFABRIC_USE_FETCHCONTENT=ON")
+        message(WARNING "pugixml not found — stubs will compile without it. Install via vcpkg/Nix or set DOCWEFT_USE_FETCHCONTENT=ON")
     endif()
 endif()
 
@@ -90,7 +90,7 @@ endif()
 _tf_dep_status("libzip" libzip_FOUND)
 
 if(NOT libzip_FOUND)
-    if(TEXTFABRIC_USE_FETCHCONTENT)
+    if(DOCWEFT_USE_FETCHCONTENT)
         FetchContent_Declare(libzip
             GIT_REPOSITORY https://github.com/nih-at/libzip.git
             GIT_TAG        v1.10.1
@@ -118,7 +118,7 @@ find_package(nlohmann_json 3.2.0 CONFIG QUIET)
 _tf_dep_status("nlohmann_json" nlohmann_json_FOUND)
 
 if(NOT nlohmann_json_FOUND)
-    if(TEXTFABRIC_USE_FETCHCONTENT)
+    if(DOCWEFT_USE_FETCHCONTENT)
         FetchContent_Declare(nlohmann_json
             GIT_REPOSITORY https://github.com/nlohmann/json.git
             GIT_TAG        v3.11.3
@@ -136,7 +136,7 @@ find_package(fmt CONFIG QUIET)
 _tf_dep_status("fmt" fmt_FOUND)
 
 if(NOT fmt_FOUND)
-    if(TEXTFABRIC_USE_FETCHCONTENT)
+    if(DOCWEFT_USE_FETCHCONTENT)
         FetchContent_Declare(fmt
             GIT_REPOSITORY https://github.com/fmtlib/fmt.git
             GIT_TAG        10.2.1
@@ -154,7 +154,7 @@ find_package(inja CONFIG QUIET)
 _tf_dep_status("inja" inja_FOUND)
 
 if(NOT inja_FOUND)
-    if(TEXTFABRIC_USE_FETCHCONTENT)
+    if(DOCWEFT_USE_FETCHCONTENT)
         FetchContent_Declare(inja
             GIT_REPOSITORY https://github.com/pantor/inja.git
             GIT_TAG        v3.4.0
@@ -201,19 +201,19 @@ endif()
 # point FETCHCONTENT_SOURCE_DIR_STB at a local checkout of the stb sources
 # and FetchContent_Populate below uses it directly instead of cloning. This
 # is a stock CMake FetchContent mechanism (works for any FetchContent_Declare
-# name), not something TextFabric implements itself.
+# name), not something DocWeft implements itself.
 set(_tf_stb_include "")
 find_package(Stb QUIET)
 if(Stb_FOUND AND DEFINED Stb_INCLUDE_DIR)
     set(_tf_stb_include "${Stb_INCLUDE_DIR}")
     message(STATUS "  [dep] stb: found via find_package (${Stb_INCLUDE_DIR})")
-elseif(TEXTFABRIC_USE_FETCHCONTENT)
+elseif(DOCWEFT_USE_FETCHCONTENT)
     message(STATUS "  [dep] stb: NOT found — fetching nothings/stb")
     # Pinned, not "master": nothings/stb has no release tags, and stb_image.h's
     # JPEG decoder is exactly the kind of unmanaged-memory C parser where an
     # unpinned "always latest" dependency means nobody can say which version
     # actually shipped when a crash is reported (see
-    # TEXTFABRIC_UPSTREAM_FEEDBACK.md item 10). Every other FetchContent dep
+    # DOCWEFT_UPSTREAM_FEEDBACK.md item 10). Every other FetchContent dep
     # above is pinned to an exact tag; this was the one exception.
     # Commit below is nothings/stb@master as of 2026-09-11 — bump deliberately,
     # not by drifting.
@@ -239,46 +239,46 @@ if(_tf_stb_include)
     # Expose as plain cache vars rather than an INTERFACE library, so the
     # install(EXPORT ...) set doesn't need to include an intermediate target
     # that points at a build-tree-only include dir.
-    set(TEXTFABRIC_STB_INCLUDE_DIR "${_tf_stb_include}" CACHE INTERNAL "")
-    set(TEXTFABRIC_HAVE_STB        ON                   CACHE INTERNAL "")
+    set(DOCWEFT_STB_INCLUDE_DIR "${_tf_stb_include}" CACHE INTERNAL "")
+    set(DOCWEFT_HAVE_STB        ON                   CACHE INTERNAL "")
 else()
-    set(TEXTFABRIC_STB_INCLUDE_DIR "" CACHE INTERNAL "")
-    set(TEXTFABRIC_HAVE_STB        OFF CACHE INTERNAL "")
+    set(DOCWEFT_STB_INCLUDE_DIR "" CACHE INTERNAL "")
+    set(DOCWEFT_HAVE_STB        OFF CACHE INTERNAL "")
 endif()
 
 # ── libtiff (Stage 5 Phase 2: TIFF decode) ──────────────────────────────────
 find_package(TIFF QUIET)
 if(TIFF_FOUND)
     message(STATUS "  [dep] TIFF: found via find_package")
-    set(TEXTFABRIC_HAVE_TIFF ON  CACHE INTERNAL "TIFF decoder available")
+    set(DOCWEFT_HAVE_TIFF ON  CACHE INTERNAL "TIFF decoder available")
 else()
     message(STATUS "  [dep] TIFF: NOT found — TIFF support disabled")
-    set(TEXTFABRIC_HAVE_TIFF OFF CACHE INTERNAL "TIFF decoder available")
+    set(DOCWEFT_HAVE_TIFF OFF CACHE INTERNAL "TIFF decoder available")
 endif()
 
 # ── PoDoFo (Stage 6b: native PDF renderer, opt-in) ──────────────────────────
-if(TEXTFABRIC_ENABLE_NATIVE_PDF)
+if(DOCWEFT_ENABLE_NATIVE_PDF)
     find_package(podofo CONFIG QUIET)
     if(podofo_FOUND)
         message(STATUS "  [dep] PoDoFo: found via find_package")
-        set(TEXTFABRIC_HAVE_PODOFO ON CACHE INTERNAL "Native PDF renderer available")
+        set(DOCWEFT_HAVE_PODOFO ON CACHE INTERNAL "Native PDF renderer available")
     else()
         message(FATAL_ERROR
-            "TEXTFABRIC_ENABLE_NATIVE_PDF=ON but PoDoFo was not found "
+            "DOCWEFT_ENABLE_NATIVE_PDF=ON but PoDoFo was not found "
             "(vcpkg: podofo | nixpkgs: podofo). Install it or turn the "
             "option off.")
     endif()
 else()
-    set(TEXTFABRIC_HAVE_PODOFO OFF CACHE INTERNAL "Native PDF renderer available")
+    set(DOCWEFT_HAVE_PODOFO OFF CACHE INTERNAL "Native PDF renderer available")
 endif()
 
 # ── Catch2 (tests only) ──────────────────────────────────────────────────────
-if(TEXTFABRIC_BUILD_TESTS)
+if(DOCWEFT_BUILD_TESTS)
     find_package(Catch2 3 CONFIG QUIET)
     _tf_dep_status("Catch2 v3" Catch2_FOUND)
 
     if(NOT Catch2_FOUND)
-        if(TEXTFABRIC_USE_FETCHCONTENT)
+        if(DOCWEFT_USE_FETCHCONTENT)
             FetchContent_Declare(Catch2
                 GIT_REPOSITORY https://github.com/catchorg/Catch2.git
                 GIT_TAG        v3.5.3
@@ -287,7 +287,7 @@ if(TEXTFABRIC_BUILD_TESTS)
             FetchContent_MakeAvailable(Catch2)
             list(APPEND CMAKE_MODULE_PATH "${catch2_SOURCE_DIR}/extras")
         else()
-            message(FATAL_ERROR "Catch2 v3 not found. Set TEXTFABRIC_USE_FETCHCONTENT=ON to auto-download.")
+            message(FATAL_ERROR "Catch2 v3 not found. Set DOCWEFT_USE_FETCHCONTENT=ON to auto-download.")
         endif()
     endif()
 endif()

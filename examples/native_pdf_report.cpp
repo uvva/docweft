@@ -1,5 +1,5 @@
 // native_pdf_report — same kind of report as basic_report, but demonstrates
-// TextFabric's native PoDoFo PDF backend (TEXTFABRIC_ENABLE_NATIVE_PDF): the
+// DocWeft's native PoDoFo PDF backend (DOCWEFT_ENABLE_NATIVE_PDF): the
 // resulting PDF is produced with no Microsoft Word or LibreOffice involved
 // at all, not even installed on the machine. Includes a bar chart and a pie
 // chart to show the backend's chart support (bar/line/area/pie/doughnut —
@@ -7,15 +7,15 @@
 // scatter/bubble/stock/surface yet).
 //
 // This binary only exists when the library was built with
-// -DTEXTFABRIC_ENABLE_NATIVE_PDF=ON (see examples/CMakeLists.txt) — save()
+// -DDOCWEFT_ENABLE_NATIVE_PDF=ON (see examples/CMakeLists.txt) — save()
 // would otherwise throw NoConverter once Word/LibreOffice are disabled
 // below, which is the whole point of this example.
 //
 // Usage:
 //   ./native_pdf_report [output.pdf]    # default: native_report.pdf
 
-#include <textfabric/error.hpp>
-#include <textfabric/merger.hpp>
+#include <docweft/error.hpp>
+#include <docweft/merger.hpp>
 
 #include <zip.h>
 
@@ -313,11 +313,11 @@ fs::path make_template(const fs::path& out) {
 // on the process outside this run.
 void disable_external_converters() {
 #if defined(_WIN32)
-    _putenv_s("TEXTFABRIC_NO_MSWORD", "1");
-    _putenv_s("TEXTFABRIC_SOFFICE", "");
+    _putenv_s("DOCWEFT_NO_MSWORD", "1");
+    _putenv_s("DOCWEFT_SOFFICE", "");
 #else
-    setenv("TEXTFABRIC_NO_MSWORD", "1", 1);
-    setenv("TEXTFABRIC_SOFFICE", "", 1);
+    setenv("DOCWEFT_NO_MSWORD", "1", 1);
+    setenv("DOCWEFT_SOFFICE", "", 1);
 #endif
 }
 
@@ -333,7 +333,7 @@ int main(int argc, char** argv) {
     try {
         make_template(template_path);
 
-        auto m = textfabric::make_docx_merger();
+        auto m = docweft::make_docx_merger();
         m->setCodePage("UTF-8");
         m->load(template_path.string());
 
@@ -350,18 +350,18 @@ int main(int argc, char** argv) {
                 {"Carol Жу", "77"},
             });
         m->setImage("Body.Logo", logo_path,
-                    textfabric::ImageSize{/*min*/64, 64, /*max*/256, 256});
+                    docweft::ImageSize{/*min*/64, 64, /*max*/256, 256});
 
         m->save(out_pdf.string());
         std::cout << "Wrote " << out_pdf
                   << " via the native PoDoFo backend — no Microsoft Word or "
                      "LibreOffice were involved.\n";
-    } catch (const textfabric::ReportException& e) {
-        std::cerr << "[TextFabric error] " << textfabric::to_string(e.code())
+    } catch (const docweft::ReportException& e) {
+        std::cerr << "[DocWeft error] " << docweft::to_string(e.code())
                    << ": " << e.what() << "\n";
-        if (e.code() == textfabric::ReportError::NoConverter) {
+        if (e.code() == docweft::ReportError::NoConverter) {
             std::cerr << "This binary needs the library built with "
-                         "-DTEXTFABRIC_ENABLE_NATIVE_PDF=ON (requires PoDoFo) "
+                         "-DDOCWEFT_ENABLE_NATIVE_PDF=ON (requires PoDoFo) "
                          "— see PLAN.md.\n";
         }
         return 1;
