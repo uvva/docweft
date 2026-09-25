@@ -145,7 +145,7 @@ Full header: [include/textfabric/merger.hpp](include/textfabric/merger.hpp). The
 | `setCodePage(cp)` | Sets the encoding. v1 accepts only `"UTF-8"`; anything else → `NotImplemented`. |
 | `load(path)` | Reads the `.docx` archive, parses `word/document.xml`. |
 | `save(path.docx)` | Round-trips the `.docx` archive. |
-| `save(path.pdf/html)` | Conversion via an external process (Microsoft Word or LibreOffice — see [Runtime Dependencies](#runtime-dependencies)). `NoConverter` if neither is found. |
+| `save(path.pdf/html)` | Conversion via Microsoft Word, LibreOffice, the optional native PDF renderer or the optional remote converter — see [PDF / HTML export](#pdf--html-export). `NoConverter` if none is available. |
 | `setClipboardValue(bookmark, field, value)` | Substitutes `value` for `field` inside `bookmark`. Handles split runs. `bookmark` = `"_Header"`/`"_Footer"` is a special case: it walks every `word/header*.xml`/`word/footer*.xml` part in the archive instead of resolving a bookmark. |
 | `hasBookmark(bookmark)` | Checks whether the loaded template has a bookmark with that name. Returns `false` for both a missing bookmark and an unloaded template — never throws. Does not resolve the `_Header`/`_Footer` pseudo-bookmarks. |
 | `clearBookmark(bookmark)` | Wipes the placeholder text inside a bookmark, leaving it empty — useful when a bookmark is deliberately left unfilled on a given run. Does not resolve the `_Header`/`_Footer` pseudo-bookmarks. |
@@ -219,23 +219,30 @@ Format detection is by magic bytes on the input file, not by extension. The arch
 
 ### PDF / HTML export
 
-`save("*.pdf")` / `save("*.html")` goes through an external converter. Detection order, top to bottom:
+`save("*.pdf")` / `save("*.html")` walks a chain of converters, top to bottom. Every converter that is present is tried in turn; if one fails, the next one gets the document.
 
-| Step | What's checked | How |
-|---|---|---|
-| 1 | **Microsoft Word** (Windows only) | `reg query HKCR\Word.Application` — is the COM class registered. Conversion runs through a `.vbs` script generated in a scratch directory + `cscript //B //Nologo` → `Documents.Open` → `SaveAs2`, headless (`word.Visible=False`, `word.DisplayAlerts=0`). |
-| 2 | **LibreOffice `soffice`** (all platforms) | `TEXTFABRIC_SOFFICE` env var (absolute path; an empty value disables this branch) → Windows `C:\Program Files[(x86)]\LibreOffice\program\soffice.exe` → PATH probe (`soffice --version`). Conversion runs `soffice --headless --convert-to pdf/html --outdir <scratch> <input>`. |
-| — | if neither is found | `ReportError::NoConverter`, with a hint to "install Microsoft Word or LibreOffice". |
+| Step | Converter | Formats | How |
+|---|---|---|---|
+| 1 | **Microsoft Word** (Windows, macOS) | pdf, html | **Windows:** `reg query HKCR\Word.Application`; conversion through a generated `.vbs` + `cscript //B //Nologo` → `Documents.Open` → `SaveAs2`, headless. **macOS:** `Microsoft Word.app` in `/Applications` or `~/Applications`; conversion through AppleScript (`osascript`) → `open` → `save as`, Word is quit afterwards if it wasn't already running. |
+| 2 | **LibreOffice `soffice`** (all platforms) | pdf, html | `TEXTFABRIC_SOFFICE` env var (absolute path; an empty value disables this branch) → Windows `C:\Program Files[(x86)]\LibreOffice\program\soffice.exe` → macOS `[~]/Applications/LibreOffice.app/Contents/MacOS/soffice` → PATH probe (`soffice --version`). Conversion runs `soffice --headless --convert-to pdf/html --outdir <scratch> <input>`. |
+| 3 | **Native PDF renderer** (PoDoFo) | pdf | Built in with `-DTEXTFABRIC_ENABLE_NATIVE_PDF=ON` (default OFF). Best-effort layout, no external program; see [PLAN.md](PLAN.md) for the supported subset. |
+| 4 | **Remote converter** | pdf | Built in with `-DTEXTFABRIC_ENABLE_REMOTE_CONVERTER=ON` (default OFF) and active only when `TEXTFABRIC_CONVERTER_URL` is set — there is no default endpoint. Sends a multipart POST with the `.docx` in the `files` field and expects PDF bytes back ([Gotenberg](https://gotenberg.dev)'s `/forms/libreoffice/convert` contract), using the `curl` command-line tool. |
+| — | nothing available | | `ReportError::NoConverter`; the message lists each converter and why it was skipped. If converters were available but all of them failed — `SaveFailed` with each failure listed (or that converter's own code when only one was tried). |
 
 Environment variables:
 
 | Name | Effect |
 |---|---|
-| `TEXTFABRIC_DISABLE_CONVERTERS=1` | Master switch. `find_converter` immediately returns None, `save("*.pdf")` → `NoConverter`. Used by tests and for forcing the fallback path. |
-| `TEXTFABRIC_NO_MSWORD=1` | Windows-only. Skips the Word branch and goes straight to LibreOffice. Useful when Word is installed but you need LibreOffice-compatible rendering. |
-| `TEXTFABRIC_SOFFICE=<path>` | If set non-empty — use only this binary as LibreOffice, skipping PATH/Program Files lookups. If set empty — disable the LibreOffice branch entirely (Word remains available if present). |
+| `TEXTFABRIC_DISABLE_CONVERTERS=1` | Master switch: the whole chain is off, `save("*.pdf")` → `NoConverter`. Used by tests. |
+| `TEXTFABRIC_NO_MSWORD=1` | Skips the Word branch (Windows and macOS). Useful when Word is installed but you need LibreOffice-compatible rendering. |
+| `TEXTFABRIC_SOFFICE=<path>` | If set non-empty — use only this binary as LibreOffice, skipping PATH/Program Files/app bundle lookups. If set empty — disable the LibreOffice branch entirely. |
+| `TEXTFABRIC_CONVERTER_URL=<url>` | Remote converter endpoint, e.g. `http://localhost:3000/forms/libreoffice/convert`. |
+| `TEXTFABRIC_CONVERTER_TOKEN=<token>` | Optional; sent as `Authorization: Bearer <token>`. Passed to curl through a config file, never on the command line, and never included in error messages. |
+| `TEXTFABRIC_CONVERTER_TIMEOUT=<seconds>` | Remote request timeout, default 120. |
 
-The MSWord branch is a deliberate trade-off: on Windows workstations with Office installed it produces output identical to what the user sees interactively in Word, without requiring LibreOffice alongside it. The cost is a possible rendering difference between Windows (via Word) and Linux/macOS (via LibreOffice); for scenarios where cross-platform rendering parity matters, set `TEXTFABRIC_NO_MSWORD=1` and deploy LibreOffice everywhere.
+The MSWord branch is a deliberate trade-off: on workstations with Office installed it produces output identical to what the user sees interactively in Word, without requiring LibreOffice alongside it. The cost is a possible rendering difference between machines with and without Word; for scenarios where cross-platform rendering parity matters, set `TEXTFABRIC_NO_MSWORD=1` and deploy LibreOffice everywhere.
+
+On macOS the first conversion through Word shows the system prompt allowing your app to control Microsoft Word (Automation). If it's denied, the Word step fails with a hint to allow it in System Settings → Privacy & Security → Automation, and the chain moves on to LibreOffice. Your app bundle needs `NSAppleEventsUsageDescription` in `Info.plist`, and under hardened runtime the `com.apple.security.automation.apple-events` entitlement — without them macOS rejects the request silently. Word is sandboxed, so it may also ask once to grant access to the temp folder.
 
 ## Error Codes
 
@@ -248,7 +255,7 @@ Every exception is a [`textfabric::ReportException`](include/textfabric/error.hp
 | `InvalidBookmark`      | The bookmark wasn't found; or `setTableRow` targets a bookmark outside a `<w:tr>` |
 | `InvalidField`         | The placeholder is missing from the bookmark; or `rows[i].size() != fields.size()` |
 | `SaveFailed`           | An unrecognized extension was passed to `save()`, or the zip write failed |
-| `NoConverter`          | Neither Microsoft Word nor LibreOffice could be found for `save("*.pdf")` / `save("*.html")`. Fix: install MS Word (Windows), install LibreOffice, set `TEXTFABRIC_SOFFICE=/abs/path/to/soffice`, or unset `TEXTFABRIC_DISABLE_CONVERTERS`. |
+| `NoConverter`          | No conversion tool is available for `save("*.pdf")` / `save("*.html")` — see [PDF / HTML export](#pdf--html-export). Fix: install MS Word (Windows/macOS) or LibreOffice, set `TEXTFABRIC_SOFFICE=/abs/path/to/soffice`, build with the native/remote converter (PDF only), or unset `TEXTFABRIC_DISABLE_CONVERTERS`. |
 | `NotImplemented`       | The scenario isn't supported by the current implementation: `setCodePage(≠ "UTF-8")`; `setChartValue` on a scatter/bubble/stock/surface chart; JPEG/BMP/TIFF in `setImage` when the library was built without stb_image/libtiff. |
 
 `textfabric::to_string(ReportError)` returns the code's name — handy for logs and user-facing messages.

@@ -8,6 +8,7 @@
 #include <fmt/format.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -159,6 +160,13 @@ void DocxMerger::reserialize_document() {
 }
 
 void DocxMerger::write_archive(const std::filesystem::path& path) const {
+    write_archive(parts_, path);
+}
+
+void DocxMerger::write_archive(
+    const std::unordered_map<std::string, std::string>& parts,
+    const std::filesystem::path&                         path)
+{
     // Overwrite target (libzip opens append-mode otherwise).
     std::error_code ec;
     std::filesystem::remove(path, ec);
@@ -176,9 +184,9 @@ void DocxMerger::write_archive(const std::filesystem::path& path) const {
 
     // libzip's zip_source_buffer keeps a pointer into `data` until
     // zip_close() — we must keep all buffers alive until then.
-    // Since parts_ is stable (std::unordered_map, not mutated during save),
-    // we pass `freep=0` and rely on parts_'s lifetime.
-    for (const auto& [name, bytes] : parts_) {
+    // Since `parts` is stable (std::unordered_map, not mutated during save),
+    // we pass `freep=0` and rely on its lifetime.
+    for (const auto& [name, bytes] : parts) {
         zip_source_t* src = zip_source_buffer(raw, bytes.data(), bytes.size(), 0);
         if (!src) {
             zip_discard(raw);
@@ -207,88 +215,320 @@ void DocxMerger::write_archive(const std::filesystem::path& path) const {
 
 // ── Converter dispatch (Stage 6) ────────────────────────────────────────────
 //
-// `.docx → .pdf/.html` goes through one of two external converters. The
-// preferred order, left to right:
+// `.docx → .pdf/.html` is tried through a chain of converters, in this
+// order. Every converter that is present is tried; if one fails, the next
+// one gets the document.
 //
-//   1. Microsoft Word (Windows only) — via a generated VBScript driven by
-//      `cscript //B`. Chosen when Word is registered under
-//      HKCR\Word.Application and `TEXTFABRIC_NO_MSWORD` is not set.
-//      Rationale: on machines that already have Office installed the result
-//      matches what the user sees in Word interactively.
-//   2. LibreOffice `soffice --headless --convert-to`. Detected via
-//      `TEXTFABRIC_SOFFICE` override, Program Files lookups (Windows), and
-//      finally a `soffice --version` PATH probe.
+//   1. Microsoft Word (Windows and macOS) — the result matches what the user
+//      sees in Word interactively.
+//        Windows: detected via HKCR\Word.Application, driven by a generated
+//                 VBScript through `cscript //B`.
+//        macOS:   detected via Microsoft Word.app in /Applications or
+//                 ~/Applications, driven by AppleScript through `osascript`.
+//                 The first run shows the system "allow to control Microsoft
+//                 Word" (Automation) prompt; the host app bundle needs
+//                 NSAppleEventsUsageDescription (and, under hardened runtime,
+//                 com.apple.security.automation.apple-events).
+//   2. LibreOffice `soffice --headless --convert-to` (all platforms).
+//      Detected via `TEXTFABRIC_SOFFICE` override, Program Files lookups
+//      (Windows), LibreOffice.app bundle lookups (macOS), and finally a
+//      `soffice --version` PATH probe.
+//   3. Native PDF renderer (PoDoFo) — .pdf only; compiled in with
+//      TEXTFABRIC_ENABLE_NATIVE_PDF=ON.
+//   4. Remote converter — .pdf only; compiled in with
+//      TEXTFABRIC_ENABLE_REMOTE_CONVERTER=ON and active only when
+//      TEXTFABRIC_CONVERTER_URL is set (no default endpoint). Contract is
+//      Gotenberg's LibreOffice route: multipart POST with the .docx in the
+//      `files` field, PDF bytes in the response body. Sent with the `curl`
+//      CLI.
 //
 // Env overrides:
-//   TEXTFABRIC_DISABLE_CONVERTERS — any non-empty value forces None.
-//                                   Used by tests to assert the NoConverter path.
-//   TEXTFABRIC_NO_MSWORD          — any non-empty value skips the Word probe
-//                                   (forces LibreOffice-only on Windows).
+//   TEXTFABRIC_DISABLE_CONVERTERS — any non-empty value disables the whole
+//                                   chain. Used by tests to assert the
+//                                   NoConverter path.
+//   TEXTFABRIC_NO_MSWORD          — any non-empty value skips Word.
 //   TEXTFABRIC_SOFFICE            — absolute path to soffice. If set non-empty
 //                                   it is used as-is (no other LibreOffice
 //                                   probe). Empty value disables the
 //                                   LibreOffice branch entirely.
+//   TEXTFABRIC_CONVERTER_URL      — remote converter endpoint, e.g.
+//                                   http://localhost:3000/forms/libreoffice/convert
+//   TEXTFABRIC_CONVERTER_TOKEN    — optional; sent as `Authorization: Bearer`.
+//                                   Never included in error messages.
+//   TEXTFABRIC_CONVERTER_TIMEOUT  — remote request timeout, seconds (default 120).
 //
-// If every branch returns None, save() throws `NoConverter` with a message
-// that names both dependencies.
+// If nothing in the chain is available, save() throws `NoConverter` listing
+// why each converter was skipped; if everything available failed, it throws
+// `SaveFailed` listing each failure.
 
 namespace {
 
-enum class ConverterKind { None, MSWord, LibreOffice };
+enum class ConverterKind { MSWord, LibreOffice, NativePdf, Remote };
 
 struct Converter {
-    ConverterKind kind = ConverterKind::None;
-    std::string   soffice_path;  // populated only when kind == LibreOffice
+    ConverterKind kind;
+    std::string   location;  // soffice path, Word.app path or endpoint URL
 };
+
+const char* converter_label(ConverterKind kind) {
+    switch (kind) {
+        case ConverterKind::MSWord:      return "Microsoft Word";
+        case ConverterKind::LibreOffice: return "LibreOffice";
+        case ConverterKind::NativePdf:   return "native PDF renderer";
+        case ConverterKind::Remote:      return "remote converter";
+    }
+    return "unknown";
+}
 
 [[nodiscard]] bool env_nonempty(const char* name) {
     const char* v = std::getenv(name);
     return v != nullptr && *v != '\0';
 }
 
-#ifdef _WIN32
-[[nodiscard]] bool msword_registered() {
-    // HKCR\Word.Application exists iff some Office version is installed and
-    // has registered its COM class. `reg query` is present in every Windows
-    // install and exits 0 on hit, 1 on miss.
-    return std::system("reg query HKCR\\Word.Application >nul 2>nul") == 0;
+#ifdef __APPLE__
+[[nodiscard]] std::string home_dir() {
+    const char* home = std::getenv("HOME");
+    return (home != nullptr) ? home : "";
 }
 #endif
 
-Converter find_converter() {
-    if (env_nonempty("TEXTFABRIC_DISABLE_CONVERTERS")) return {};
-
-#ifdef _WIN32
-    if (!env_nonempty("TEXTFABRIC_NO_MSWORD") && msword_registered()) {
-        return {ConverterKind::MSWord, {}};
+// Word install location, or empty when Word is not installed.
+[[nodiscard]] std::string find_msword() {
+#if defined(_WIN32)
+    // HKCR\Word.Application exists iff some Office version is installed and
+    // has registered its COM class. `reg query` is present in every Windows
+    // install and exits 0 on hit, 1 on miss.
+    if (std::system("reg query HKCR\\Word.Application >nul 2>nul") == 0) {
+        return "Word.Application";
+    }
+#elif defined(__APPLE__)
+    std::vector<std::string> candidates = {"/Applications/Microsoft Word.app"};
+    if (const std::string home = home_dir(); !home.empty()) {
+        candidates.push_back(home + "/Applications/Microsoft Word.app");
+    }
+    for (const auto& c : candidates) {
+        if (std::filesystem::exists(c)) return c;
     }
 #endif
+    return {};
+}
 
+// soffice to run, or empty when LibreOffice is not found / disabled.
+[[nodiscard]] std::string find_soffice() {
     const char* const override_path = std::getenv("TEXTFABRIC_SOFFICE");
     if (override_path != nullptr) {
         if (*override_path == '\0') return {};  // explicit opt-out
-        if (std::filesystem::exists(override_path)) {
-            return {ConverterKind::LibreOffice, override_path};
-        }
+        if (std::filesystem::exists(override_path)) return override_path;
         return {};
     }
 
-#ifdef _WIN32
-    constexpr const char* kWinCandidates[] = {
+    std::vector<std::string> candidates;
+#if defined(_WIN32)
+    candidates = {
         "C:\\Program Files\\LibreOffice\\program\\soffice.exe",
         "C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe",
     };
-    for (const char* c : kWinCandidates) {
-        if (std::filesystem::exists(c)) return {ConverterKind::LibreOffice, c};
+#elif defined(__APPLE__)
+    // The official .dmg (and the Homebrew cask) install an app bundle and
+    // never touch PATH; apps started from Finder/Dock also get launchd's
+    // minimal PATH, so the probe below alone would miss a normal install.
+    candidates.emplace_back("/Applications/LibreOffice.app/Contents/MacOS/soffice");
+    if (const std::string home = home_dir(); !home.empty()) {
+        candidates.push_back(home + "/Applications/LibreOffice.app/Contents/MacOS/soffice");
     }
+#endif
+    for (const auto& c : candidates) {
+        if (std::filesystem::exists(c)) return c;
+    }
+
+#ifdef _WIN32
     const char* const probe = "soffice --version >nul 2>nul";
 #else
     const char* const probe = "soffice --version >/dev/null 2>&1";
 #endif
-    if (std::system(probe) == 0) {
-        return {ConverterKind::LibreOffice, "soffice"};
-    }
+    if (std::system(probe) == 0) return "soffice";
     return {};
+}
+
+struct ConverterChain {
+    std::vector<Converter>   available;  // in the order they will be tried
+    std::vector<std::string> skipped;    // "<label>: <why>" for the rest
+};
+
+// Build the chain for `format` ("pdf" or "html").
+ConverterChain find_converters(const std::string& format) {
+    (void)format;  // only consulted by the .pdf-only backends, if compiled in
+    ConverterChain chain;
+    if (env_nonempty("TEXTFABRIC_DISABLE_CONVERTERS")) {
+        chain.skipped.emplace_back(
+            "all converters: disabled by TEXTFABRIC_DISABLE_CONVERTERS");
+        return chain;
+    }
+    auto skip = [&](ConverterKind kind, const std::string& why) {
+        chain.skipped.push_back(fmt::format("{}: {}", converter_label(kind), why));
+    };
+
+    if (env_nonempty("TEXTFABRIC_NO_MSWORD")) {
+        skip(ConverterKind::MSWord, "disabled by TEXTFABRIC_NO_MSWORD");
+    } else if (std::string word = find_msword(); !word.empty()) {
+        chain.available.push_back({ConverterKind::MSWord, std::move(word)});
+    } else {
+#if defined(_WIN32) || defined(__APPLE__)
+        skip(ConverterKind::MSWord, "not installed");
+#else
+        skip(ConverterKind::MSWord, "not available on this platform");
+#endif
+    }
+
+    if (std::string soffice = find_soffice(); !soffice.empty()) {
+        chain.available.push_back({ConverterKind::LibreOffice, std::move(soffice)});
+    } else if (const char* o = std::getenv("TEXTFABRIC_SOFFICE"); o != nullptr) {
+        skip(ConverterKind::LibreOffice,
+             *o == '\0' ? "disabled by empty TEXTFABRIC_SOFFICE"
+                        : "TEXTFABRIC_SOFFICE points to a missing file");
+    } else {
+        skip(ConverterKind::LibreOffice, "not installed");
+    }
+
+#if defined(TEXTFABRIC_HAVE_PODOFO)
+    if (format == "pdf") {
+        chain.available.push_back({ConverterKind::NativePdf, {}});
+    } else {
+        skip(ConverterKind::NativePdf, "produces .pdf only");
+    }
+#else
+    skip(ConverterKind::NativePdf, "not built (TEXTFABRIC_ENABLE_NATIVE_PDF=OFF)");
+#endif
+
+#if defined(TEXTFABRIC_HAVE_REMOTE_CONVERTER)
+    if (format != "pdf") {
+        skip(ConverterKind::Remote, "produces .pdf only");
+    } else if (!env_nonempty("TEXTFABRIC_CONVERTER_URL")) {
+        skip(ConverterKind::Remote, "TEXTFABRIC_CONVERTER_URL is not set");
+    } else {
+        chain.available.push_back(
+            {ConverterKind::Remote, std::getenv("TEXTFABRIC_CONVERTER_URL")});
+    }
+#else
+    skip(ConverterKind::Remote, "not built (TEXTFABRIC_ENABLE_REMOTE_CONVERTER=OFF)");
+#endif
+
+    return chain;
+}
+
+// ── Default theme for converter input ───────────────────────────────────────
+//
+// Chart series without an explicit <c:spPr> take their "automatic" colors
+// from the document theme (accent1..6). Word falls back to its built-in
+// Office theme when the package has none; LibreOffice does not and draws
+// such series with no fill at all — the PDF/HTML gets axes and labels but
+// an empty plot area. Word-authored templates always ship a theme, so this
+// only bites hand-generated ones (e.g. examples/generate_template.cpp).
+//
+// The fix is applied to the scratch .docx handed to the converter only;
+// parts_ — and therefore a later save(".docx") — is left untouched.
+
+constexpr const char* kThemeRelType =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme";
+constexpr const char* kThemeContentType =
+    "application/vnd.openxmlformats-officedocument.theme+xml";
+
+// Standard Office 2013+ color scheme; fonts/format scheme kept minimal.
+constexpr const char* kDefaultThemeXml =
+    R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?>)"
+    R"(<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="Office Theme">)"
+    R"(<a:themeElements>)"
+    R"(<a:clrScheme name="Office">)"
+    R"(<a:dk1><a:sysClr val="windowText" lastClr="000000"/></a:dk1>)"
+    R"(<a:lt1><a:sysClr val="window" lastClr="FFFFFF"/></a:lt1>)"
+    R"(<a:dk2><a:srgbClr val="44546A"/></a:dk2>)"
+    R"(<a:lt2><a:srgbClr val="E7E6E6"/></a:lt2>)"
+    R"(<a:accent1><a:srgbClr val="4472C4"/></a:accent1>)"
+    R"(<a:accent2><a:srgbClr val="ED7D31"/></a:accent2>)"
+    R"(<a:accent3><a:srgbClr val="A5A5A5"/></a:accent3>)"
+    R"(<a:accent4><a:srgbClr val="FFC000"/></a:accent4>)"
+    R"(<a:accent5><a:srgbClr val="5B9BD5"/></a:accent5>)"
+    R"(<a:accent6><a:srgbClr val="70AD47"/></a:accent6>)"
+    R"(<a:hlink><a:srgbClr val="0563C1"/></a:hlink>)"
+    R"(<a:folHlink><a:srgbClr val="954F72"/></a:folHlink>)"
+    R"(</a:clrScheme>)"
+    R"(<a:fontScheme name="Office">)"
+    R"(<a:majorFont><a:latin typeface="Calibri Light"/><a:ea typeface=""/><a:cs typeface=""/></a:majorFont>)"
+    R"(<a:minorFont><a:latin typeface="Calibri"/><a:ea typeface=""/><a:cs typeface=""/></a:minorFont>)"
+    R"(</a:fontScheme>)"
+    R"(<a:fmtScheme name="Office">)"
+    R"(<a:fillStyleLst>)"
+    R"(<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>)"
+    R"(<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>)"
+    R"(<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>)"
+    R"(</a:fillStyleLst>)"
+    R"(<a:lnStyleLst>)"
+    R"(<a:ln w="6350"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln>)"
+    R"(<a:ln w="12700"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln>)"
+    R"(<a:ln w="19050"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln>)"
+    R"(</a:lnStyleLst>)"
+    R"(<a:effectStyleLst>)"
+    R"(<a:effectStyle><a:effectLst/></a:effectStyle>)"
+    R"(<a:effectStyle><a:effectLst/></a:effectStyle>)"
+    R"(<a:effectStyle><a:effectLst/></a:effectStyle>)"
+    R"(</a:effectStyleLst>)"
+    R"(<a:bgFillStyleLst>)"
+    R"(<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>)"
+    R"(<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>)"
+    R"(<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>)"
+    R"(</a:bgFillStyleLst>)"
+    R"(</a:fmtScheme>)"
+    R"(</a:themeElements>)"
+    R"(</a:theme>)";
+
+// True when the package has at least one chart part but its main document
+// declares no theme relationship.
+[[nodiscard]] bool needs_default_theme(
+    const std::unordered_map<std::string, std::string>& parts)
+{
+    const bool has_chart = std::any_of(parts.begin(), parts.end(),
+        [](const auto& kv) { return kv.first.rfind("word/charts/chart", 0) == 0; });
+    if (!has_chart) return false;
+
+    const auto rels_it = parts.find("word/_rels/document.xml.rels");
+    if (rels_it == parts.end()) return false;  // no rels → charts can't be linked anyway
+    pugi::xml_document rels;
+    if (!rels.load_buffer(rels_it->second.data(), rels_it->second.size())) return false;
+    for (auto rel : rels.child("Relationships").children("Relationship")) {
+        if (std::strcmp(rel.attribute("Type").value(), kThemeRelType) == 0) return false;
+    }
+    return parts.find("[Content_Types].xml") != parts.end();
+}
+
+// Add word/theme/themeN.xml with kDefaultThemeXml, its relationship and its
+// content-type override. Call only when needs_default_theme(parts) is true.
+void add_default_theme(std::unordered_map<std::string, std::string>& parts) {
+    std::string part_name;
+    for (int n = 1; part_name.empty() || parts.count(part_name) != 0; ++n) {
+        part_name = fmt::format("word/theme/theme{}.xml", n);
+    }
+    parts[part_name] = kDefaultThemeXml;
+
+    auto& rels_xml = parts["word/_rels/document.xml.rels"];
+    pugi::xml_document rels;
+    rels.load_buffer(rels_xml.data(), rels_xml.size());
+    auto rel = rels.child("Relationships").append_child("Relationship");
+    rel.append_attribute("Id").set_value("rIdTextFabricTheme");
+    rel.append_attribute("Type").set_value(kThemeRelType);
+    rel.append_attribute("Target").set_value(part_name.substr(std::strlen("word/")).c_str());
+    std::ostringstream rels_out;
+    rels.save(rels_out, "", pugi::format_raw);
+    rels_xml = rels_out.str();
+
+    auto& ct_xml = parts["[Content_Types].xml"];
+    pugi::xml_document ct;
+    ct.load_buffer(ct_xml.data(), ct_xml.size());
+    auto ovr = ct.child("Types").append_child("Override");
+    ovr.append_attribute("PartName").set_value(("/" + part_name).c_str());
+    ovr.append_attribute("ContentType").set_value(kThemeContentType);
+    std::ostringstream ct_out;
+    ct.save(ct_out, "", pugi::format_raw);
+    ct_xml = ct_out.str();
 }
 
 // Minimal shell-safe quoting. Rejects embedded double quotes rather than
@@ -509,6 +749,148 @@ void inline_sibling_images(const std::filesystem::path& html_path,
     out.write(html.data(), static_cast<std::streamsize>(html.size()));
 }
 
+#if defined(__APPLE__) || defined(TEXTFABRIC_HAVE_REMOTE_CONVERTER)
+// Captured stderr of a converter, trimmed, for error messages.
+std::string read_error_text(const std::filesystem::path& path) {
+    std::string text = read_file_bytes(path);
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) {
+        text.pop_back();
+    }
+    constexpr std::size_t kMaxLen = 500;
+    if (text.size() > kMaxLen) text = text.substr(0, kMaxLen) + "...";
+    return text;
+}
+#endif
+
+#ifdef __APPLE__
+// Run Word for Mac via AppleScript. Returns an empty string on success,
+// otherwise the reason. Word is quit afterwards only if this call started
+// it. `with timeout` bounds each Apple Event, so a dialog nobody answers
+// (sign-in, "Grant File Access" for the sandbox) fails the step instead of
+// hanging save() forever.
+std::string run_msword_mac_conversion(const std::string& format,  // "pdf" or "html"
+                                      const std::filesystem::path& input,
+                                      const std::filesystem::path& output)
+{
+    const std::filesystem::path dir    = output.parent_path();
+    const std::filesystem::path script = dir / "tf_msword.applescript";
+    const std::filesystem::path err    = dir / "tf_msword.err";
+    {
+        std::ofstream os(script, std::ios::binary);
+        if (!os) return "cannot write the AppleScript file";
+        os << "on run argv\n"
+              "  set inFile to POSIX file (item 1 of argv)\n"
+              "  set outPath to item 2 of argv\n"
+              "  set wasRunning to application \"Microsoft Word\" is running\n"
+              "  with timeout of 300 seconds\n"
+              "    tell application \"Microsoft Word\"\n"
+              "      open inFile\n"
+              "      set doc to active document\n"
+              "      try\n"
+              "        save as doc file name outPath file format "
+           << (format == "pdf" ? "format PDF" : "format filtered HTML") << "\n"
+              "      on error errMsg number errNum\n"
+              "        close doc saving no\n"
+              "        if not wasRunning then quit saving no\n"
+              "        error errMsg number errNum\n"
+              "      end try\n"
+              "      close doc saving no\n"
+              "      if not wasRunning then quit saving no\n"
+              "    end tell\n"
+              "  end timeout\n"
+              "end run\n";
+    }
+    const std::string cmd = fmt::format(
+        "osascript {} {} {} >/dev/null 2>{}",
+        shell_quote(script.string()),
+        shell_quote(std::filesystem::absolute(input).string()),
+        shell_quote(std::filesystem::absolute(output).string()),
+        shell_quote(err.string()));
+    const int rc = std::system(cmd.c_str());
+    std::error_code ec;
+    std::filesystem::remove(script, ec);
+    if (rc == 0) return {};
+
+    const std::string text = read_error_text(err);
+    if (text.find("-1743") != std::string::npos) {
+        return "macOS denied control of Microsoft Word — allow it in System "
+               "Settings → Privacy & Security → Automation";
+    }
+    return text.empty() ? "osascript failed" : "osascript: " + text;
+}
+#endif  // __APPLE__
+
+#if defined(TEXTFABRIC_HAVE_REMOTE_CONVERTER)
+// Quote a value for a curl config file ("..." with backslash escapes).
+std::string curl_config_quote(const std::string& s) {
+    std::string out = "\"";
+    for (const char c : s) {
+        if (c == '"' || c == '\\') out.push_back('\\');
+        out.push_back(c);
+    }
+    out.push_back('"');
+    return out;
+}
+
+// POST `input` to `url` as multipart `files` (Gotenberg's LibreOffice route
+// contract) and store the response body in `output`. Returns an empty string
+// on success, otherwise the reason. All options go through a curl config
+// file so the auth token never shows up on a command line (visible in the
+// process list) — and it is never put into the returned text.
+std::string run_remote_conversion(const std::string& url,
+                                  const std::filesystem::path& input,
+                                  const std::filesystem::path& output)
+{
+    int timeout_s = 120;
+    if (const char* t = std::getenv("TEXTFABRIC_CONVERTER_TIMEOUT"); t != nullptr) {
+        try { timeout_s = std::max(1, std::stoi(t)); } catch (...) { /* keep default */ }
+    }
+
+    const std::filesystem::path dir = output.parent_path();
+    const std::filesystem::path cfg = dir / "tf_curl.cfg";
+    const std::filesystem::path err = dir / "tf_curl.err";
+    {
+        std::ofstream os(cfg, std::ios::binary);
+        if (!os) return "cannot write the curl config file";
+        os << "silent\nshow-error\nfail\n"
+           << "max-time = " << timeout_s << "\n"
+           << "url = " << curl_config_quote(url) << "\n"
+           << "form = " << curl_config_quote("files=@" + input.string()) << "\n"
+           << "output = " << curl_config_quote(output.string()) << "\n";
+        if (const char* token = std::getenv("TEXTFABRIC_CONVERTER_TOKEN");
+            token != nullptr && *token != '\0') {
+            os << "header = "
+               << curl_config_quote(std::string("Authorization: Bearer ") + token) << "\n";
+        }
+    }
+#ifdef _WIN32
+    constexpr const char* kNull = "nul";
+#else
+    constexpr const char* kNull = "/dev/null";
+#endif
+    const std::string cmd = fmt::format("curl --config {} >{} 2>{}",
+                                        shell_quote(cfg.string()), kNull,
+                                        shell_quote(err.string()));
+    const int rc = std::system(cmd.c_str());
+    std::error_code ec;
+    std::filesystem::remove(cfg, ec);
+
+    if (rc != 0) {
+        const std::string text = read_error_text(err);
+        return text.empty() ? "curl failed" : text;
+    }
+    // A misconfigured endpoint (wrong route, HTML error page with 200)
+    // must fail loudly rather than be saved as report.pdf.
+    std::ifstream in(output, std::ios::binary);
+    char magic[4] = {};
+    in.read(magic, 4);
+    if (in.gcount() != 4 || std::string(magic, 4) != "%PDF") {
+        return "endpoint response is not a PDF";
+    }
+    return {};
+}
+#endif  // TEXTFABRIC_HAVE_REMOTE_CONVERTER
+
 } // namespace
 
 void DocxMerger::save(const std::string& path) {
@@ -521,28 +903,15 @@ void DocxMerger::save(const std::string& path) {
     const std::string ext = p.extension().string();
 
     if (ext == ".pdf" || ext == ".html" || ext == ".htm") {
-        const Converter conv = find_converter();
-        if (conv.kind == ConverterKind::None) {
-#if defined(TEXTFABRIC_HAVE_PODOFO)
-            // Fallback tried only after Word/LibreOffice come up empty, and
-            // only for ".pdf" — the native renderer doesn't do HTML. See
-            // PLAN.md ("Proposed direction") for why this is scoped this way.
-            // TEXTFABRIC_DISABLE_CONVERTERS is a master kill switch (tests
-            // rely on it to assert the NoConverter path) — it must suppress
-            // this fallback too, not just Word/LibreOffice detection.
-            if (ext == ".pdf" && !env_nonempty("TEXTFABRIC_DISABLE_CONVERTERS")) {
-                docx::render_native_pdf(document_, parts_, p);
-                return;
-            }
-#endif
+        const std::string conv_format = (ext == ".pdf") ? "pdf" : "html";
+        const ConverterChain chain = find_converters(conv_format);
+        if (chain.available.empty()) {
+            std::string why;
+            for (const auto& s : chain.skipped) why += "\n  - " + s;
             throw ReportException(
                 ReportError::NoConverter,
-                fmt::format(
-                    "No converter available to produce {}. On Windows install "
-                    "Microsoft Word or LibreOffice; on Linux/macOS install "
-                    "LibreOffice. Set TEXTFABRIC_SOFFICE to an absolute path "
-                    "to override LibreOffice detection.",
-                    ext));
+                fmt::format("No conversion tool available to produce {}:{}",
+                            ext, why));
         }
 
         // Two-step: serialize to .docx in a scratch dir, then convert.
@@ -556,65 +925,110 @@ void DocxMerger::save(const std::string& path) {
 
         reserialize_document();
         try {
-            write_archive(scratch_docx);
+            // Converter input only — see add_default_theme().
+            std::unordered_map<std::string, std::string> themed;
+            if (needs_default_theme(parts_)) {
+                themed = parts_;
+                add_default_theme(themed);
+            }
+            write_archive(themed.empty() ? parts_ : themed, scratch_docx);
         } catch (...) {
             cleanup();
             throw;
         }
 
-        const std::string conv_format = (ext == ".pdf") ? "pdf" : "html";
-        const std::filesystem::path produced =
-            scratch / ("output." + conv_format);
+        // Try each converter in turn; each gets its own output directory so
+        // leftovers of a failed attempt can't be mistaken for output.
+        struct Failure {
+            ReportError code;
+            std::string text;
+        };
+        std::vector<Failure> failures;
+        std::filesystem::path produced;
+        for (std::size_t i = 0; i < chain.available.size() && produced.empty(); ++i) {
+            const Converter& conv = chain.available[i];
+            const std::filesystem::path outdir = scratch / fmt::format("try{}", i);
+            const std::filesystem::path target = outdir / ("output." + conv_format);
+            std::error_code dir_ec;
+            std::filesystem::create_directories(outdir, dir_ec);
 
-        bool        ok         = false;
-        const char* conv_label = "unknown";
-        switch (conv.kind) {
-            case ConverterKind::LibreOffice:
-                conv_label = "LibreOffice";
-                ok = run_soffice_conversion(conv.soffice_path, conv_format,
-                                            scratch_docx, scratch);
-                break;
-#ifdef _WIN32
-            case ConverterKind::MSWord:
-                conv_label = "Microsoft Word";
-                ok = run_msword_conversion(conv_format, scratch_docx, produced);
-                break;
+            std::string error;
+            ReportError code = ReportError::SaveFailed;
+            try {
+                switch (conv.kind) {
+                    case ConverterKind::MSWord:
+#if defined(_WIN32)
+                        if (!run_msword_conversion(conv_format, scratch_docx, target)) {
+                            error = "conversion failed";
+                        }
+#elif defined(__APPLE__)
+                        error = run_msword_mac_conversion(conv_format, scratch_docx, target);
 #endif
-            default:
-                break;  // unreachable: None was rejected above
+                        break;
+                    case ConverterKind::LibreOffice:
+                        if (!run_soffice_conversion(conv.location, conv_format,
+                                                    scratch_docx, outdir)) {
+                            error = "soffice exited with an error";
+                        }
+                        break;
+                    case ConverterKind::NativePdf:
+#if defined(TEXTFABRIC_HAVE_PODOFO)
+                        docx::render_native_pdf(document_, parts_, target);
+#endif
+                        break;
+                    case ConverterKind::Remote:
+#if defined(TEXTFABRIC_HAVE_REMOTE_CONVERTER)
+                        error = run_remote_conversion(conv.location, scratch_docx, target);
+#endif
+                        break;
+                }
+            } catch (const ReportException& e) {
+                code  = e.code();
+                error = e.what();
+            }
+            if (error.empty() && !std::filesystem::exists(target)) {
+                error = "reported success but produced no output";
+            }
+            if (error.empty()) {
+                produced = target;
+            } else {
+                failures.push_back({code, fmt::format("{}: {}",
+                                    converter_label(conv.kind), error)});
+            }
         }
 
-        if (!ok) {
+        if (produced.empty()) {
             cleanup();
+            if (failures.size() == 1) {
+                throw ReportException(failures.front().code, failures.front().text);
+            }
+            std::string why;
+            for (const auto& f : failures) why += "\n  - " + f.text;
             throw ReportException(
                 ReportError::SaveFailed,
-                fmt::format("{} failed while converting to {}",
-                            conv_label, ext));
-        }
-        if (!std::filesystem::exists(produced)) {
-            cleanup();
-            throw ReportException(
-                ReportError::SaveFailed,
-                fmt::format("{} returned 0 but expected output {} is missing",
-                            conv_label, produced.string()));
+                fmt::format("every available converter failed to produce {}:{}",
+                            ext, why));
         }
 
         // LibreOffice's HTML export writes referenced images as sibling
-        // files next to `produced` inside `scratch` (e.g.
-        // "output_html_....png") instead of embedding them. Inline every
-        // such file into `produced` as a base64 data: URI so the final
-        // HTML is self-contained; the siblings themselves are discarded
-        // with the rest of `scratch` below. PDF conversion has no
-        // siblings, so this is a no-op for ".pdf".
-        std::error_code list_ec;
-        std::vector<std::filesystem::path> siblings;
-        for (const auto& entry :
-             std::filesystem::directory_iterator(scratch, list_ec)) {
-            if (!entry.is_regular_file()) continue;
-            if (entry.path() == produced || entry.path() == scratch_docx) continue;
-            siblings.push_back(entry.path());
+        // files next to `produced` (e.g. "output_html_....png") instead of
+        // embedding them. Inline every such file into `produced` as a
+        // base64 data: URI so the final HTML is self-contained; the
+        // siblings themselves are discarded with the rest of `scratch`
+        // below. PDF conversion has no siblings, so this is a no-op for
+        // ".pdf". Converter helper files (tf_*) are not images.
+        if (conv_format == "html") {
+            std::error_code list_ec;
+            std::vector<std::filesystem::path> siblings;
+            for (const auto& entry :
+                 std::filesystem::directory_iterator(produced.parent_path(), list_ec)) {
+                if (!entry.is_regular_file()) continue;
+                if (entry.path() == produced) continue;
+                if (entry.path().filename().string().rfind("tf_", 0) == 0) continue;
+                siblings.push_back(entry.path());
+            }
+            inline_sibling_images(produced, siblings);
         }
-        inline_sibling_images(produced, siblings);
 
         // Move into place. Cross-device move is possible (tmp on a different
         // filesystem than the target) so fall back to copy.

@@ -118,6 +118,23 @@ std::string paragraph_plain_text(pugi::xml_node p) {
     return out;
 }
 
+// draw_line() draws exactly one line — but a string reaching it isn't
+// always actually one line: real Excel-authored chart category/series text
+// can carry a literal embedded line break (Alt+Enter inside a cell), e.g.
+// a two-line axis label serialized as "<c:v>0,5\n0,6</c:v>". PoDoFo's
+// embedded-CID-font encoding path throws PdfErrorCode::InvalidFontData on
+// a raw control character in a DrawText() string, which would otherwise
+// take down the whole save() over one axis label. Collapse any C0 control
+// character to a space here — the one choke point nearly everything this
+// renderer draws passes through — rather than chasing every place text
+// might originate from.
+std::string sanitize_single_line(std::string s) {
+    for (char& ch : s) {
+        if (static_cast<unsigned char>(ch) < 0x20) ch = ' ';
+    }
+    return s;
+}
+
 RelMap build_rel_map(const PartMap& parts) {
     RelMap out;
     const auto it = parts.find("word/_rels/document.xml.rels");
@@ -177,7 +194,7 @@ ImageBlock resolve_image(pugi::xml_node drawing, const RelMap& rels, const PartM
     return img;
 }
 
-// ── Charts (bar/line/area only — see PLAN.md for pie/doughnut/radar/3D) ────
+// ── Charts (bar/line/area/pie/doughnut — see PLAN.md for radar/ofPie/etc.) ─
 //
 // Reads the same <c:cat>/<c:val> cache shape merger.cpp already parses for
 // setChartValue/setChartData, but only ever reads it (this renderer never
@@ -186,7 +203,7 @@ ImageBlock resolve_image(pugi::xml_node drawing, const RelMap& rels, const PartM
 // concerns (category matching by name, cache rewriting) this code doesn't
 // need.
 
-enum class ChartKind { Bar, Line, Area };
+enum class ChartKind { Bar, Line, Area, Pie, Doughnut };
 
 struct ChartSeriesData {
     std::string          name;
@@ -200,8 +217,8 @@ struct ChartData {
 
 std::string read_series_name(pugi::xml_node ser) {
     pugi::xml_node pt = ser.child("c:tx").child("c:strRef").child("c:strCache").child("c:pt");
-    if (pt) return pt.child_value("c:v");
-    return ser.child("c:tx").child_value("c:v");  // rare literal <c:tx><c:v> form
+    if (pt) return sanitize_single_line(pt.child_value("c:v"));
+    return sanitize_single_line(ser.child("c:tx").child_value("c:v"));  // rare literal <c:tx><c:v> form
 }
 
 ChartData read_chart_series_data(pugi::xml_node type_node) {
@@ -215,7 +232,10 @@ ChartData read_chart_series_data(pugi::xml_node type_node) {
             pugi::xml_node cache = cat.child("c:strRef").child("c:strCache");
             if (!cache) cache = cat.child("c:numRef").child("c:numCache");
             for (pugi::xml_node pt : cache.children("c:pt")) {
-                data.categories.emplace_back(pt.child_value("c:v"));
+                // Real Excel-authored categories can carry a literal
+                // embedded line break (Alt+Enter in a cell) — collapse it,
+                // this renderer draws axis labels as a single line.
+                data.categories.emplace_back(sanitize_single_line(pt.child_value("c:v")));
             }
         }
 
@@ -248,6 +268,257 @@ const PoDoFo::PdfColor& chart_palette_color(std::size_t index) {
         PoDoFo::PdfColor(0.25, 0.55, 0.65),
     };
     return kPalette[index % (sizeof(kPalette) / sizeof(kPalette[0]))];
+}
+
+struct ResolvedChart {
+    ChartKind kind      = ChartKind::Bar;
+    double    hole_frac = 0.5;   // only meaningful for Doughnut
+    ChartData data;
+    double    width_pt  = 0.0;   // from the drawing's <wp:extent>
+    double    height_pt = 0.0;
+};
+
+// Resolves a <c:chart r:id="..."> reference to its part (the relationship
+// lives in the same word/_rels/document.xml.rels as image relationships,
+// just under a different Id), classifies the plot type, and reads its
+// series/category data plus the drawing's natural (unscaled) size. Throws
+// NotImplemented for anything outside bar/line/area/pie/doughnut (their 3D
+// variants rendered flat, no projection) — see PLAN.md.
+ResolvedChart resolve_chart(pugi::xml_node drawing, pugi::xml_node chart_ref,
+                            const RelMap& rels, const PartMap& parts) {
+    const std::string rid = chart_ref.attribute("r:id").value();
+    const auto rel_it = rels.find(rid);
+    if (rel_it == rels.end()) {
+        throw ReportException(
+            ReportError::CantCopyDocxTemplate,
+            fmt::format("native PDF backend: dangling chart relationship '{}'", rid));
+    }
+    const std::string chart_part_name = "word/" + rel_it->second;
+    const auto part_it = parts.find(chart_part_name);
+    if (part_it == parts.end()) {
+        throw ReportException(
+            ReportError::CantCopyDocxTemplate,
+            fmt::format("native PDF backend: missing chart part '{}'", chart_part_name));
+    }
+
+    pugi::xml_document chart_doc;
+    if (!chart_doc.load_buffer(part_it->second.data(), part_it->second.size())) {
+        throw ReportException(
+            ReportError::CantCopyDocxTemplate,
+            fmt::format("native PDF backend: chart part '{}' failed to parse", chart_part_name));
+    }
+    pugi::xml_node plot_area =
+        chart_doc.child("c:chartSpace").child("c:chart").child("c:plotArea");
+
+    pugi::xml_node type_node;
+    ChartKind kind = ChartKind::Bar;
+    bool recognized = false;
+    bool supported  = false;
+    for (pugi::xml_node child : plot_area.children()) {
+        const std::string_view name = child.name();
+        if (name == "c:barChart" || name == "c:bar3DChart") {
+            type_node = child; kind = ChartKind::Bar; recognized = supported = true;
+        } else if (name == "c:lineChart" || name == "c:line3DChart") {
+            type_node = child; kind = ChartKind::Line; recognized = supported = true;
+        } else if (name == "c:areaChart" || name == "c:area3DChart") {
+            type_node = child; kind = ChartKind::Area; recognized = supported = true;
+        } else if (name == "c:pieChart" || name == "c:pie3DChart") {
+            type_node = child; kind = ChartKind::Pie; recognized = supported = true;
+        } else if (name == "c:doughnutChart") {
+            type_node = child; kind = ChartKind::Doughnut; recognized = supported = true;
+        } else if (name == "c:ofPieChart" || name == "c:radarChart"
+                || name == "c:scatterChart" || name == "c:bubbleChart"
+                || name == "c:stockChart" || name == "c:surfaceChart"
+                || name == "c:surface3DChart") {
+            recognized = true;
+        }
+        if (recognized) break;
+    }
+    if (!supported) {
+        throw ReportException(
+            ReportError::NotImplemented,
+            "native PDF backend renders bar/line/area/pie/doughnut charts "
+            "only so far — pie-of-pie/bar-of-pie, radar, scatter, bubble, "
+            "stock, and surface charts are not yet implemented (see "
+            "PLAN.md); use the Word/LibreOffice converter path for "
+            "templates containing one of those");
+    }
+
+    ResolvedChart rc;
+    rc.kind = kind;
+    rc.data = read_chart_series_data(type_node);
+    if (rc.data.categories.empty() || rc.data.series.empty()) {
+        throw ReportException(
+            ReportError::CantCopyDocxTemplate,
+            "native PDF backend: chart has no readable category/series data");
+    }
+    if (kind == ChartKind::Doughnut) {
+        // <c:holeSize val="50"/> — percentage of outer radius the hole
+        // occupies; only meaningful for doughnut, absent on pie.
+        rc.hole_frac = type_node.child("c:holeSize").attribute("val").as_double(50.0) / 100.0;
+    }
+
+    pugi::xml_node extent = find_descendant(drawing, "wp:extent");
+    constexpr double kDefaultChartCx = 9525.0 * 640.0;
+    constexpr double kDefaultChartCy = 9525.0 * 380.0;
+    rc.width_pt  = emu_to_pt(extent.attribute("cx").as_double(kDefaultChartCx));
+    rc.height_pt = emu_to_pt(extent.attribute("cy").as_double(kDefaultChartCy));
+    return rc;
+}
+
+// Finds a table style's own <w:style> node in styles.xml by id — only the
+// direct w:type="table" entries; <w:basedOn> inheritance chains (e.g.
+// TableGrid and PlainTable4 both declare w:basedOn="TableNormal") aren't
+// followed, so a style whose own <w:tblPr> has no border info is treated
+// as "this style deliberately specifies none" rather than climbing to its
+// parent's. Confirmed against a real template: Word's built-in "Plain
+// Table 4" style has no <w:tblBorders> anywhere in its own definition
+// (banding comes from cell shading, not lines) and TableGrid defines every
+// side as "single" directly — TableNormal's own (usually empty) borders
+// never actually come into play for either in practice.
+pugi::xml_node find_table_style(const pugi::xml_document& styles_doc, const std::string& style_id) {
+    if (style_id.empty()) return {};
+    for (pugi::xml_node style : styles_doc.child("w:styles").children("w:style")) {
+        if (std::strcmp(style.attribute("w:type").value(), "table") != 0) continue;
+        if (style_id == style.attribute("w:styleId").value()) return style;
+    }
+    return {};
+}
+
+// Whether one border side is visible, resolved the way Word actually does
+// it, in priority order:
+//   1. A per-cell <w:tcPr>/<w:tcBorders> override — real templates
+//      routinely borderless a whole table except for e.g. a single
+//      underline under the header row, via exactly this mechanism.
+//   2. The table's own <w:tblPr>/<w:tblBorders> — its outer edge value
+//      (top/left/bottom/right) for a cell actually on that edge of the
+//      table, its "inside" value (insideH/insideV) for every interior
+//      row/column boundary.
+//   3. The referenced table *style*'s own <w:tblBorders> (see
+//      find_table_style()) — same outer/inside distinction. A style's
+//      per-region conditional formatting (<w:tblStylePr w:type="firstRow">
+//      and friends, which real "Plain Table" styles use for bold text and
+//      banded shading, not borders) isn't resolved — out of scope, see
+//      PLAN.md.
+//   4. With no signal from any of the above: `false` (no visible border)
+//      if the table named a style that was actually found — even one
+//      that, like Plain Table 4, defines no border information anywhere,
+//      relying entirely on shading — since that's a deliberate design, not
+//      missing data. Only a table with no style reference at all (this
+//      project's own examples, which set <w:tblBorders> directly instead)
+//      falls back to `true`, preserving the original default for
+//      hand-authored templates that specify neither.
+bool cell_border_visible(pugi::xml_node tc, pugi::xml_node tbl_borders,
+                         pugi::xml_node style_borders, bool style_resolved,
+                         const char* cell_side, const char* table_outer_side,
+                         const char* table_inside_side, bool is_outer_edge) {
+    if (pugi::xml_node tc_borders = tc.child("w:tcPr").child("w:tcBorders")) {
+        if (pugi::xml_node b = tc_borders.child(cell_side)) {
+            const std::string val = b.attribute("w:val").value();
+            return val != "none" && val != "nil";
+        }
+    }
+    const char* side = is_outer_edge ? table_outer_side : table_inside_side;
+    if (tbl_borders) {
+        if (pugi::xml_node b = tbl_borders.child(side)) {
+            const std::string val = b.attribute("w:val").value();
+            return val != "none" && val != "nil";
+        }
+    }
+    if (style_borders) {
+        if (pugi::xml_node b = style_borders.child(side)) {
+            const std::string val = b.attribute("w:val").value();
+            return val != "none" && val != "nil";
+        }
+    }
+    return !style_resolved;
+}
+
+struct CellBorderSides { bool top, left, bottom, right; };
+
+CellBorderSides resolve_cell_borders(pugi::xml_node tc, pugi::xml_node tbl_borders,
+                                     pugi::xml_node style_borders, bool style_resolved,
+                                     bool first_row, bool last_row,
+                                     bool first_col, bool last_col) {
+    CellBorderSides s;
+    s.top    = cell_border_visible(tc, tbl_borders, style_borders, style_resolved,
+                                   "w:top",    "w:top",    "w:insideH", first_row);
+    s.bottom = cell_border_visible(tc, tbl_borders, style_borders, style_resolved,
+                                   "w:bottom", "w:bottom", "w:insideH", last_row);
+    s.left   = cell_border_visible(tc, tbl_borders, style_borders, style_resolved,
+                                   "w:left",   "w:left",   "w:insideV", first_col);
+    s.right  = cell_border_visible(tc, tbl_borders, style_borders, style_resolved,
+                                   "w:right",  "w:right",  "w:insideV", last_col);
+    return s;
+}
+
+// Column widths for a table laid out at `width` points wide. `force_fit`
+// rescales the template's own <w:tblGrid> widths (originally computed
+// relative to the full page) to exactly fill `width` regardless of
+// direction — required for a nested table inside a cell, whose available
+// width is a fraction of the page and almost never matches what the
+// template's author saw. At the page level (force_fit=false) a table
+// narrower than the page keeps its own width and stays left-aligned,
+// matching the template's intent; it's only ever scaled *down* if it would
+// otherwise overflow the page.
+std::vector<double> table_column_widths(pugi::xml_node tbl, double width, bool force_fit) {
+    std::vector<double> col_widths;
+    if (pugi::xml_node grid = tbl.child("w:tblGrid")) {
+        for (pugi::xml_node col : grid.children("w:gridCol")) {
+            col_widths.push_back(twips_to_pt(col.attribute("w:w").as_llong(0)));
+        }
+    }
+    if (col_widths.empty()) {
+        pugi::xml_node first_tr = tbl.child("w:tr");
+        std::size_t ncols = 0;
+        for (pugi::xml_node tc : first_tr.children("w:tc")) { (void)tc; ++ncols; }
+        ncols = std::max<std::size_t>(ncols, 1);
+        col_widths.assign(ncols, width / static_cast<double>(ncols));
+        return col_widths;
+    }
+    double sum = 0.0;
+    for (double w : col_widths) sum += w;
+    if (sum <= 0.0) {
+        col_widths.assign(col_widths.size(), width / static_cast<double>(col_widths.size()));
+        return col_widths;
+    }
+    if (force_fit || sum > width) {
+        const double scale = width / sum;
+        for (double& w : col_widths) w *= scale;
+    }
+    return col_widths;
+}
+
+// Per-column `col_widths` only lines up 1:1 with a row's actual <w:tc>
+// elements when no cell in the row merges columns. A cell carrying
+// <w:tcPr>/<w:gridSpan val="N"> consumes N consecutive grid columns, not
+// one — confirmed as the real cause of a badly-compressed real-world
+// nested table: its immediate parent cell spanned both columns of a
+// 2-column outer layout table (gridSpan="2", the full page width) but was
+// being sized as only the *first* column, compressing everything nested
+// inside it by roughly half. Returns one width per entry in `cells`,
+// walking the grid column cursor forward by each cell's own span so a
+// later cell's index into `col_widths` is never assumed to equal its
+// position in `cells`.
+std::vector<double> cell_widths_for_row(const std::vector<pugi::xml_node>& cells,
+                                        const std::vector<double>& col_widths) {
+    std::vector<double> widths;
+    widths.reserve(cells.size());
+    std::size_t grid_col = 0;
+    for (pugi::xml_node tc : cells) {
+        std::size_t span = 1;
+        if (pugi::xml_node gs = tc.child("w:tcPr").child("w:gridSpan")) {
+            span = std::max<unsigned>(1, gs.attribute("w:val").as_uint(1));
+        }
+        double w = 0.0;
+        for (std::size_t k = 0; k < span && grid_col + k < col_widths.size(); ++k) {
+            w += col_widths[grid_col + k];
+        }
+        if (w <= 0.0 && !col_widths.empty()) w = col_widths.back();
+        widths.push_back(w);
+        grid_col += span;
+    }
+    return widths;
 }
 
 // Explicit env override (mirrors the TEXTFABRIC_SOFFICE pattern) first, then
@@ -296,13 +567,29 @@ constexpr double kCellPadding          = 4.0;
 // already reads as comfortable there.
 constexpr double kBlockGap = 6.0;
 
+// What a table cell's content resolves to for layout purposes. Real-world
+// templates mix these more freely than this models (see PLAN.md) — a cell
+// is classified as exactly ONE of these, in priority order: a nested table
+// wins over everything else in the cell, then the first picture/chart
+// drawing, then plain paragraph text. A cell that mixes a drawing with
+// meaningful surrounding text only shows the drawing.
+struct CellContent {
+    enum class Kind { Empty, Text, Image, Chart, NestedTable } kind = Kind::Empty;
+    std::vector<std::string> text_lines;
+    ImageBlock      image;
+    ResolvedChart   chart;
+    pugi::xml_node  nested_tbl;
+    double          height = 0.0;  // computed once, reused for measure + draw
+};
+
 // Walks one in-memory document and lays it out onto a growing PdfMemDocument,
 // page by page. Not reentrant / not thread-safe — one Layout per document.
 class Layout {
 public:
     Layout(PoDoFo::PdfMemDocument& doc, const PageMetrics& pm,
-           PoDoFo::PdfFont& regular, PoDoFo::PdfFont& bold)
-        : doc_(doc), pm_(pm), regular_(regular), bold_(bold) {}
+           PoDoFo::PdfFont& regular, PoDoFo::PdfFont& bold,
+           const pugi::xml_document& styles_doc)
+        : doc_(doc), pm_(pm), regular_(regular), bold_(bold), styles_doc_(styles_doc) {}
 
     void new_page() {
         if (page_open_) painter_.FinishDrawing();
@@ -363,7 +650,11 @@ public:
         }
     }
 
-    void draw_table(pugi::xml_node tbl) {
+    // Top-level table: the only one that participates in page-break
+    // decisions (checked per row, via the shared cursor_y_). A nested
+    // table (reached through a cell's own content) never triggers a page
+    // break — see layout_table_rows().
+    void draw_table(pugi::xml_node tbl, const RelMap& rels, const PartMap& parts) {
         std::vector<pugi::xml_node> row_nodes;
         for (pugi::xml_node tr : tbl.children("w:tr")) row_nodes.push_back(tr);
         if (row_nodes.empty()) return;
@@ -371,18 +662,9 @@ public:
         ensure_space(kBlockGap);
         cursor_y_ -= kBlockGap;
 
-        std::vector<double> col_widths;
-        if (pugi::xml_node grid = tbl.child("w:tblGrid")) {
-            for (pugi::xml_node col : grid.children("w:gridCol")) {
-                col_widths.push_back(twips_to_pt(col.attribute("w:w").as_llong(0)));
-            }
-        }
-        if (col_widths.empty()) {
-            std::size_t ncols = 0;
-            for (auto tc : row_nodes.front().children("w:tc")) { (void)tc; ++ncols; }
-            ncols = std::max<std::size_t>(ncols, 1);
-            col_widths.assign(ncols, content_width() / static_cast<double>(ncols));
-        }
+        const std::vector<double> col_widths =
+            table_column_widths(tbl, content_width(), /*force_fit*/false);
+        const TableBorderSources borders = resolve_table_border_sources(tbl);
 
         PoDoFo::PdfTextState table_state;
         table_state.Font     = &regular_;
@@ -390,38 +672,36 @@ public:
         const double line_height =
             std::max(regular_.GetLineSpacing(table_state), kDefaultTableFontSize * 1.15);
 
-        for (pugi::xml_node tr : row_nodes) {
+        for (std::size_t ri = 0; ri < row_nodes.size(); ++ri) {
+            pugi::xml_node tr = row_nodes[ri];
+            const bool first_row = (ri == 0);
+            const bool last_row  = (ri == row_nodes.size() - 1);
+
             std::vector<pugi::xml_node> cells;
             for (pugi::xml_node tc : tr.children("w:tc")) cells.push_back(tc);
+            const std::vector<double> cell_widths = cell_widths_for_row(cells, col_widths);
 
-            std::vector<std::vector<std::string>> cell_lines(cells.size());
-            std::size_t max_lines = 1;
+            std::vector<CellContent> contents(cells.size());
+            double row_height = kDefaultTableFontSize * 1.15 + 2 * kCellPadding;
             for (std::size_t i = 0; i < cells.size(); ++i) {
-                std::string text;
-                for (pugi::xml_node p : cells[i].children("w:p")) {
-                    if (!text.empty()) text += "\n";
-                    text += paragraph_plain_text(p);
-                }
-                const double col_w = (i < col_widths.size() ? col_widths[i] : col_widths.back());
-                cell_lines[i] = table_state.SplitTextAsLines(
-                    text, std::max(col_w - 2 * kCellPadding, 1.0));
-                max_lines = std::max(max_lines, cell_lines[i].size());
+                contents[i] = classify_cell(cells[i], std::max(cell_widths[i] - 2 * kCellPadding, 1.0),
+                                            rels, parts, table_state, line_height);
+                row_height = std::max(row_height, contents[i].height + 2 * kCellPadding);
             }
 
-            const double row_height = static_cast<double>(max_lines) * line_height + 2 * kCellPadding;
             ensure_space(row_height);
             const double row_top = cursor_y_;
 
             double x = pm_.margin_left_pt;
             for (std::size_t i = 0; i < cells.size(); ++i) {
-                const double col_w = (i < col_widths.size() ? col_widths[i] : col_widths.back());
-                painter_.DrawRectangle(x, row_top - row_height, col_w, row_height);
-
-                double ty = row_top - kCellPadding;
-                for (const std::string& line : cell_lines[i]) {
-                    ty -= line_height;
-                    draw_line(regular_, kDefaultTableFontSize, line, x + kCellPadding, ty);
-                }
+                const double col_w = cell_widths[i];
+                const CellBorderSides sides = resolve_cell_borders(
+                    cells[i], borders.tbl_borders, borders.style_borders, borders.style_resolved,
+                    first_row, last_row, i == 0, i == cells.size() - 1);
+                draw_cell_border(x, row_top - row_height, col_w, row_height, sides);
+                draw_cell_content(contents[i], x + kCellPadding, row_top - kCellPadding,
+                                  std::max(col_w - 2 * kCellPadding, 1.0), line_height,
+                                  rels, parts);
                 x += col_w;
             }
             cursor_y_ = row_top - row_height;
@@ -429,6 +709,206 @@ public:
     }
 
 private:
+    // Resolves the table-level and style-level border sources for one
+    // <w:tbl>, once per table rather than once per cell: its own
+    // <w:tblPr>/<w:tblBorders>, and — via <w:tblPr>/<w:tblStyle w:val="X">
+    // — style "X"'s own <w:tblBorders> plus whether that style was found
+    // at all (see cell_border_visible() for how the two combine).
+    struct TableBorderSources {
+        pugi::xml_node tbl_borders;
+        pugi::xml_node style_borders;
+        bool           style_resolved = false;
+    };
+
+    TableBorderSources resolve_table_border_sources(pugi::xml_node tbl) {
+        TableBorderSources src;
+        pugi::xml_node tbl_pr = tbl.child("w:tblPr");
+        src.tbl_borders = tbl_pr.child("w:tblBorders");
+        const std::string style_id = tbl_pr.child("w:tblStyle").attribute("w:val").value();
+        if (pugi::xml_node style = find_table_style(styles_doc_, style_id)) {
+            src.style_borders  = style.child("w:tblPr").child("w:tblBorders");
+            src.style_resolved = true;
+        }
+        return src;
+    }
+
+    // Classifies one <w:tc> and measures the height its content needs at
+    // `width` points wide — a nested <w:tbl> recurses (dry run, no
+    // drawing) to get its own total height. Shared between the page-level
+    // draw_table() and layout_table_rows() (nested tables) so both use
+    // identical sizing.
+    CellContent classify_cell(pugi::xml_node tc, double width,
+                              const RelMap& rels, const PartMap& parts,
+                              PoDoFo::PdfTextState& text_state, double line_height) {
+        CellContent c;
+        if (pugi::xml_node nested = tc.child("w:tbl")) {
+            c.kind = CellContent::Kind::NestedTable;
+            c.nested_tbl = nested;
+            c.height = layout_table_rows(nested, 0, 0, width, rels, parts, /*dry_run*/true);
+            return c;
+        }
+
+        for (pugi::xml_node p : tc.children("w:p")) {
+            pugi::xml_node drawing = find_descendant(p, "w:drawing");
+            if (!drawing) continue;
+            if (pugi::xml_node chart_ref = find_descendant(drawing, "c:chart")) {
+                c.kind  = CellContent::Kind::Chart;
+                c.chart = resolve_chart(drawing, chart_ref, rels, parts);
+                c.height = c.chart.height_pt;
+                if (c.chart.width_pt > width && c.chart.width_pt > 0.0) {
+                    c.height *= width / c.chart.width_pt;
+                }
+            } else {
+                c.kind  = CellContent::Kind::Image;
+                c.image = resolve_image(drawing, rels, parts);
+                c.height = c.image.height_pt;
+                if (c.image.width_pt > width && c.image.width_pt > 0.0) {
+                    c.height *= width / c.image.width_pt;
+                }
+            }
+            return c;
+        }
+
+        std::string text;
+        for (pugi::xml_node p : tc.children("w:p")) {
+            if (!text.empty()) text += "\n";
+            text += paragraph_plain_text(p);
+        }
+        c.kind       = CellContent::Kind::Text;
+        c.text_lines = text_state.SplitTextAsLines(text, width);
+        c.height     = static_cast<double>(std::max<std::size_t>(c.text_lines.size(), 1)) * line_height;
+        return c;
+    }
+
+    // Draws only the sides resolve_cell_borders() found visible, as
+    // independent line segments rather than one rectangle — two adjacent
+    // cells that disagree about their shared edge (a header cell's own
+    // <w:tcBorders> claiming a bottom line the row below doesn't repeat as
+    // its own top, say) both still get an honest rendering: whichever side
+    // claims the line draws it, redrawing an edge both sides claim is
+    // harmless.
+    void draw_cell_border(double x, double y, double w, double h, const CellBorderSides& sides) {
+        // A preceding line/area chart leaves the stroke width/color set to
+        // whatever it last drew a series with (draw_chart_plot() doesn't
+        // reset those two, only the colors used for fills/text) — pin both
+        // explicitly rather than let a border silently inherit that.
+        painter_.GraphicsState.SetLineWidth(1.0);
+        painter_.GraphicsState.SetStrokingColor(PoDoFo::PdfColor(0, 0, 0));
+        if (sides.top)    painter_.DrawLine(x, y + h, x + w, y + h);
+        if (sides.bottom) painter_.DrawLine(x, y, x + w, y);
+        if (sides.left)   painter_.DrawLine(x, y, x, y + h);
+        if (sides.right)  painter_.DrawLine(x + w, y, x + w, y + h);
+    }
+
+    // Draws one already-classified cell's content, top-aligned within the
+    // row, at the given content-box origin (inside the cell padding — the
+    // caller already drew the cell's own border rectangle, if any).
+    void draw_cell_content(const CellContent& c, double x, double top_y, double width,
+                           double line_height, const RelMap& rels, const PartMap& parts) {
+        switch (c.kind) {
+            case CellContent::Kind::Text: {
+                double ty = top_y;
+                for (const std::string& line : c.text_lines) {
+                    ty -= line_height;
+                    draw_line(regular_, kDefaultTableFontSize, line, x, ty);
+                }
+                break;
+            }
+            case CellContent::Kind::Image: {
+                std::unique_ptr<PoDoFo::PdfImage> image = doc_.CreateImage();
+                image->LoadFromBuffer(
+                    PoDoFo::bufferview(c.image.png_bytes.data(), c.image.png_bytes.size()));
+                const double h = c.height;
+                const double w = (c.image.height_pt > 0.0)
+                                     ? c.image.width_pt * (h / c.image.height_pt) : width;
+                const double scale_x = w / static_cast<double>(image->GetWidth());
+                const double scale_y = h / static_cast<double>(image->GetHeight());
+                painter_.DrawImage(*image, x, top_y - h, scale_x, scale_y);
+                break;
+            }
+            case CellContent::Kind::Chart: {
+                const double h = c.height;
+                const double w = (c.chart.height_pt > 0.0)
+                                     ? c.chart.width_pt * (h / c.chart.height_pt) : width;
+                // No legend — cells are usually too narrow to spare the
+                // extra row, and the category/series names are already
+                // visible via the rest of the cell's own table row/column
+                // headers in every real template this was tested against.
+                if (c.chart.kind == ChartKind::Pie || c.chart.kind == ChartKind::Doughnut) {
+                    draw_pie_chart_plot(c.chart.kind == ChartKind::Doughnut, c.chart.hole_frac,
+                                        c.chart.data, x, top_y - h, w, h);
+                } else {
+                    draw_chart_plot(c.chart.kind, c.chart.data, x, top_y - h, w, h);
+                }
+                break;
+            }
+            case CellContent::Kind::NestedTable:
+                layout_table_rows(c.nested_tbl, x, top_y, width, rels, parts, /*dry_run*/false);
+                break;
+            case CellContent::Kind::Empty:
+                break;
+        }
+    }
+
+    // A table laid out at a fixed (x, width) with no page-break awareness —
+    // used only for a table nested inside another table's cell, which is
+    // already confined to whatever vertical space the outer row measured
+    // for it. `dry_run` skips every painter_ call and just returns the
+    // total height, for the outer cell's own sizing pass. A nested table
+    // that overflows the bottom margin is a known limitation (see
+    // PLAN.md) — it draws into the margin rather than breaking pages.
+    double layout_table_rows(pugi::xml_node tbl, double x, double top_y, double width,
+                             const RelMap& rels, const PartMap& parts, bool dry_run) {
+        std::vector<pugi::xml_node> row_nodes;
+        for (pugi::xml_node tr : tbl.children("w:tr")) row_nodes.push_back(tr);
+        if (row_nodes.empty()) return 0.0;
+
+        const std::vector<double> col_widths = table_column_widths(tbl, width, /*force_fit*/true);
+        const TableBorderSources borders = resolve_table_border_sources(tbl);
+
+        PoDoFo::PdfTextState table_state;
+        table_state.Font     = &regular_;
+        table_state.FontSize = kDefaultTableFontSize;
+        const double line_height =
+            std::max(regular_.GetLineSpacing(table_state), kDefaultTableFontSize * 1.15);
+
+        double y = top_y;
+        for (std::size_t ri = 0; ri < row_nodes.size(); ++ri) {
+            pugi::xml_node tr = row_nodes[ri];
+            const bool first_row = (ri == 0);
+            const bool last_row  = (ri == row_nodes.size() - 1);
+
+            std::vector<pugi::xml_node> cells;
+            for (pugi::xml_node tc : tr.children("w:tc")) cells.push_back(tc);
+            const std::vector<double> cell_widths = cell_widths_for_row(cells, col_widths);
+
+            std::vector<CellContent> contents(cells.size());
+            double row_height = kDefaultTableFontSize * 1.15 + 2 * kCellPadding;
+            for (std::size_t i = 0; i < cells.size(); ++i) {
+                contents[i] = classify_cell(cells[i], std::max(cell_widths[i] - 2 * kCellPadding, 1.0),
+                                            rels, parts, table_state, line_height);
+                row_height = std::max(row_height, contents[i].height + 2 * kCellPadding);
+            }
+
+            if (!dry_run) {
+                double cx = x;
+                for (std::size_t i = 0; i < cells.size(); ++i) {
+                    const double col_w = cell_widths[i];
+                    const CellBorderSides sides = resolve_cell_borders(
+                        cells[i], borders.tbl_borders, borders.style_borders, borders.style_resolved,
+                        first_row, last_row, i == 0, i == cells.size() - 1);
+                    draw_cell_border(cx, y - row_height, col_w, row_height, sides);
+                    draw_cell_content(contents[i], cx + kCellPadding, y - kCellPadding,
+                                      std::max(col_w - 2 * kCellPadding, 1.0), line_height,
+                                      rels, parts);
+                    cx += col_w;
+                }
+            }
+            y -= row_height;
+        }
+        return top_y - y;
+    }
+
     double content_width() const {
         return pm_.width_pt - pm_.margin_left_pt - pm_.margin_right_pt;
     }
@@ -443,7 +923,7 @@ private:
         // PoDoFo version (BeginText/EndText are private — meant for a
         // lower-level multi-call text object API this renderer doesn't need).
         painter_.TextState.SetFont(font, size);
-        painter_.DrawText(text, x, y);
+        painter_.DrawText(sanitize_single_line(text), x, y);
     }
 
     void draw_image(const ImageBlock& img) {
@@ -459,91 +939,128 @@ private:
         cursor_y_ -= img.height_pt;
     }
 
-    // Resolves the chart part via the drawing's <c:chart r:id="..."> (the
-    // relationship lives in the same word/_rels/document.xml.rels as image
-    // relationships, just under a different Id), classifies its plot type,
-    // and either renders it (bar/line/area, including their 3D variants
-    // rendered flat) or throws NotImplemented for everything else.
+    // Resolves and renders a chart at page scale (bar/line/area/pie/
+    // doughnut, 3D variants rendered flat) or throws NotImplemented —
+    // see resolve_chart(). This is the page-flow entry point (with a
+    // legend row); a chart inside a table cell goes through
+    // draw_cell_content() instead, which skips the legend.
     void draw_chart_block(pugi::xml_node drawing, pugi::xml_node chart_ref,
                           const RelMap& rels, const PartMap& parts) {
-        const std::string rid = chart_ref.attribute("r:id").value();
-        const auto rel_it = rels.find(rid);
-        if (rel_it == rels.end()) {
-            throw ReportException(
-                ReportError::CantCopyDocxTemplate,
-                fmt::format("native PDF backend: dangling chart relationship '{}'", rid));
-        }
-        const std::string chart_part_name = "word/" + rel_it->second;
-        const auto part_it = parts.find(chart_part_name);
-        if (part_it == parts.end()) {
-            throw ReportException(
-                ReportError::CantCopyDocxTemplate,
-                fmt::format("native PDF backend: missing chart part '{}'", chart_part_name));
-        }
-
-        pugi::xml_document chart_doc;
-        if (!chart_doc.load_buffer(part_it->second.data(), part_it->second.size())) {
-            throw ReportException(
-                ReportError::CantCopyDocxTemplate,
-                fmt::format("native PDF backend: chart part '{}' failed to parse", chart_part_name));
-        }
-        pugi::xml_node plot_area =
-            chart_doc.child("c:chartSpace").child("c:chart").child("c:plotArea");
-
-        pugi::xml_node type_node;
-        ChartKind kind = ChartKind::Bar;
-        bool recognized = false;
-        bool supported  = false;
-        for (pugi::xml_node child : plot_area.children()) {
-            const std::string_view name = child.name();
-            if (name == "c:barChart" || name == "c:bar3DChart") {
-                type_node = child; kind = ChartKind::Bar; recognized = supported = true;
-            } else if (name == "c:lineChart" || name == "c:line3DChart") {
-                type_node = child; kind = ChartKind::Line; recognized = supported = true;
-            } else if (name == "c:areaChart" || name == "c:area3DChart") {
-                type_node = child; kind = ChartKind::Area; recognized = supported = true;
-            } else if (name == "c:pieChart" || name == "c:doughnutChart"
-                    || name == "c:ofPieChart" || name == "c:pie3DChart"
-                    || name == "c:radarChart" || name == "c:scatterChart"
-                    || name == "c:bubbleChart" || name == "c:stockChart"
-                    || name == "c:surfaceChart" || name == "c:surface3DChart") {
-                recognized = true;
-            }
-            if (recognized) break;
-        }
-        if (!supported) {
-            throw ReportException(
-                ReportError::NotImplemented,
-                "native PDF backend renders bar/line/area charts only so far "
-                "— pie/doughnut/radar/scatter/bubble/stock/surface charts are "
-                "not yet implemented (see PLAN.md); use the Word/LibreOffice "
-                "converter path for templates containing one of those");
-        }
-
-        const ChartData data = read_chart_series_data(type_node);
-        if (data.categories.empty() || data.series.empty()) {
-            throw ReportException(
-                ReportError::CantCopyDocxTemplate,
-                "native PDF backend: chart has no readable category/series data");
-        }
-
-        pugi::xml_node extent = find_descendant(drawing, "wp:extent");
-        constexpr double kDefaultChartCx = 9525.0 * 640.0;
-        constexpr double kDefaultChartCy = 9525.0 * 380.0;
-        const double width_pt = std::min(
-            emu_to_pt(extent.attribute("cx").as_double(kDefaultChartCx)), content_width());
-        const double height_pt = emu_to_pt(extent.attribute("cy").as_double(kDefaultChartCy));
+        const ResolvedChart rc = resolve_chart(drawing, chart_ref, rels, parts);
+        const double width_pt  = std::min(rc.width_pt, content_width());
+        const double height_pt = rc.height_pt;
 
         constexpr double kLegendRowHeight = 16.0;
         ensure_space(height_pt + kLegendRowHeight + kBlockGap);
         cursor_y_ -= kBlockGap;
 
         const double chart_top = cursor_y_;
-        draw_chart_plot(kind, data, pm_.margin_left_pt, chart_top - height_pt,
-                        width_pt, height_pt);
-        cursor_y_ = chart_top - height_pt;
-        draw_chart_legend(data, pm_.margin_left_pt, cursor_y_ - 4.0);
+        if (rc.kind == ChartKind::Pie || rc.kind == ChartKind::Doughnut) {
+            draw_pie_chart_plot(rc.kind == ChartKind::Doughnut, rc.hole_frac, rc.data,
+                               pm_.margin_left_pt, chart_top - height_pt,
+                               width_pt, height_pt);
+            cursor_y_ = chart_top - height_pt;
+            draw_category_legend(rc.data, pm_.margin_left_pt, cursor_y_ - 4.0);
+        } else {
+            draw_chart_plot(rc.kind, rc.data, pm_.margin_left_pt, chart_top - height_pt,
+                            width_pt, height_pt);
+            cursor_y_ = chart_top - height_pt;
+            draw_chart_legend(rc.data, pm_.margin_left_pt, cursor_y_ - 4.0);
+        }
         cursor_y_ -= kLegendRowHeight;
+    }
+
+    // Pie/doughnut layout: a single series read as one wedge per category
+    // (multi-series "concentric ring" doughnuts aren't supported — only
+    // data.series.front() is drawn), colored per-category like Word/Excel's
+    // <c:varyColors val="1"/> convention rather than per-series. Wedges
+    // start at 12 o'clock and sweep clockwise, matching Word/Excel/
+    // LibreOffice's own pie orientation.
+    void draw_pie_chart_plot(bool doughnut, double hole_frac, const ChartData& data,
+                             double x, double y, double w, double h) {
+        const auto& values = data.series.front().values;
+        const std::size_t n = std::min(values.size(), data.categories.size());
+
+        double total = 0.0;
+        for (std::size_t i = 0; i < n; ++i) total += std::max(values[i], 0.0);
+        if (total <= 0.0) total = 1.0;
+
+        const double cx = x + w / 2.0;
+        const double cy = y + h / 2.0;
+        const double radius  = std::min(w, h) / 2.0 * 0.80;
+        const double hole_r  = doughnut ? radius * std::clamp(hole_frac, 0.0, 0.9) : 0.0;
+
+        constexpr double kHalfPi = 1.5707963267948966;
+        constexpr double kTwoPi  = 6.283185307179586;
+
+        PoDoFo::PdfTextState label_state;
+        label_state.Font     = &regular_;
+        label_state.FontSize = 8.0;
+
+        double cum = 0.0;
+        for (std::size_t i = 0; i < n; ++i) {
+            const double frac = std::max(values[i], 0.0) / total;
+            if (frac <= 0.0) continue;
+            const double a_start = kHalfPi - kTwoPi * cum;
+            const double a_end   = kHalfPi - kTwoPi * (cum + frac);
+            const double a_mid   = (a_start + a_end) / 2.0;
+            cum += frac;
+
+            PoDoFo::PdfPainterPath path;
+            if (hole_r > 0.0) {
+                path.MoveTo(cx + hole_r * std::cos(a_start), cy + hole_r * std::sin(a_start));
+                path.AddLineTo(cx + radius * std::cos(a_start), cy + radius * std::sin(a_start));
+                path.AddArc(cx, cy, radius, a_start, a_end, /*clockwise*/false);
+                path.AddLineTo(cx + hole_r * std::cos(a_end), cy + hole_r * std::sin(a_end));
+                path.AddArc(cx, cy, hole_r, a_end, a_start, /*clockwise*/true);
+                path.Close();
+            } else {
+                path.MoveTo(cx, cy);
+                path.AddArc(cx, cy, radius, a_start, a_end, /*clockwise*/false);
+                path.Close();
+            }
+            painter_.GraphicsState.SetNonStrokingColor(chart_palette_color(i));
+            painter_.DrawPath(path, PoDoFo::PdfPathDrawMode::Fill);
+
+            char pct_buf[16];
+            std::snprintf(pct_buf, sizeof(pct_buf), "%.0f%%", frac * 100.0);
+            const double label_r = hole_r > 0.0 ? (hole_r + radius) / 2.0 : radius * 0.65;
+            const double label_w = regular_.GetStringLength(pct_buf, label_state);
+            painter_.GraphicsState.SetNonStrokingColor(PoDoFo::PdfColor(1, 1, 1));
+            draw_line(regular_, 8.0, pct_buf,
+                     cx + label_r * std::cos(a_mid) - label_w / 2.0,
+                     cy + label_r * std::sin(a_mid) - 3.0);
+        }
+
+        painter_.GraphicsState.SetNonStrokingColor(PoDoFo::PdfColor(0, 0, 0));
+    }
+
+    // Legend keyed by category (pie/doughnut have one series, many
+    // categories — the wedges, not the series, are what's color-coded).
+    // Same single-row-only simplification as draw_chart_legend().
+    void draw_category_legend(const ChartData& data, double x, double y) {
+        constexpr double kSwatch   = 8.0;
+        constexpr double kGap      = 6.0;
+        constexpr double kFontSize = 8.0;
+
+        PoDoFo::PdfTextState state;
+        state.Font     = &regular_;
+        state.FontSize = kFontSize;
+
+        double       cursor_x = x;
+        const double max_x    = x + content_width();
+        for (std::size_t i = 0; i < data.categories.size(); ++i) {
+            const std::string& name    = data.categories[i];
+            const double        text_w = regular_.GetStringLength(name, state);
+            const double        item_w = kSwatch + 4.0 + text_w + kGap * 2.0;
+            if (cursor_x + item_w > max_x && cursor_x > x) break;
+
+            painter_.GraphicsState.SetNonStrokingColor(chart_palette_color(i));
+            painter_.DrawRectangle(cursor_x, y, kSwatch, kSwatch, PoDoFo::PdfPathDrawMode::Fill);
+            painter_.GraphicsState.SetNonStrokingColor(PoDoFo::PdfColor(0, 0, 0));
+            draw_line(regular_, kFontSize, name, cursor_x + kSwatch + 4.0, y + 1.0);
+            cursor_x += item_w;
+        }
     }
 
     // Draws axes, gridlines with value labels, category labels, and the
@@ -708,13 +1225,14 @@ private:
         }
     }
 
-    PoDoFo::PdfMemDocument& doc_;
-    PageMetrics             pm_;
-    PoDoFo::PdfFont&        regular_;
-    PoDoFo::PdfFont&        bold_;
-    PoDoFo::PdfPainter      painter_;
-    double                  cursor_y_  = 0.0;
-    bool                    page_open_ = false;
+    PoDoFo::PdfMemDocument&   doc_;
+    PageMetrics               pm_;
+    PoDoFo::PdfFont&          regular_;
+    PoDoFo::PdfFont&          bold_;
+    const pugi::xml_document& styles_doc_;
+    PoDoFo::PdfPainter        painter_;
+    double                    cursor_y_  = 0.0;
+    bool                      page_open_ = false;
 };
 
 } // namespace
@@ -745,6 +1263,15 @@ void render_native_pdf(const pugi::xml_document& document,
     const PageMetrics pm = read_page_metrics(body);
     const RelMap rels    = build_rel_map(parts);
 
+    // Table *style* default borders (see find_table_style()) — best-effort;
+    // an absent or unparsable word/styles.xml just leaves this empty, which
+    // resolve_table_border_sources() treats as "no style resolved" (same
+    // as if the table named a style that genuinely doesn't exist).
+    pugi::xml_document styles_doc;
+    if (const auto it = parts.find("word/styles.xml"); it != parts.end()) {
+        styles_doc.load_buffer(it->second.data(), it->second.size());
+    }
+
     try {
         PdfMemDocument doc;
 
@@ -759,7 +1286,7 @@ void render_native_pdf(const pugi::xml_document& document,
             : (regular_path ? regular
                              : &doc.GetFonts().GetStandard14Font(PdfStandard14FontType::HelveticaBold));
 
-        Layout layout(doc, pm, *regular, *bold);
+        Layout layout(doc, pm, *regular, *bold, styles_doc);
         layout.new_page();
 
         for (pugi::xml_node child : body.children()) {
@@ -767,7 +1294,7 @@ void render_native_pdf(const pugi::xml_document& document,
             if (name == "w:p") {
                 layout.draw_paragraph(child, rels, parts);
             } else if (name == "w:tbl") {
-                layout.draw_table(child);
+                layout.draw_table(child, rels, parts);
             }
             // w:sectPr (already consumed above) and anything else the
             // library doesn't produce itself: silently skipped.

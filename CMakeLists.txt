@@ -29,6 +29,7 @@ option(TEXTFABRIC_BUILD_EXAMPLES "Build example programs"             OFF)
 option(TEXTFABRIC_BUILD_SHARED   "Build as shared library"            OFF)
 option(TEXTFABRIC_USE_FETCHCONTENT "Fall back to FetchContent for deps not found via find_package" ON)
 option(TEXTFABRIC_ENABLE_NATIVE_PDF "Native OOXML->PDF rendering via PoDoFo, no Microsoft Word/LibreOffice required (see PLAN.md)" OFF)
+option(TEXTFABRIC_ENABLE_REMOTE_CONVERTER "HTTP converter fallback (Gotenberg-compatible endpoint from TEXTFABRIC_CONVERTER_URL, via the curl CLI)" OFF)
 
 # ============================================================
 # Platform diagnostics
@@ -147,6 +148,9 @@ endif()
 if(TARGET podofo::podofo)
     target_compile_definitions(textfabric PRIVATE TEXTFABRIC_HAVE_PODOFO=1)
 endif()
+if(TEXTFABRIC_ENABLE_REMOTE_CONVERTER)
+    target_compile_definitions(textfabric PRIVATE TEXTFABRIC_HAVE_REMOTE_CONVERTER=1)
+endif()
 
 textfabric_apply_compiler_options(textfabric)
 
@@ -200,6 +204,9 @@ if(TEXTFABRIC_BUILD_SHARED AND TEXTFABRIC_BUILD_TESTS)
     endif()
     if(TARGET podofo::podofo)
         target_compile_definitions(textfabric_internal PUBLIC TEXTFABRIC_HAVE_PODOFO=1)
+    endif()
+    if(TEXTFABRIC_ENABLE_REMOTE_CONVERTER)
+        target_compile_definitions(textfabric_internal PUBLIC TEXTFABRIC_HAVE_REMOTE_CONVERTER=1)
     endif()
 
     set_target_properties(textfabric_internal PROPERTIES

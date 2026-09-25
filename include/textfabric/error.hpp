@@ -17,7 +17,7 @@ enum class ReportError : int {
     InvalidBookmark       = 3,   ///< requested bookmark not found
     InvalidField          = 4,   ///< requested field inside bookmark not found
     SaveFailed            = 5,   ///< output could not be written
-    NoConverter           = 6,   ///< LibreOffice soffice not found for .pdf/.html
+    NoConverter           = 6,   ///< no conversion tool available for .pdf/.html
     NotImplemented        = 7,   ///< feature scheduled for later stage
     Unknown               = 99,
 };

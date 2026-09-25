@@ -1,9 +1,10 @@
 // native_pdf_report — same kind of report as basic_report, but demonstrates
 // TextFabric's native PoDoFo PDF backend (TEXTFABRIC_ENABLE_NATIVE_PDF): the
 // resulting PDF is produced with no Microsoft Word or LibreOffice involved
-// at all, not even installed on the machine. See PLAN.md for the backend's
-// scope and known gaps (most notably: no embedded charts — the template
-// built here deliberately has none, unlike generate_template's).
+// at all, not even installed on the machine. Includes a bar chart and a pie
+// chart to show the backend's chart support (bar/line/area/pie/doughnut —
+// see PLAN.md for the full scope and known gaps, e.g. no pie-of-pie/radar/
+// scatter/bubble/stock/surface yet).
 //
 // This binary only exists when the library was built with
 // -DTEXTFABRIC_ENABLE_NATIVE_PDF=ON (see examples/CMakeLists.txt) — save()
@@ -62,10 +63,9 @@ int write_docx(const fs::path& out, const std::vector<Part>& parts) {
     return 0;
 }
 
-// Same boilerplate parts as generate_template.cpp, minus everything chart-
-// related (no [Content_Types].xml chart override, no chart relationship, no
-// word/charts/chart1.xml, no Body.Stats paragraph) — the native PDF backend
-// doesn't render charts, so this template deliberately has none.
+// Same boilerplate parts as generate_template.cpp, plus a second chart
+// (pie) alongside the bar chart to show off the fuller range of chart
+// types the native PDF backend now renders.
 
 constexpr std::string_view kContentTypes = R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
@@ -76,6 +76,10 @@ constexpr std::string_view kContentTypes = R"(<?xml version="1.0" encoding="UTF-
             ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
   <Override PartName="/word/styles.xml"
             ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>
+  <Override PartName="/word/charts/chart1.xml"
+            ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>
+  <Override PartName="/word/charts/chart2.xml"
+            ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>
 </Types>)";
 
 constexpr std::string_view kPackageRels = R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -90,7 +94,62 @@ constexpr std::string_view kDocumentRels = R"(<?xml version="1.0" encoding="UTF-
   <Relationship Id="rId1"
                 Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles"
                 Target="styles.xml"/>
+  <Relationship Id="rIdChart1"
+                Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart"
+                Target="charts/chart1.xml"/>
+  <Relationship Id="rIdChart2"
+                Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart"
+                Target="charts/chart2.xml"/>
 </Relationships>)";
+
+// Bar chart: one series × three categories — same shape as
+// generate_template.cpp's, kept here so this example is self-contained.
+constexpr std::string_view kBarChart = R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <c:chart><c:plotArea><c:layout/>
+    <c:barChart>
+      <c:barDir val="col"/><c:grouping val="clustered"/><c:varyColors val="0"/>
+      <c:ser>
+        <c:idx val="0"/><c:order val="0"/>
+        <c:tx><c:strRef><c:f>Sheet1!$B$1</c:f><c:strCache><c:ptCount val="1"/><c:pt idx="0"><c:v>Measurements</c:v></c:pt></c:strCache></c:strRef></c:tx>
+        <c:cat><c:strRef><c:f>Sheet1!$A$2:$A$4</c:f><c:strCache><c:ptCount val="3"/>
+          <c:pt idx="0"><c:v>Region A</c:v></c:pt><c:pt idx="1"><c:v>Region B</c:v></c:pt><c:pt idx="2"><c:v>Region C</c:v></c:pt>
+        </c:strCache></c:strRef></c:cat>
+        <c:val><c:numRef><c:f>Sheet1!$B$2:$B$4</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val="3"/>
+          <c:pt idx="0"><c:v>42</c:v></c:pt><c:pt idx="1"><c:v>73.5</c:v></c:pt><c:pt idx="2"><c:v>55</c:v></c:pt>
+        </c:numCache></c:numRef></c:val>
+      </c:ser>
+      <c:axId val="111111111"/><c:axId val="222222222"/>
+    </c:barChart>
+    <c:catAx><c:axId val="111111111"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="b"/><c:crossAx val="222222222"/></c:catAx>
+    <c:valAx><c:axId val="222222222"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="l"/><c:crossAx val="111111111"/></c:valAx>
+  </c:plotArea></c:chart>
+</c:chartSpace>)";
+
+// Pie chart: one series, four categories, <c:varyColors val="1"/> so the
+// native backend colors per-category (matching Word/Excel's own convention
+// for pie/doughnut) instead of per-series.
+constexpr std::string_view kPieChart = R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <c:chart><c:plotArea><c:layout/>
+    <c:pieChart>
+      <c:varyColors val="1"/>
+      <c:ser>
+        <c:idx val="0"/><c:order val="0"/>
+        <c:tx><c:strRef><c:f>Sheet1!$B$1</c:f><c:strCache><c:ptCount val="1"/><c:pt idx="0"><c:v>Share</c:v></c:pt></c:strCache></c:strRef></c:tx>
+        <c:cat><c:strRef><c:f>Sheet1!$A$2:$A$5</c:f><c:strCache><c:ptCount val="4"/>
+          <c:pt idx="0"><c:v>Chrome</c:v></c:pt><c:pt idx="1"><c:v>Firefox</c:v></c:pt>
+          <c:pt idx="2"><c:v>Safari</c:v></c:pt><c:pt idx="3"><c:v>Other</c:v></c:pt>
+        </c:strCache></c:strRef></c:cat>
+        <c:val><c:numRef><c:f>Sheet1!$B$2:$B$5</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val="4"/>
+          <c:pt idx="0"><c:v>50</c:v></c:pt><c:pt idx="1"><c:v>15</c:v></c:pt>
+          <c:pt idx="2"><c:v>25</c:v></c:pt><c:pt idx="3"><c:v>10</c:v></c:pt>
+        </c:numCache></c:numRef></c:val>
+      </c:ser>
+    </c:pieChart>
+  </c:plotArea></c:chart>
+</c:chartSpace>)";
+
 
 constexpr std::string_view kStyles = R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
@@ -102,7 +161,7 @@ constexpr std::string_view kStyles = R"(<?xml version="1.0" encoding="UTF-8" sta
 </w:styles>)";
 
 constexpr std::string_view kDocument = R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
   <w:body>
 
     <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
@@ -194,6 +253,36 @@ constexpr std::string_view kDocument = R"(<?xml version="1.0" encoding="UTF-8" s
       </w:tr>
     </w:tbl>
 
+    <w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr>
+      <w:r><w:rPr><w:b/></w:rPr><w:t>Stats</w:t></w:r>
+    </w:p>
+
+    <w:p><w:r><w:drawing>
+      <wp:inline distT="0" distB="0" distL="0" distR="0">
+        <wp:extent cx="5030470" cy="3200400"/>
+        <wp:docPr id="1" name="Chart 1"/>
+        <wp:cNvGraphicFramePr/>
+        <a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart">
+          <c:chart r:id="rIdChart1"/>
+        </a:graphicData></a:graphic>
+      </wp:inline>
+    </w:drawing></w:r></w:p>
+
+    <w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr>
+      <w:r><w:rPr><w:b/></w:rPr><w:t>Browser Share</w:t></w:r>
+    </w:p>
+
+    <w:p><w:r><w:drawing>
+      <wp:inline distT="0" distB="0" distL="0" distR="0">
+        <wp:extent cx="4114800" cy="3200400"/>
+        <wp:docPr id="2" name="Chart 2"/>
+        <wp:cNvGraphicFramePr/>
+        <a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart">
+          <c:chart r:id="rIdChart2"/>
+        </a:graphicData></a:graphic>
+      </wp:inline>
+    </w:drawing></w:r></w:p>
+
     <w:sectPr>
       <w:pgSz w:w="12240" w:h="15840"/>
       <w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"
@@ -202,13 +291,15 @@ constexpr std::string_view kDocument = R"(<?xml version="1.0" encoding="UTF-8" s
   </w:body>
 </w:document>)";
 
-fs::path make_chartless_template(const fs::path& out) {
+fs::path make_template(const fs::path& out) {
     const std::vector<Part> parts = {
         {"[Content_Types].xml",          std::string(kContentTypes)},
         {"_rels/.rels",                  std::string(kPackageRels)},
         {"word/_rels/document.xml.rels", std::string(kDocumentRels)},
         {"word/styles.xml",              std::string(kStyles)},
         {"word/document.xml",            std::string(kDocument)},
+        {"word/charts/chart1.xml",       std::string(kBarChart)},
+        {"word/charts/chart2.xml",       std::string(kPieChart)},
     };
     if (write_docx(out, parts) != 0) {
         throw std::runtime_error("failed to write template");
@@ -216,16 +307,16 @@ fs::path make_chartless_template(const fs::path& out) {
     return out;
 }
 
-// Force the LibreOffice branch off regardless of what happens to be
-// installed on this machine — the whole point of this example is showing
-// the native PoDoFo path runs without either converter. No effect on
-// Microsoft Word detection (Windows-only, already skipped here since we
-// don't touch the registry probe), and no effect on the process outside
-// this run.
+// Force the Microsoft Word and LibreOffice branches off regardless of what
+// happens to be installed on this machine — the whole point of this example
+// is showing the native PoDoFo path runs without either converter. No effect
+// on the process outside this run.
 void disable_external_converters() {
 #if defined(_WIN32)
+    _putenv_s("TEXTFABRIC_NO_MSWORD", "1");
     _putenv_s("TEXTFABRIC_SOFFICE", "");
 #else
+    setenv("TEXTFABRIC_NO_MSWORD", "1", 1);
     setenv("TEXTFABRIC_SOFFICE", "", 1);
 #endif
 }
@@ -240,7 +331,7 @@ int main(int argc, char** argv) {
     disable_external_converters();
 
     try {
-        make_chartless_template(template_path);
+        make_template(template_path);
 
         auto m = textfabric::make_docx_merger();
         m->setCodePage("UTF-8");

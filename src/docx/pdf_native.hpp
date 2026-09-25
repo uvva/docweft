@@ -12,11 +12,12 @@ namespace textfabric::docx {
 /// out to Microsoft Word or LibreOffice. Scoped to what TextFabric itself
 /// understands: paragraphs/runs (font size + bold, first run's style wins
 /// per paragraph — same convention as the rest of the merger), simple grid
-/// tables, and embedded PNG images. Anything else — most notably embedded
-/// charts, since drawing a chart requires a chart-rendering engine this
-/// library doesn't have — throws ReportException{NotImplemented}. See
-/// PLAN.md ("Functional / feature-completeness risk") for the full list of
-/// known gaps.
+/// tables, embedded PNG images, and bar/line/area/pie/doughnut charts (3D
+/// variants rendered flat, no projection). Anything else — pie-of-pie/
+/// bar-of-pie, radar, scatter, bubble, stock, and surface charts, most
+/// prominently — throws ReportException{NotImplemented}. See PLAN.md
+/// ("Functional / feature-completeness risk") for the full list of known
+/// gaps.
 ///
 /// `document` is the already-parsed `word/document.xml` DOM (DocxMerger
 /// keeps this live and re-serializes it into `parts` on save — both must be
@@ -32,8 +33,9 @@ namespace textfabric::docx {
 ///
 /// Throws ReportException:
 ///   - NotImplemented: PoDoFo support wasn't compiled in, or the document
-///                     uses a feature this renderer doesn't cover (an
-///                     embedded chart, most prominently).
+///                     uses a feature this renderer doesn't cover (a
+///                     chart type outside bar/line/area/pie/doughnut,
+///                     most prominently).
 ///   - SaveFailed:     PoDoFo itself failed to write the PDF (caught
 ///                     PdfError is wrapped with its message).
 void render_native_pdf(const pugi::xml_document& document,

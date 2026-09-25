@@ -50,7 +50,11 @@ public:
     /// Save the current document to disk.
     /// Format is inferred from the file extension:
     ///   .docx → native save
-    ///   .pdf / .html → routed through LibreOffice (Stage 6 — throws NotImplemented in v1)
+    ///   .pdf / .html → first working converter of: Microsoft Word (Windows,
+    ///                  macOS), LibreOffice, native PDF renderer
+    ///                  (TEXTFABRIC_ENABLE_NATIVE_PDF, .pdf only), remote
+    ///                  converter (TEXTFABRIC_ENABLE_REMOTE_CONVERTER +
+    ///                  TEXTFABRIC_CONVERTER_URL, .pdf only)
     /// Throws ReportException{SaveFailed | NoConverter | NotImplemented}.
     virtual void save(const std::string& path) = 0;
 

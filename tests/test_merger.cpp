@@ -252,6 +252,151 @@ TEST_CASE("save('.html') returns NoConverter when all converters are disabled",
     fs::remove(in);
 }
 
+#ifndef _WIN32
+// A stand-in for soffice that "converts" by copying its input .docx to
+// <outdir>/<stem>.pdf, so the test can inspect exactly what save() handed
+// to the converter.
+static fs::path write_fake_soffice(std::string_view stem) {
+    const auto script = tmp_file(stem, ".sh");
+    {
+        std::ofstream os(script);
+        os << "#!/bin/sh\n"
+              "outdir=\n"
+              "while [ $# -gt 1 ]; do\n"
+              "  [ \"$1\" = --outdir ] && outdir=$2\n"
+              "  shift\n"
+              "done\n"
+              "in=$1\n"
+              "cp \"$in\" \"$outdir/$(basename \"$in\" .docx).pdf\"\n";
+    }
+    fs::permissions(script, fs::perms::owner_all);
+    return script;
+}
+
+TEST_CASE("save('.pdf') gives the converter a theme when charts have none",
+          "[merger][save][pdf][chart]") {
+    // Without a theme LibreOffice draws series lacking <c:spPr> with no
+    // fill — the chart comes out empty in the PDF.
+    const auto in  = tmp_file("pdf_theme_in",  ".docx");
+    const auto out = tmp_file("pdf_theme_out", ".pdf");
+    const auto out_docx = tmp_file("pdf_theme_out", ".docx");
+    tf_test::write_chart_template_docx(in);
+    REQUIRE(read_docx_part(in, "word/theme/theme1.xml").empty());
+
+    const auto fake = write_fake_soffice("fake_soffice_theme");
+    ScopedEnv no_word("TEXTFABRIC_NO_MSWORD");
+    no_word.set("1");
+    ScopedEnv soffice("TEXTFABRIC_SOFFICE");
+    soffice.set(fake.string().c_str());
+
+    auto merger = textfabric::make_docx_merger();
+    merger->load(in.string());
+    REQUIRE_NOTHROW(merger->save(out.string()));
+
+    // `out` is the converter's input, copied verbatim by the fake.
+    REQUIRE(read_docx_part(out, "word/theme/theme1.xml").find("accent1") != std::string::npos);
+    REQUIRE(read_docx_part(out, "word/_rels/document.xml.rels").find("relationships/theme") != std::string::npos);
+    REQUIRE(read_docx_part(out, "[Content_Types].xml").find("/word/theme/theme1.xml") != std::string::npos);
+
+    // The document itself is unchanged: a subsequent .docx save has no theme.
+    REQUIRE_NOTHROW(merger->save(out_docx.string()));
+    REQUIRE(read_docx_part(out_docx, "word/theme/theme1.xml").empty());
+
+    fs::remove(in);
+    fs::remove(out);
+    fs::remove(out_docx);
+    fs::remove(fake);
+}
+
+TEST_CASE("save('.pdf') moves on down the chain when LibreOffice fails",
+          "[merger][save][pdf]") {
+    const auto in  = tmp_file("pdf_chain_in",  ".docx");
+    const auto out = tmp_file("pdf_chain_out", ".pdf");
+    const auto fail = tmp_file("fail_soffice", ".sh");
+    {
+        std::ofstream os(fail);
+        os << "#!/bin/sh\nexit 3\n";
+    }
+    fs::permissions(fail, fs::perms::owner_all);
+    tf_test::write_minimal_docx(in, kBodyWithHeaderBookmark);
+
+    ScopedEnv no_word("TEXTFABRIC_NO_MSWORD");
+    no_word.set("1");
+    ScopedEnv soffice("TEXTFABRIC_SOFFICE");
+    soffice.set(fail.string().c_str());
+    ScopedEnv remote("TEXTFABRIC_CONVERTER_URL");
+    remote.set(nullptr);
+
+    auto merger = textfabric::make_docx_merger();
+    merger->load(in.string());
+    try {
+        merger->save(out.string());
+        // Only possible when the native renderer is compiled in: it is the
+        // next link after LibreOffice.
+        REQUIRE(fs::file_size(out) > 256);
+    } catch (const textfabric::ReportException& e) {
+        REQUIRE(e.code() == textfabric::ReportError::SaveFailed);
+        REQUIRE(std::string(e.what()).find("LibreOffice") != std::string::npos);
+        REQUIRE_FALSE(fs::exists(out));
+    }
+
+    fs::remove(in);
+    fs::remove(out);
+    fs::remove(fail);
+}
+
+TEST_CASE("save('.html') NoConverter names every converter it checked",
+          "[merger][save][html]") {
+    const auto in  = tmp_file("html_none_in",  ".docx");
+    const auto out = tmp_file("html_none_out", ".html");
+    tf_test::write_minimal_docx(in, kBodyWithHeaderBookmark);
+
+    // Neither the native renderer nor the remote converter produce HTML, so
+    // with Word and LibreOffice off nothing is left in any build.
+    ScopedEnv no_word("TEXTFABRIC_NO_MSWORD");
+    no_word.set("1");
+    ScopedEnv soffice("TEXTFABRIC_SOFFICE");
+    soffice.set("");
+
+    auto merger = textfabric::make_docx_merger();
+    merger->load(in.string());
+    try {
+        merger->save(out.string());
+        FAIL("expected NoConverter");
+    } catch (const textfabric::ReportException& e) {
+        REQUIRE(e.code() == textfabric::ReportError::NoConverter);
+        const std::string msg = e.what();
+        REQUIRE(msg.find("Microsoft Word") != std::string::npos);
+        REQUIRE(msg.find("LibreOffice") != std::string::npos);
+        REQUIRE(msg.find("native PDF renderer") != std::string::npos);
+        REQUIRE(msg.find("remote converter") != std::string::npos);
+    }
+    fs::remove(in);
+}
+
+TEST_CASE("save('.pdf') adds no theme to a document without charts",
+          "[merger][save][pdf]") {
+    const auto in  = tmp_file("pdf_notheme_in",  ".docx");
+    const auto out = tmp_file("pdf_notheme_out", ".pdf");
+    tf_test::write_minimal_docx(in, kBodyWithHeaderBookmark);
+
+    const auto fake = write_fake_soffice("fake_soffice_notheme");
+    ScopedEnv no_word("TEXTFABRIC_NO_MSWORD");
+    no_word.set("1");
+    ScopedEnv soffice("TEXTFABRIC_SOFFICE");
+    soffice.set(fake.string().c_str());
+
+    auto merger = textfabric::make_docx_merger();
+    merger->load(in.string());
+    REQUIRE_NOTHROW(merger->save(out.string()));
+    REQUIRE(read_docx_part(out, "word/theme/theme1.xml").empty());
+
+    fs::remove(in);
+    fs::remove(out);
+    fs::remove(fake);
+}
+#endif
+
 TEST_CASE("save('.pdf') via any available converter produces a non-empty PDF",
           "[merger][save][pdf][integration]") {
     if (!any_converter_available_on_host()) {

@@ -88,6 +88,9 @@ private:
     // ── Internals ────────────────────────────────────────────────────────
     void read_archive(const std::filesystem::path& path);
     void write_archive(const std::filesystem::path& path) const;
+    static void write_archive(
+        const std::unordered_map<std::string, std::string>& parts,
+        const std::filesystem::path&                         path);
     void reparse_document();
     void reserialize_document();
 
