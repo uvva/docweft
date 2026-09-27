@@ -5,6 +5,7 @@ include(Catch)
 add_executable(docweft_tests
     test_basic.cpp
     test_merger.cpp
+    test_native_pdf.cpp
     fixture_helpers.cpp
 )
 
@@ -39,6 +40,11 @@ if(DOCWEFT_HAVE_STB)
 endif()
 if(TARGET TIFF::TIFF)
     target_compile_definitions(docweft_tests PRIVATE DOCWEFT_HAVE_TIFF=1)
+endif()
+# The native PDF tests read the produced PDFs back with PoDoFo itself.
+if(TARGET podofo::podofo)
+    target_compile_definitions(docweft_tests PRIVATE DOCWEFT_HAVE_PODOFO=1)
+    target_link_libraries(docweft_tests PRIVATE podofo::podofo)
 endif()
 
 # Copy test fixtures next to the binary so tests can find them

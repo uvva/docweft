@@ -9,15 +9,31 @@
 namespace docweft::docx {
 
 /// Renders the loaded document straight to PDF via PoDoFo, without shelling
-/// out to Microsoft Word or LibreOffice. Scoped to what DocWeft itself
-/// understands: paragraphs/runs (font size + bold, first run's style wins
-/// per paragraph — same convention as the rest of the merger), simple grid
-/// tables, embedded PNG images, and bar/line/area/pie/doughnut charts (3D
-/// variants rendered flat, no projection). Anything else — pie-of-pie/
-/// bar-of-pie, radar, scatter, bubble, stock, and surface charts, most
-/// prominently — throws ReportException{NotImplemented}. See PLAN.md
-/// ("Functional / feature-completeness risk") for the full list of known
-/// gaps.
+/// out to Microsoft Word or LibreOffice. Paragraphs are laid out here:
+/// paragraph/character styles, fonts found by name (with metric-compatible
+/// substitutes), per-run bold/italic/underline/strike/color/size and
+/// (small) capitals, superscript/subscript and raised/lowered text,
+/// alignment (incl. justified), paragraph borders and shading, indents,
+/// spacing, tab stops (with leaders), list numbering, hidden text
+/// (<w:vanish>) left out, fields (PAGE/NUMPAGES/SECTIONPAGES and PAGEREF
+/// — TOC page numbers — filled in from its own layout), keep with next,
+/// headers/footers and page breaks, several sections (page size,
+/// orientation, margins, headers/footers, page numbering restarts and
+/// formats); tables with borders, shading, table style regions (header
+/// row, banding, ...), margins, vertical alignment, row heights,
+/// vertically merged cells and repeated header rows; PNG/JPEG images, inline or floating (<wp:anchor>: positioned,
+/// in front of or behind the text, text kept out of their band);
+/// bar/line/area/pie/doughnut charts — stacked, 100 % stacked,
+/// horizontal, combined with a secondary axis — with the template's
+/// colors, titles and data labels.
+///
+/// Strict mode (on unless DOCWEFT_NATIVE_PDF_STRICT=0): before drawing, the
+/// document is checked for content this renderer would get wrong rather
+/// than just plainer — text boxes, footnotes, equations, multi-column
+/// layout, non-PNG/JPEG images, SmartArt and shapes, radar/scatter/...
+/// charts, pie charts mixed with other types, ... — and rejected with
+/// NotImplemented listing all of them, so the caller's converter chain can
+/// move on.
 ///
 /// `document` is the already-parsed `word/document.xml` DOM (DocxMerger
 /// keeps this live and re-serializes it into `parts` on save — both must be
@@ -33,9 +49,8 @@ namespace docweft::docx {
 ///
 /// Throws ReportException:
 ///   - NotImplemented: PoDoFo support wasn't compiled in, or the document
-///                     uses a feature this renderer doesn't cover (a
-///                     chart type outside bar/line/area/pie/doughnut,
-///                     most prominently).
+///                     uses something this renderer can't draw faithfully
+///                     (see strict mode above).
 ///   - SaveFailed:     PoDoFo itself failed to write the PDF (caught
 ///                     PdfError is wrapped with its message).
 void render_native_pdf(const pugi::xml_document& document,
