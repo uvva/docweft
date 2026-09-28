@@ -16,6 +16,7 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <regex>
 #include <sstream>
 #include <thread>
@@ -29,6 +30,9 @@
 #    define WIN32_LEAN_AND_MEAN
 #  endif
 #  include <windows.h>
+#  ifdef _MSC_VER
+#    pragma comment(lib, "advapi32.lib")  // RegOpenKeyExW in find_msword()
+#  endif
 #else
 #  include <csignal>
 #  include <fcntl.h>
@@ -237,8 +241,9 @@ void DocxMerger::write_archive(
 //
 //   1. Microsoft Word (Windows and macOS) — the result matches what the user
 //      sees in Word interactively.
-//        Windows: detected via HKCR\Word.Application, driven by a generated
-//                 VBScript through `cscript //B`.
+//        Windows: detected via HKCR\Word.Application\CLSID, driven by a
+//                 generated VBScript through `cscript //B` (started without a
+//                 shell or console window).
 //        macOS:   detected via Microsoft Word.app in /Applications or
 //                 ~/Applications, driven by AppleScript through `osascript`.
 //                 The first run shows the system "allow to control Microsoft
@@ -270,7 +275,11 @@ void DocxMerger::write_archive(
 //   DOCWEFT_SOFFICE_TIMEOUT    — LibreOffice time limit, seconds (default
 //                                120). On expiry soffice and its child
 //                                processes are killed and the chain moves on.
-//   DOCWEFT_CONVERTER_URL      — remote converter endpoint, e.g.
+//   DOCWEFT_MSWORD_TIMEOUT     — Word (Windows) time limit, seconds (default
+//                                300). On expiry cscript is stopped and the
+//                                chain moves on; the WINWORD.EXE COM server
+//                                is not a child process and may stay behind.
+//   DOCWEFT_CONVERTER_URL     — remote converter endpoint, e.g.
 //                                http://localhost:3000/forms/libreoffice/convert
 //   DOCWEFT_CONVERTER_TOKEN    — optional; sent as `Authorization: Bearer`.
 //                                Never included in error messages.
@@ -322,10 +331,14 @@ const char* converter_label(ConverterKind kind) {
 // Word install location, or empty when Word is not installed.
 [[nodiscard]] std::string find_msword() {
 #if defined(_WIN32)
-    // HKCR\Word.Application exists iff some Office version is installed and
-    // has registered its COM class. `reg query` is present in every Windows
-    // install and exits 0 on hit, 1 on miss.
-    if (std::system("reg query HKCR\\Word.Application >nul 2>nul") == 0) {
+    // HKCR\Word.Application\CLSID exists iff some Office version is installed
+    // and has registered its COM class. Read directly rather than through
+    // `reg query`: a console process started from a GUI host flashes a
+    // console window.
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CLASSES_ROOT, L"Word.Application\\CLSID", 0, KEY_READ, &key)
+            == ERROR_SUCCESS) {
+        RegCloseKey(key);
         return "Word.Application";
     }
 #elif defined(__APPLE__)
@@ -369,11 +382,14 @@ const char* converter_label(ConverterKind kind) {
     }
 
 #ifdef _WIN32
-    const char* const probe = "soffice --version >nul 2>nul";
+    // Look soffice.exe up in PATH without running it (running it would flash
+    // a console window in a GUI host). CreateProcessW finds it the same way.
+    if (SearchPathW(nullptr, L"soffice.exe", nullptr, 0, nullptr, nullptr) > 0) {
+        return "soffice";
+    }
 #else
-    const char* const probe = "soffice --version >/dev/null 2>&1";
+    if (std::system("soffice --version >/dev/null 2>&1") == 0) return "soffice";
 #endif
-    if (std::system(probe) == 0) return "soffice";
     return {};
 }
 
@@ -558,7 +574,7 @@ void add_default_theme(std::unordered_map<std::string, std::string>& parts) {
     ct_xml = ct_out.str();
 }
 
-#if defined(_WIN32) || defined(__APPLE__) || defined(DOCWEFT_HAVE_REMOTE_CONVERTER)
+#ifdef __APPLE__
 // Minimal shell-safe quoting. Rejects embedded double quotes rather than
 // trying to escape them portably (cmd.exe and POSIX sh have different rules).
 std::string shell_quote(const std::string& s) {
@@ -607,13 +623,20 @@ ProcessResult run_with_timeout(const std::vector<std::filesystem::path>& args,
     ProcessResult result;
 #ifdef _WIN32
     // CommandLineToArgvW quoting: wrap in quotes, double the backslashes
-    // that precede a quote, escape the quote itself.
+    // that precede a quote, escape the quote itself. Arguments that need no
+    // quoting are passed bare — some programs parse their own command line
+    // and don't strip quotes from switches (cscript's "//B").
     std::wstring cmdline;
     for (const auto& arg : args) {
         if (!cmdline.empty()) cmdline += L' ';
+        const std::wstring w = arg.wstring();
+        if (!w.empty() && w.find_first_of(L" \t\n\v\"") == std::wstring::npos) {
+            cmdline += w;
+            continue;
+        }
         cmdline += L'"';
         std::size_t backslashes = 0;
-        for (const wchar_t c : arg.wstring()) {
+        for (const wchar_t c : w) {
             if (c == L'\\') { ++backslashes; continue; }
             if (c == L'"') cmdline.append(backslashes * 2 + 1, L'\\');
             else           cmdline.append(backslashes, L'\\');
@@ -752,17 +775,21 @@ std::string run_soffice_conversion(const std::string& soffice,
 //   3 — Documents.Open failed (corrupted .docx, locked, etc.)
 //   4 — SaveAs2 failed (unknown format, read-only target)
 // cscript is always present on Windows 10/11 (no PowerShell ExecutionPolicy
-// headaches) and can run in //B (batch, suppress dialogs) mode.
-bool run_msword_conversion(const std::string& format,  // "pdf" or "html"
-                           const std::filesystem::path& input,
-                           const std::filesystem::path& output)
+// headaches) and can run in //B (batch, suppress dialogs) mode. It runs
+// through run_with_timeout(): no console window in a GUI host, paths passed
+// as UTF-16, and bounded by DOCWEFT_MSWORD_TIMEOUT. Returns an empty string
+// on success, otherwise the reason.
+std::string run_msword_conversion(const std::string& format,  // "pdf" or "html"
+                                  const std::filesystem::path& input,
+                                  const std::filesystem::path& output)
 {
     // wdFormatPDF = 17, wdFormatFilteredHTML = 10 (both stable since Word 2007)
     const int fmt_code = (format == "pdf") ? 17 : 10;
     const std::filesystem::path vbs = output.parent_path() / "tf_msword.vbs";
+    const std::filesystem::path err = output.parent_path() / "tf_msword.err";
     {
         std::ofstream os(vbs, std::ios::binary);
-        if (!os) return false;
+        if (!os) return "cannot write the VBScript file";
         // CRLF is what cscript expects; using binary mode so ofstream doesn't
         // double-convert on Windows.
         os << "Option Explicit\r\n"
@@ -787,15 +814,29 @@ bool run_msword_conversion(const std::string& format,  // "pdf" or "html"
               "word.Quit\r\n"
               "WScript.Quit 0\r\n";
     }
-    const std::string cmd = fmt::format(
-        "cscript //B //Nologo {} {} {} >nul 2>nul",
-        shell_quote(vbs.string()),
-        shell_quote(std::filesystem::absolute(input).string()),
-        shell_quote(std::filesystem::absolute(output).string()));
-    const int rc = std::system(cmd.c_str());
+    const int timeout_s = env_seconds("DOCWEFT_MSWORD_TIMEOUT", 300);
+    const ProcessResult r = run_with_timeout(
+        {"cscript.exe", "//B", "//Nologo", vbs,
+         std::filesystem::absolute(input), std::filesystem::absolute(output)},
+        err, std::chrono::seconds(timeout_s));
     std::error_code ec;
     std::filesystem::remove(vbs, ec);
-    return rc == 0;
+
+    if (!r.started) return "could not start cscript.exe";
+    if (r.timed_out) {
+        // Word is an out-of-process COM server, not a child of cscript: it
+        // is not in the job object and may be left running hidden.
+        return fmt::format("Word did not finish within {} s "
+                           "(DOCWEFT_MSWORD_TIMEOUT); cscript was stopped, a "
+                           "hidden WINWORD.EXE may still be running", timeout_s);
+    }
+    switch (r.exit_code) {
+        case 0:  return {};
+        case 2:  return "could not start Word (CreateObject failed)";
+        case 3:  return "Word could not open the document";
+        case 4:  return "Word could not save the document";
+        default: return fmt::format("cscript exited with code {}", r.exit_code);
+    }
 }
 #endif  // _WIN32
 
@@ -891,36 +932,133 @@ std::string sniff_data_uri_mime(const std::filesystem::path& path,
     return "application/octet-stream";
 }
 
-// LibreOffice's HTML export writes referenced images as sibling files next
-// to `html_path` (e.g. "output_html_....png") instead of embedding them —
-// <img src="..."> in the produced HTML points at those bare filenames.
-// Rewrite `html_path` in place so every such reference becomes an inline
-// base64 data: URI, making the HTML self-contained. `siblings` is consumed
-// only for its bytes; callers are still responsible for deleting the files.
-void inline_sibling_images(const std::filesystem::path& html_path,
-                            const std::vector<std::filesystem::path>& siblings) {
-    if (siblings.empty()) return;
-
-    std::string html = read_file_bytes(html_path);
-
-    for (const auto& sibling : siblings) {
-        const std::string bytes = read_file_bytes(sibling);
-        const std::string data_uri =
-            fmt::format("data:{};base64,{}",
-                        sniff_data_uri_mime(sibling, bytes),
-                        base64_encode(bytes));
-
-        const std::string needle = "\"" + sibling.filename().string() + "\"";
-        const std::string replacement = "\"" + data_uri + "\"";
-        std::size_t pos = 0;
-        while ((pos = html.find(needle, pos)) != std::string::npos) {
-            html.replace(pos, needle.size(), replacement);
-            pos += replacement.size();
+// Decode %XX escapes; anything malformed is kept as is.
+std::string percent_decode(std::string_view s) {
+    auto hex = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    std::string out;
+    out.reserve(s.size());
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '%' && i + 2 < s.size() &&
+            hex(s[i + 1]) >= 0 && hex(s[i + 2]) >= 0) {
+            out.push_back(static_cast<char>(hex(s[i + 1]) * 16 + hex(s[i + 2])));
+            i += 2;
+        } else {
+            out.push_back(s[i]);
         }
     }
+    return out;
+}
 
-    std::ofstream out(html_path, std::ios::binary | std::ios::trunc);
-    out.write(html.data(), static_cast<std::streamsize>(html.size()));
+// The file a relative `src` reference in the HTML at `base_dir` points to,
+// if it is a regular file inside `root`; empty otherwise. Absolute paths,
+// URLs with a scheme (data:, http:, file:, a drive letter …) and fragments
+// are left alone, and so is anything that escapes `root` via "..".
+std::filesystem::path resolve_local_ref(const std::filesystem::path& base_dir,
+                                        const std::filesystem::path& root,
+                                        std::string_view ref) {
+    namespace fs = std::filesystem;
+    if (const auto cut = ref.find_first_of("?#"); cut != std::string_view::npos) {
+        ref = ref.substr(0, cut);
+    }
+    if (ref.empty() || ref.front() == '/' || ref.front() == '\\') return {};
+    const auto colon = ref.find(':');
+    if (colon != std::string_view::npos &&
+        colon < ref.find_first_of("/\\")) return {};
+
+    const std::string decoded = percent_decode(ref);
+    // The HTML may be UTF-8 (LibreOffice) or the ANSI code page Word was set
+    // to save web pages in; try both readings of a non-ASCII name.
+    std::vector<fs::path> names;
+    try {
+        std::u8string utf8;
+        utf8.reserve(decoded.size());
+        for (const char c : decoded) utf8.push_back(static_cast<char8_t>(c));
+        names.emplace_back(utf8);
+    } catch (...) {}
+    try {
+        names.emplace_back(decoded);
+    } catch (...) {}
+
+    std::error_code ec;
+    const fs::path canon_root = fs::weakly_canonical(root, ec);
+    if (ec) return {};
+    for (const auto& name : names) {
+        const fs::path p = fs::weakly_canonical(base_dir / name, ec);
+        if (ec || !fs::is_regular_file(p, ec)) continue;
+        const fs::path rel = p.lexically_relative(canon_root);
+        if (rel.empty() || *rel.begin() == "..") continue;
+        return p;
+    }
+    return {};
+}
+
+// HTML exports reference their images as separate files: LibreOffice writes
+// them next to the HTML ("output_html_....png"), Word into a subfolder
+// ("output_files/image001.png", folder name localized by some Word
+// versions). Rewrite `html_path` in place so every src="..." that points at
+// a file inside `root` becomes an inline base64 data: URI, making the HTML
+// self-contained — the files themselves are deleted with the scratch dir.
+void inline_local_images(const std::filesystem::path& html_path,
+                         const std::filesystem::path& root) {
+    const std::string html = read_file_bytes(html_path);
+    std::string lower = html;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    const std::filesystem::path base_dir = html_path.parent_path();
+
+    std::map<std::filesystem::path, std::string> data_uris;  // resolved file → URI
+    std::string out;
+    out.reserve(html.size());
+    std::size_t copied = 0;
+    bool changed = false;
+    for (std::size_t pos = lower.find("src", 0); pos != std::string::npos;
+         pos = lower.find("src", pos + 1)) {
+        // An attribute name on its own, not "data-src" or "srcset".
+        if (pos == 0 || !std::isspace(static_cast<unsigned char>(lower[pos - 1]))) continue;
+        std::size_t i = pos + 3;
+        while (i < lower.size() && std::isspace(static_cast<unsigned char>(lower[i]))) ++i;
+        if (i >= lower.size() || lower[i] != '=') continue;
+        ++i;
+        while (i < lower.size() && std::isspace(static_cast<unsigned char>(lower[i]))) ++i;
+        if (i >= lower.size()) break;
+
+        std::size_t begin = i;
+        std::size_t end   = std::string::npos;
+        if (html[i] == '"' || html[i] == '\'') {
+            begin = i + 1;
+            end   = html.find(html[i], begin);
+        } else {
+            end = html.find_first_of(" \t\r\n>", begin);
+        }
+        if (end == std::string::npos) break;
+
+        const std::filesystem::path file = resolve_local_ref(
+            base_dir, root, std::string_view(html).substr(begin, end - begin));
+        if (file.empty()) continue;
+
+        auto [it, inserted] = data_uris.try_emplace(file);
+        if (inserted) {
+            const std::string bytes = read_file_bytes(file);
+            it->second = fmt::format("data:{};base64,{}",
+                                     sniff_data_uri_mime(file, bytes),
+                                     base64_encode(bytes));
+        }
+        out.append(html, copied, begin - copied);
+        out += it->second;
+        copied  = end;
+        changed = true;
+        pos     = end;
+    }
+    if (!changed) return;
+    out.append(html, copied, std::string::npos);
+
+    std::ofstream os(html_path, std::ios::binary | std::ios::trunc);
+    os.write(out.data(), static_cast<std::streamsize>(out.size()));
 }
 
 
@@ -1022,21 +1160,21 @@ std::string run_remote_conversion(const std::string& url,
                << curl_config_quote(std::string("Authorization: Bearer ") + token) << "\n";
         }
     }
-#ifdef _WIN32
-    constexpr const char* kNull = "nul";
-#else
-    constexpr const char* kNull = "/dev/null";
-#endif
-    const std::string cmd = fmt::format("curl --config {} >{} 2>{}",
-                                        shell_quote(cfg.string()), kNull,
-                                        shell_quote(err.string()));
-    const int rc = std::system(cmd.c_str());
+    // No shell: no console window in a Windows GUI host. curl enforces
+    // max-time itself; the process limit is only a backstop.
+    const ProcessResult r = run_with_timeout({"curl", "--config", cfg}, err,
+                                             std::chrono::seconds(timeout_s + 30));
     std::error_code ec;
     std::filesystem::remove(cfg, ec);
 
-    if (rc != 0) {
+    if (!r.started) return "could not start curl";
+    if (r.timed_out) {
+        return fmt::format("curl did not finish within {} s and was stopped",
+                           timeout_s + 30);
+    }
+    if (r.exit_code != 0) {
         const std::string text = read_error_text(err);
-        return text.empty() ? "curl failed" : text;
+        return text.empty() ? fmt::format("curl exited with code {}", r.exit_code) : text;
     }
     // A misconfigured endpoint (wrong route, HTML error page with 200)
     // must fail loudly rather than be saved as report.pdf.
@@ -1117,9 +1255,7 @@ void DocxMerger::save(const std::string& path) {
                 switch (conv.kind) {
                     case ConverterKind::MSWord:
 #if defined(_WIN32)
-                        if (!run_msword_conversion(conv_format, scratch_docx, target)) {
-                            error = "conversion failed";
-                        }
+                        error = run_msword_conversion(conv_format, scratch_docx, target);
 #elif defined(__APPLE__)
                         error = run_msword_mac_conversion(conv_format, scratch_docx, target);
 #endif
@@ -1167,24 +1303,12 @@ void DocxMerger::save(const std::string& path) {
                             ext, why));
         }
 
-        // LibreOffice's HTML export writes referenced images as sibling
-        // files next to `produced` (e.g. "output_html_....png") instead of
-        // embedding them. Inline every such file into `produced` as a
-        // base64 data: URI so the final HTML is self-contained; the
-        // siblings themselves are discarded with the rest of `scratch`
-        // below. PDF conversion has no siblings, so this is a no-op for
-        // ".pdf". Converter helper files (tf_*) are not images.
+        // HTML exports keep images as separate files (LibreOffice next to
+        // the HTML, Word in a subfolder); both are deleted with `scratch`
+        // below. Inline everything the HTML references from this attempt's
+        // directory so the final HTML is self-contained.
         if (conv_format == "html") {
-            std::error_code list_ec;
-            std::vector<std::filesystem::path> siblings;
-            for (const auto& entry :
-                 std::filesystem::directory_iterator(produced.parent_path(), list_ec)) {
-                if (!entry.is_regular_file()) continue;
-                if (entry.path() == produced) continue;
-                if (entry.path().filename().string().rfind("tf_", 0) == 0) continue;
-                siblings.push_back(entry.path());
-            }
-            inline_sibling_images(produced, siblings);
+            inline_local_images(produced, produced.parent_path());
         }
 
         // Move into place. Cross-device move is possible (tmp on a different

@@ -452,6 +452,77 @@ TEST_CASE("save('.pdf') adds no theme to a document without charts",
     fs::remove(out);
     fs::remove(fake);
 }
+
+TEST_CASE("save('.html') inlines images in both LibreOffice and Word layouts",
+          "[merger][save][html]") {
+    // LibreOffice puts images next to the HTML, Word (filtered HTML) into a
+    // "<name>_files" subfolder. Both are deleted with the scratch dir, so
+    // every local reference must end up as a data: URI.
+    const auto in  = tmp_file("html_img_in",  ".docx");
+    const auto out = tmp_file("html_img_out", ".html");
+    const auto fake = tmp_file("fake_soffice_html_img", ".sh");
+    {
+        std::ofstream os(fake);
+        os << "#!/bin/sh\n"
+              "outdir=\n"
+              "while [ $# -gt 1 ]; do\n"
+              "  [ \"$1\" = --outdir ] && outdir=$2\n"
+              "  shift\n"
+              "done\n"
+              "mkdir -p \"$outdir/output_files\" \"$outdir/my pics\"\n"
+              "printf '\\211PNG\\r\\n\\032\\nflat' > \"$outdir/output_html_1.png\"\n"
+              "printf '\\211PNG\\r\\n\\032\\nword' > \"$outdir/output_files/image001.png\"\n"
+              "printf 'GIF89a-sub' > \"$outdir/my pics/a b.gif\"\n"
+              "cat > \"$outdir/output.html\" <<'EOF'\n"
+              "<html><body>\n"
+              "<img src=\"output_html_1.png\">\n"
+              "<img width=10 src=\"output_files/image001.png\" alt=x>\n"
+              "<IMG SRC='my%20pics/a%20b.gif'>\n"
+              "<img src=output_files/image001.png>\n"
+              "<img src=\"http://example.com/x.png\">\n"
+              "<img src=\"../output.docx\">\n"
+              "<img data-src=\"output_html_1.png\">\n"
+              "</body></html>\n"
+              "EOF\n";
+    }
+    fs::permissions(fake, fs::perms::owner_all);
+    tf_test::write_minimal_docx(in, kBodyWithHeaderBookmark);
+
+    ScopedEnv no_word("DOCWEFT_NO_MSWORD");
+    no_word.set("1");
+    ScopedEnv soffice("DOCWEFT_SOFFICE");
+    soffice.set(fake.string().c_str());
+
+    auto merger = docweft::make_docx_merger();
+    merger->load(in.string());
+    REQUIRE_NOTHROW(merger->save(out.string()));
+
+    std::ifstream f(out, std::ios::binary);
+    const std::string html((std::istreambuf_iterator<char>(f)),
+                            std::istreambuf_iterator<char>());
+    REQUIRE(html.find("<img src=\"output_html_1.png\"") == std::string::npos);
+    REQUIRE(html.find("src=\"output_files") == std::string::npos);
+    REQUIRE(html.find("src=output_files") == std::string::npos);
+    REQUIRE(html.find("my%20pics") == std::string::npos);
+    std::size_t png_uris = 0;
+    for (auto p = html.find("data:image/png;base64,"); p != std::string::npos;
+         p = html.find("data:image/png;base64,", p + 1)) {
+        ++png_uris;
+    }
+    REQUIRE(png_uris == 3);
+    REQUIRE(html.find("SRC='data:image/gif;base64,") != std::string::npos);
+    // Left alone: a URL, a file outside the converter's directory, and an
+    // attribute that only ends in "src".
+    REQUIRE(html.find("src=\"http://example.com/x.png\"") != std::string::npos);
+    REQUIRE(html.find("src=\"../output.docx\"") != std::string::npos);
+    REQUIRE(html.find("data-src=\"output_html_1.png\"") != std::string::npos);
+    // Nothing but the HTML itself lands next to the target.
+    REQUIRE_FALSE(fs::exists(out.parent_path() / "output_files"));
+
+    fs::remove(in);
+    fs::remove(out);
+    fs::remove(fake);
+}
 #endif
 
 TEST_CASE("save('.pdf') via any available converter produces a non-empty PDF",
