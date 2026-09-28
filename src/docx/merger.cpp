@@ -276,9 +276,9 @@ void DocxMerger::write_archive(
 //                                120). On expiry soffice and its child
 //                                processes are killed and the chain moves on.
 //   DOCWEFT_MSWORD_TIMEOUT     — Word (Windows) time limit, seconds (default
-//                                300). On expiry cscript is stopped and the
-//                                chain moves on; the WINWORD.EXE COM server
-//                                is not a child process and may stay behind.
+//                                300). On expiry cscript and the WINWORD.EXE
+//                                it started are stopped and the chain moves
+//                                on (see run_msword_conversion()).
 //   DOCWEFT_CONVERTER_URL     — remote converter endpoint, e.g.
 //                                http://localhost:3000/forms/libreoffice/convert
 //   DOCWEFT_CONVERTER_TOKEN    — optional; sent as `Authorization: Bearer`.
@@ -294,8 +294,9 @@ namespace {
 enum class ConverterKind { MSWord, LibreOffice, NativePdf, Remote };
 
 struct Converter {
-    ConverterKind kind;
-    std::string   location;  // soffice path, Word.app path or endpoint URL
+    ConverterKind         kind;
+    std::string           location;  // Word.app path or endpoint URL
+    std::filesystem::path program;   // soffice to run
 };
 
 const char* converter_label(ConverterKind kind) {
@@ -353,8 +354,46 @@ const char* converter_label(ConverterKind kind) {
     return {};
 }
 
+#ifdef _WIN32
+// `name` in the Windows system directory (System32), or empty.
+[[nodiscard]] std::filesystem::path system_program(const wchar_t* name) {
+    wchar_t dir[MAX_PATH];
+    const UINT n = GetSystemDirectoryW(dir, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return {};
+    std::filesystem::path p = std::filesystem::path(dir) / name;
+    std::error_code ec;
+    return std::filesystem::is_regular_file(p, ec) ? p : std::filesystem::path{};
+}
+
+// `name` in an absolute directory listed in PATH, or empty. Programs are
+// always started by full path: given a bare name, CreateProcessW (and
+// SearchPathW) also look in the current directory, so a file planted there
+// would run instead.
+[[nodiscard]] std::filesystem::path find_in_path(const wchar_t* name) {
+    const DWORD size = GetEnvironmentVariableW(L"PATH", nullptr, 0);
+    if (size == 0) return {};
+    std::wstring value(size, L'\0');
+    value.resize(GetEnvironmentVariableW(L"PATH", value.data(), size));
+
+    std::error_code ec;
+    std::size_t start = 0;
+    while (start <= value.size()) {
+        std::size_t end = value.find(L';', start);
+        if (end == std::wstring::npos) end = value.size();
+        std::wstring dir = value.substr(start, end - start);
+        start = end + 1;
+        dir.erase(std::remove(dir.begin(), dir.end(), L'"'), dir.end());
+        const std::filesystem::path d(dir);
+        if (dir.empty() || !d.is_absolute()) continue;  // relative → current dir
+        std::filesystem::path p = d / name;
+        if (std::filesystem::is_regular_file(p, ec)) return p;
+    }
+    return {};
+}
+#endif
+
 // soffice to run, or empty when LibreOffice is not found / disabled.
-[[nodiscard]] std::string find_soffice() {
+[[nodiscard]] std::filesystem::path find_soffice() {
     const char* const override_path = std::getenv("DOCWEFT_SOFFICE");
     if (override_path != nullptr) {
         if (*override_path == '\0') return {};  // explicit opt-out
@@ -383,14 +422,12 @@ const char* converter_label(ConverterKind kind) {
 
 #ifdef _WIN32
     // Look soffice.exe up in PATH without running it (running it would flash
-    // a console window in a GUI host). CreateProcessW finds it the same way.
-    if (SearchPathW(nullptr, L"soffice.exe", nullptr, 0, nullptr, nullptr) > 0) {
-        return "soffice";
-    }
+    // a console window in a GUI host).
+    return find_in_path(L"soffice.exe");
 #else
     if (std::system("soffice --version >/dev/null 2>&1") == 0) return "soffice";
-#endif
     return {};
+#endif
 }
 
 struct ConverterChain {
@@ -414,7 +451,7 @@ ConverterChain find_converters(const std::string& format) {
     if (env_nonempty("DOCWEFT_NO_MSWORD")) {
         skip(ConverterKind::MSWord, "disabled by DOCWEFT_NO_MSWORD");
     } else if (std::string word = find_msword(); !word.empty()) {
-        chain.available.push_back({ConverterKind::MSWord, std::move(word)});
+        chain.available.push_back({ConverterKind::MSWord, std::move(word), {}});
     } else {
 #if defined(_WIN32) || defined(__APPLE__)
         skip(ConverterKind::MSWord, "not installed");
@@ -423,8 +460,8 @@ ConverterChain find_converters(const std::string& format) {
 #endif
     }
 
-    if (std::string soffice = find_soffice(); !soffice.empty()) {
-        chain.available.push_back({ConverterKind::LibreOffice, std::move(soffice)});
+    if (std::filesystem::path soffice = find_soffice(); !soffice.empty()) {
+        chain.available.push_back({ConverterKind::LibreOffice, {}, std::move(soffice)});
     } else if (const char* o = std::getenv("DOCWEFT_SOFFICE"); o != nullptr) {
         skip(ConverterKind::LibreOffice,
              *o == '\0' ? "disabled by empty DOCWEFT_SOFFICE"
@@ -435,7 +472,7 @@ ConverterChain find_converters(const std::string& format) {
 
 #if defined(DOCWEFT_HAVE_PODOFO)
     if (format == "pdf") {
-        chain.available.push_back({ConverterKind::NativePdf, {}});
+        chain.available.push_back({ConverterKind::NativePdf, {}, {}});
     } else {
         skip(ConverterKind::NativePdf, "produces .pdf only");
     }
@@ -450,7 +487,7 @@ ConverterChain find_converters(const std::string& format) {
         skip(ConverterKind::Remote, "DOCWEFT_CONVERTER_URL is not set");
     } else {
         chain.available.push_back(
-            {ConverterKind::Remote, std::getenv("DOCWEFT_CONVERTER_URL")});
+            {ConverterKind::Remote, std::getenv("DOCWEFT_CONVERTER_URL"), {}});
     }
 #else
     skip(ConverterKind::Remote, "not built (DOCWEFT_ENABLE_REMOTE_CONVERTER=OFF)");
@@ -743,7 +780,7 @@ ProcessResult run_with_timeout(const std::vector<std::filesystem::path>& args,
 // success, otherwise the reason. Bounded by DOCWEFT_SOFFICE_TIMEOUT —
 // soffice can hang on a dialog or a stuck profile lock, and save() must not
 // hang with it.
-std::string run_soffice_conversion(const std::string& soffice,
+std::string run_soffice_conversion(const std::filesystem::path& soffice,
                                    const std::string& format,  // "pdf" or "html"
                                    const std::filesystem::path& input,
                                    const std::filesystem::path& outdir)
@@ -769,6 +806,30 @@ std::string run_soffice_conversion(const std::string& soffice,
 }
 
 #ifdef _WIN32
+// Stop the WINWORD.EXE whose PID run_msword_conversion()'s script wrote to
+// `pid_file`. The image name is checked first, so a PID reused by some
+// other process in the meantime is left alone. True when it was stopped.
+bool stop_recorded_word(const std::filesystem::path& pid_file) {
+    std::ifstream in(pid_file);
+    DWORD pid = 0;
+    if (!(in >> pid) || pid == 0) return false;
+
+    HANDLE h = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION |
+                           SYNCHRONIZE, FALSE, pid);
+    if (h == nullptr) return false;
+    bool stopped = false;
+    wchar_t image[MAX_PATH];
+    DWORD len = MAX_PATH;
+    if (QueryFullProcessImageNameW(h, 0, image, &len) &&
+        _wcsicmp(std::filesystem::path(image).filename().c_str(), L"WINWORD.EXE") == 0 &&
+        TerminateProcess(h, 1)) {
+        WaitForSingleObject(h, 5000);
+        stopped = true;
+    }
+    CloseHandle(h);
+    return stopped;
+}
+
 // Run Word via a generated VBScript. Exit codes:
 //   0 — ok
 //   2 — CreateObject("Word.Application") failed (unlikely after reg probe)
@@ -779,24 +840,62 @@ std::string run_soffice_conversion(const std::string& soffice,
 // through run_with_timeout(): no console window in a GUI host, paths passed
 // as UTF-16, and bounded by DOCWEFT_MSWORD_TIMEOUT. Returns an empty string
 // on success, otherwise the reason.
+//
+// Word is an out-of-process COM server started by COM, not by cscript, so
+// it is outside run_with_timeout()'s job object. The script therefore
+// records the WINWORD.EXE it started (the one that wasn't running before
+// CreateObject) in `tf_msword.pid`; on timeout that process is stopped too.
+// If it can't be told apart — WMI unavailable, or more than one new
+// WINWORD.EXE — nothing is written and Word is left alone rather than risk
+// stopping the user's own Word.
 std::string run_msword_conversion(const std::string& format,  // "pdf" or "html"
                                   const std::filesystem::path& input,
                                   const std::filesystem::path& output)
 {
+    // A bare "cscript.exe" would also be looked up in the current directory.
+    const std::filesystem::path cscript = system_program(L"cscript.exe");
+    if (cscript.empty()) return "cscript.exe not found in the system directory";
+
     // wdFormatPDF = 17, wdFormatFilteredHTML = 10 (both stable since Word 2007)
     const int fmt_code = (format == "pdf") ? 17 : 10;
     const std::filesystem::path vbs = output.parent_path() / "tf_msword.vbs";
     const std::filesystem::path err = output.parent_path() / "tf_msword.err";
+    const std::filesystem::path pid = output.parent_path() / "tf_msword.pid";
     {
         std::ofstream os(vbs, std::ios::binary);
         if (!os) return "cannot write the VBScript file";
         // CRLF is what cscript expects; using binary mode so ofstream doesn't
         // double-convert on Windows.
         os << "Option Explicit\r\n"
-              "Dim word, doc\r\n"
+              "Dim word, doc, wmi, before, p, started, count, f\r\n"
+              "Const kQuery = \"SELECT ProcessId FROM Win32_Process WHERE Name = 'WINWORD.EXE'\"\r\n"
               "On Error Resume Next\r\n"
+              "Set before = CreateObject(\"Scripting.Dictionary\")\r\n"
+              "Set wmi = GetObject(\"winmgmts:{impersonationLevel=impersonate}!\\\\.\\root\\cimv2\")\r\n"
+              "If IsObject(wmi) Then\r\n"
+              "    For Each p In wmi.ExecQuery(kQuery)\r\n"
+              "        before(p.ProcessId) = True\r\n"
+              "    Next\r\n"
+              "End If\r\n"
+              "Err.Clear\r\n"
               "Set word = CreateObject(\"Word.Application\")\r\n"
               "If Err.Number <> 0 Then WScript.Quit 2\r\n"
+              "If IsObject(wmi) Then\r\n"
+              "    count = 0\r\n"
+              "    For Each p In wmi.ExecQuery(kQuery)\r\n"
+              "        If Not before.Exists(p.ProcessId) Then\r\n"
+              "            started = p.ProcessId\r\n"
+              "            count = count + 1\r\n"
+              "        End If\r\n"
+              "    Next\r\n"
+              "    If count = 1 Then\r\n"
+              "        Set f = CreateObject(\"Scripting.FileSystemObject\")"
+              ".CreateTextFile(WScript.Arguments(2), True)\r\n"
+              "        f.Write CStr(started)\r\n"
+              "        f.Close\r\n"
+              "    End If\r\n"
+              "End If\r\n"
+              "Err.Clear\r\n"
               "word.Visible = False\r\n"
               "word.DisplayAlerts = 0\r\n"
               "Set doc = word.Documents.Open(WScript.Arguments(0), False, True)\r\n"
@@ -816,19 +915,20 @@ std::string run_msword_conversion(const std::string& format,  // "pdf" or "html"
     }
     const int timeout_s = env_seconds("DOCWEFT_MSWORD_TIMEOUT", 300);
     const ProcessResult r = run_with_timeout(
-        {"cscript.exe", "//B", "//Nologo", vbs,
-         std::filesystem::absolute(input), std::filesystem::absolute(output)},
+        {cscript, "//B", "//Nologo", vbs,
+         std::filesystem::absolute(input), std::filesystem::absolute(output), pid},
         err, std::chrono::seconds(timeout_s));
     std::error_code ec;
     std::filesystem::remove(vbs, ec);
 
     if (!r.started) return "could not start cscript.exe";
     if (r.timed_out) {
-        // Word is an out-of-process COM server, not a child of cscript: it
-        // is not in the job object and may be left running hidden.
+        const bool stopped = stop_recorded_word(pid);
         return fmt::format("Word did not finish within {} s "
-                           "(DOCWEFT_MSWORD_TIMEOUT); cscript was stopped, a "
-                           "hidden WINWORD.EXE may still be running", timeout_s);
+                           "(DOCWEFT_MSWORD_TIMEOUT) and was stopped{}", timeout_s,
+                           stopped ? "" : "; the hidden WINWORD.EXE it started "
+                                          "could not be identified and may "
+                                          "still be running");
     }
     switch (r.exit_code) {
         case 0:  return {};
@@ -1162,7 +1262,20 @@ std::string run_remote_conversion(const std::string& url,
     }
     // No shell: no console window in a Windows GUI host. curl enforces
     // max-time itself; the process limit is only a backstop.
-    const ProcessResult r = run_with_timeout({"curl", "--config", cfg}, err,
+#ifdef _WIN32
+    // By full path — a bare name would also be looked up in the current
+    // directory. Windows 10+ ships curl.exe in System32.
+    std::filesystem::path curl = system_program(L"curl.exe");
+    if (curl.empty()) curl = find_in_path(L"curl.exe");
+    if (curl.empty()) {
+        std::error_code rm_ec;
+        std::filesystem::remove(cfg, rm_ec);  // it may carry the auth token
+        return "curl.exe not found";
+    }
+#else
+    const std::filesystem::path curl = "curl";
+#endif
+    const ProcessResult r = run_with_timeout({curl, "--config", cfg}, err,
                                              std::chrono::seconds(timeout_s + 30));
     std::error_code ec;
     std::filesystem::remove(cfg, ec);
@@ -1261,7 +1374,7 @@ void DocxMerger::save(const std::string& path) {
 #endif
                         break;
                     case ConverterKind::LibreOffice:
-                        error = run_soffice_conversion(conv.location, conv_format,
+                        error = run_soffice_conversion(conv.program, conv_format,
                                                        scratch_docx, outdir);
                         break;
                     case ConverterKind::NativePdf:

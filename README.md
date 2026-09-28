@@ -238,7 +238,7 @@ Environment variables:
 | `DOCWEFT_NO_MSWORD=1` | Skips the Word branch (Windows and macOS). Useful when Word is installed but you need LibreOffice-compatible rendering. |
 | `DOCWEFT_SOFFICE=<path>` | If set non-empty — use only this binary as LibreOffice, skipping PATH/Program Files/app bundle lookups. If set empty — disable the LibreOffice branch entirely. |
 | `DOCWEFT_SOFFICE_TIMEOUT=<seconds>` | LibreOffice time limit, default 120. On expiry `soffice` and the processes it started are killed and the chain moves on to the next converter. |
-| `DOCWEFT_MSWORD_TIMEOUT=<seconds>` | Word time limit on Windows, default 300. On expiry `cscript` is stopped and the chain moves on; Word itself runs as a separate COM server and may be left running hidden. |
+| `DOCWEFT_MSWORD_TIMEOUT=<seconds>` | Word time limit on Windows, default 300. On expiry `cscript` and the hidden `WINWORD.EXE` it started are stopped and the chain moves on. A Word instance that was already running is never touched; if the started instance can't be identified (WMI unavailable), it may be left running — the error message says so. |
 | `DOCWEFT_CONVERTER_URL=<url>` | Remote converter endpoint, e.g. `http://localhost:3000/forms/libreoffice/convert`. |
 | `DOCWEFT_CONVERTER_TOKEN=<token>` | Optional; sent as `Authorization: Bearer <token>`. Passed to curl through a config file, never on the command line, and never included in error messages. |
 | `DOCWEFT_CONVERTER_TIMEOUT=<seconds>` | Remote request timeout, default 120. |
