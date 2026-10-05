@@ -155,6 +155,25 @@ TEST_CASE("load then save produces a valid DOCX round-trip", "[merger][load][sav
     fs::remove(out);
 }
 
+TEST_CASE("load then save keeps runs that hold only a space", "[merger][load][save]") {
+    const auto in  = tmp_file("space_run_in",  ".docx");
+    const auto out = tmp_file("space_run_out", ".docx");
+    tf_test::write_minimal_docx(in,
+        R"(<w:p><w:r><w:t>AAA</w:t></w:r><w:r><w:t xml:space="preserve"> </w:t></w:r>)"
+        R"(<w:r><w:t>BBB</w:t></w:r></w:p>)");
+
+    auto merger = docweft::make_docx_merger();
+    REQUIRE_NOTHROW(merger->load(in.string()));
+    REQUIRE_NOTHROW(merger->save(out.string()));
+
+    const std::string xml = read_docx_part(out, "word/document.xml");
+    INFO(xml);
+    CHECK(xml.find(R"(<w:t xml:space="preserve"> </w:t>)") != std::string::npos);
+
+    fs::remove(in);
+    fs::remove(out);
+}
+
 TEST_CASE("save rejects unknown extension", "[merger][save]") {
     const auto in  = tmp_file("ext_in", ".docx");
     const auto out = tmp_file("ext_bad", ".xyz");
@@ -252,6 +271,52 @@ TEST_CASE("save('.html') returns NoConverter when all converters are disabled",
         REQUIRE(e.code() == docweft::ReportError::NoConverter);
     }
     fs::remove(in);
+}
+
+TEST_CASE("setWordConversion overrides the Word env switches",
+          "[merger][save][html]") {
+    const auto in  = tmp_file("html_word_mode_in",  ".docx");
+    const auto out = tmp_file("html_word_mode_out", ".html");
+    tf_test::write_minimal_docx(in, kBodyWithHeaderBookmark);
+
+    // Only Word may convert: LibreOffice off, .html (no native/remote).
+    ScopedEnv all("DOCWEFT_DISABLE_CONVERTERS");
+    all.set(nullptr);
+    ScopedEnv soffice("DOCWEFT_SOFFICE");
+    soffice.set("");
+    ScopedEnv no_word("DOCWEFT_NO_MSWORD");
+    no_word.set("1");
+
+    auto word_reason = [&](docweft::IReportMerger::WordConversion mode) {
+        auto merger = docweft::make_docx_merger();
+        merger->load(in.string());
+        merger->setWordConversion(mode);
+        try {
+            merger->save(out.string());
+        } catch (const docweft::ReportException& e) {
+            if (e.code() == docweft::ReportError::NoConverter) return std::string(e.what());
+        }
+        return std::string("converted");  // Word installed and enabled
+    };
+    using Mode = docweft::IReportMerger::WordConversion;
+
+    constexpr auto npos = std::string::npos;
+    REQUIRE(word_reason(Mode::Default).find("disabled by DOCWEFT_NO_MSWORD") != npos);
+    REQUIRE(word_reason(Mode::Enabled).find("DOCWEFT_NO_MSWORD") == npos);
+
+    no_word.set(nullptr);
+    REQUIRE(word_reason(Mode::Disabled).find("disabled by setWordConversion(Disabled)") != npos);
+#ifdef __APPLE__
+    // Off by default on macOS: installed Word is reported, not used.
+    ScopedEnv mac_word("DOCWEFT_MSWORD");
+    mac_word.set(nullptr);
+    const std::string by_default = word_reason(Mode::Default);
+    REQUIRE((by_default.find("off by default on macOS") != npos
+             || by_default.find("Microsoft Word: not installed") != npos));
+#endif
+
+    fs::remove(in);
+    fs::remove(out);
 }
 
 #ifndef _WIN32
@@ -602,11 +667,13 @@ TEST_CASE("save('.html') via any available converter produces an HTML file",
     REQUIRE(fs::exists(out));
     REQUIRE(fs::file_size(out) > 64);
 
-    // Both converters write UTF-8; substituted Cyrillic must survive.
+    // Substituted Cyrillic must survive: as UTF-8, or — LibreOffice under
+    // a non-UTF-8 locale (LANG=C) writes iso-8859-1 — as character references.
     std::ifstream f(out, std::ios::binary);
     const std::string body((std::istreambuf_iterator<char>(f)),
                             std::istreambuf_iterator<char>());
-    REQUIRE(body.find("Борис") != std::string::npos);
+    REQUIRE((body.find("Борис") != std::string::npos ||
+             body.find("&#1041;&#1086;&#1088;&#1080;&#1089;") != std::string::npos));
 
     fs::remove(in);
     fs::remove(out);
@@ -1945,6 +2012,16 @@ TEST_CASE("setChartTitle creates a title and clears autoTitleDeleted",
     REQUIRE(std::string(title_text) == "Quarterly Sales");
     REQUIRE(std::string(chart_node.child("c:autoTitleDeleted").attribute("val").value()) == "0");
 
+    // A title made from scratch is styled as Word styles one: it doesn't
+    // overlay the plot (right after <c:tx>, per CT_Title) and has a size.
+    auto title = chart_node.child("c:title");
+    REQUIRE(std::string(title.child("c:tx").next_sibling().name()) == "c:overlay");
+    REQUIRE(std::string(title.child("c:overlay").attribute("val").value()) == "0");
+    auto p = title.child("c:tx").child("c:rich").child("a:p");
+    REQUIRE(std::string(p.child("a:pPr").child("a:defRPr").attribute("sz").value()) == "1400");
+    REQUIRE(std::string(p.child("a:r").child("a:rPr").attribute("sz").value()) == "1400");
+    REQUIRE(std::string(p.child("a:r").child("a:rPr").attribute("b").value()) == "0");
+
     fs::remove(in);
     fs::remove(out);
 }
@@ -2007,6 +2084,9 @@ TEST_CASE("setChartTitle preserves the template's existing title formatting",
     REQUIRE(std::string(run.child("a:rPr").attribute("sz").value()) == "1400");
     REQUIRE(std::string(run.child("a:rPr").child("a:solidFill").child("a:srgbClr")
                          .attribute("val").value()) == "FF0000");
+    // The template's title is left as it is — no overlay or defaults added.
+    REQUIRE(!title.child("c:overlay"));
+    REQUIRE(!rich.child("a:p").child("a:pPr").child("a:defRPr"));
 
     fs::remove(in);
     fs::remove(out);
@@ -2053,6 +2133,15 @@ TEST_CASE("setChartAxisTitle sets the category axis title",
     REQUIRE(std::string(cat_title) == "Quarter");
     REQUIRE(!plot_area.child("c:valAx").child("c:title"));
 
+    // New axis title: no overlay, 10 pt bold, flat under a bottom axis.
+    auto title = plot_area.child("c:catAx").child("c:title");
+    REQUIRE(std::string(title.child("c:overlay").attribute("val").value()) == "0");
+    auto rich = title.child("c:tx").child("c:rich");
+    auto r_pr = rich.child("a:p").child("a:r").child("a:rPr");
+    REQUIRE(std::string(r_pr.attribute("sz").value()) == "1000");
+    REQUIRE(std::string(r_pr.attribute("b").value()) == "1");
+    REQUIRE(!rich.child("a:bodyPr").attribute("rot"));
+
     fs::remove(in);
     fs::remove(out);
 }
@@ -2076,6 +2165,9 @@ TEST_CASE("setChartAxisTitle sets the value axis title",
     auto val_title = plot_area.child("c:valAx").child("c:title").child("c:tx")
                      .child("c:rich").child("a:p").child("a:r").child_value("a:t");
     REQUIRE(std::string(val_title) == "USD");
+    // A side (left) axis's new title reads upwards, as Word writes it.
+    auto val_rich = plot_area.child("c:valAx").child("c:title").child("c:tx").child("c:rich");
+    REQUIRE(std::string(val_rich.child("a:bodyPr").attribute("rot").value()) == "-5400000");
 
     fs::remove(in);
     fs::remove(out);

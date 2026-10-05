@@ -1,4 +1,5 @@
 #include "docx/pdf_native.hpp"
+#include "docx/merger.hpp"
 #include "docweft/error.hpp"
 
 #include <fmt/format.h>
@@ -10,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <functional>
 #include <map>
@@ -19,6 +21,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #if defined(DOCWEFT_HAVE_PODOFO)
@@ -258,6 +261,7 @@ struct TextStyle {
     bool   underline = false;
     bool   strike    = false;
     Color  color;           // black unless set
+    bool   color_set = false;  // `color` came from a style or the run ("auto" doesn't count)
     bool   hidden    = false;  // <w:vanish>: not printed
     bool   caps       = false;  // <w:caps>: drawn in capitals
     bool   small_caps = false;  // <w:smallCaps>: lower case drawn as smaller capitals
@@ -360,8 +364,9 @@ const Border& stronger(const Border& a, const Border& b) {
 //      (top/left/bottom/right) for a cell actually on that edge of the
 //      table, its "inside" value (insideH/insideV) for every interior
 //      row/column boundary.
-//   4. The referenced table *style*'s own <w:tblBorders> (see
-//      find_table_style()) — same outer/inside distinction.
+//   4. The referenced table *style*'s <w:tblBorders>, a side it leaves
+//      out taken from the style it's <w:basedOn> — same outer/inside
+//      distinction.
 //   5. With no signal from any of the above: no border if the table named
 //      a style that was actually found — even one that, like Plain Table
 //      4, defines no border information anywhere, relying entirely on
@@ -390,6 +395,13 @@ struct ParaProps {
     double   line       = 1.0;   // Auto: multiple of single; otherwise points
     bool     contextual = false;
     bool     keep_next  = false;  // <w:keepNext>: on the same page as the next block
+    // <w:widowControl>: no first line alone at a page's bottom, no last
+    // line alone at the next one's top. On unless turned off, as in Word
+    // (which writes it only as w:val="0") and LibreOffice.
+    bool     widow_control = true;
+    // The document's compat setting doNotUseHTMLParagraphAutoSpacing: space
+    // after and the next paragraph's space before add up (see FlowState).
+    bool     add_spacing = false;
     std::vector<Tab> tabs;
     std::string style_id;
 
@@ -472,9 +484,9 @@ bool on_off(pugi::xml_node n) {
 
 // Subtrees that never contribute running text to the paragraph they sit
 // in: property blocks, deleted text (tracked changes), drawings and legacy
-// VML (a text box's own text is not paragraph text — strict mode rejects
-// text boxes, see find_unsupported()), and the mc:Fallback copy of an
-// mc:AlternateContent (the mc:Choice branch is the one rendered).
+// VML (a text box's own text is drawn in its shape, see ShapeBlock), and
+// the mc:Fallback copy of an mc:AlternateContent (the mc:Choice branch is
+// the one rendered).
 bool skipped_in_text(std::string_view name) {
     return name == "w:pPr" || name == "w:rPr" || name == "w:del" || name == "w:moveFrom"
         || name == "w:drawing" || name == "w:pict" || name == "w:object"
@@ -539,6 +551,12 @@ std::string format_number(int v, std::string_view fmt) {
     }
     if (fmt == "decimalZero" && v >= 0 && v < 10) return "0" + std::to_string(v);
     if (fmt == "numberInDash") return "- " + std::to_string(v) + " -";
+    if (fmt == "chicago" && v > 0) {  // note marks: *, †, ‡, §, then doubled, ...
+        static constexpr const char* kMarks[] = {"*", "\u2020", "\u2021", "\u00a7"};
+        std::string out;
+        for (int i = 0; i <= (v - 1) / 4; ++i) out += kMarks[(v - 1) % 4];
+        return out;
+    }
     return std::to_string(v);  // decimal, and the fallback for anything else
 }
 
@@ -667,6 +685,90 @@ void append_utf8(std::string& out, char32_t cp) {
     }
 }
 
+// ── Symbol fonts ────────────────────────────────────────────────────────────
+
+// Symbol, Wingdings and Wingdings 2 have no Unicode text in them: a
+// character is a byte (0x20..0xFF, or the same moved to U+F020..U+F0FF)
+// whose glyph is whatever that font draws there. Those fonts are rarely
+// installed where this runs, so such characters are drawn as the Unicode
+// character with the same picture, in an ordinary font.
+bool is_symbol_font(std::string_view family) {
+    std::string n;
+    for (const char ch : family) {
+        if (ch != ' ') n.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+    }
+    return n == "symbol" || n == "wingdings" || n == "wingdings2";
+}
+
+// Unicode for `code` in symbol font `family`, or 0 when unknown (including
+// when `family` isn't a symbol font).
+char32_t symbol_to_unicode(std::string_view family, unsigned code) {
+    if (code >= 0xF000 && code <= 0xF0FF) code -= 0xF000;
+    if (code < 0x20 || code > 0xFF) return 0;
+    std::string n;
+    for (const char ch : family) {
+        if (ch != ' ') n.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+    }
+    if (n == "symbol") {
+        // Adobe's Symbol encoding (0x20..0x7E as ASCII apart from the
+        // letters, which are Greek, and a few math signs).
+        static const std::map<unsigned, char32_t> kSpecial = {
+            {0x22, U'∀'}, {0x24, U'∃'}, {0x27, U'∋'}, {0x2A, U'∗'}, {0x2D, U'−'},
+            {0x40, U'≅'}, {0x5C, U'∴'}, {0x5E, U'⊥'}, {0x60, U'‾'}, {0x7E, U'∼'},
+        };
+        static const char32_t kUpper[] = U"ΑΒΧΔΕΦΓΗΙϑΚΛΜΝΟΠΘΡΣΤΥςΩΞΨΖ";
+        static const char32_t kLower[] = U"αβχδεφγηιϕκλμνοπθρστυϖωξψζ";
+        static const char32_t kHigh[] =  // 0xA0..0xFF; 0 = bracket pieces
+            U"€ϒ′≤⁄∞ƒ♣♦♥♠↔←↑→↓°±″≥×∝∂•÷≠≡≈…⏐⎯↵"
+            U"ℵℑℜ℘⊗⊕∅∩∪⊃⊇⊄⊂⊆∈∉∠∇®©™∏√⋅¬∧∨⇔⇐⇑⇒⇓"
+            U"◊〈®©™∑\0\0\0\0\0\0\0\0\0\0\0〉∫\0\0\0\0\0\0\0\0\0\0\0\0\0";
+        static_assert(std::size(kUpper) == 27 && std::size(kLower) == 27 && std::size(kHigh) == 97);
+        if (const auto it = kSpecial.find(code); it != kSpecial.end()) return it->second;
+        if (code >= 0x41 && code <= 0x5A) return kUpper[code - 0x41];
+        if (code >= 0x61 && code <= 0x7A) return kLower[code - 0x61];
+        if (code < 0x7F) return code;
+        if (code >= 0xA0) return kHigh[code - 0xA0];
+        return 0;
+    }
+    if (n == "wingdings") {
+        static const std::map<unsigned, char32_t> kWingdings = {
+            {0x21, U'✏'}, {0x22, U'✂'}, {0x23, U'✁'}, {0x28, U'☎'}, {0x2A, U'✉'},
+            {0x4A, U'☺'}, {0x4C, U'☹'}, {0x4E, U'☠'}, {0x51, U'✈'}, {0x52, U'☼'},
+            {0x54, U'❄'}, {0x56, U'✞'}, {0x58, U'✠'}, {0x59, U'✡'}, {0x5A, U'☪'},
+            {0x5B, U'☯'}, {0x6C, U'●'}, {0x6D, U'❍'}, {0x6E, U'■'}, {0x6F, U'□'},
+            {0x71, U'❑'}, {0x72, U'❒'}, {0x74, U'⧫'}, {0x75, U'◆'}, {0x76, U'❖'},
+            {0x78, U'⌧'}, {0x7A, U'⌘'}, {0x7B, U'❀'}, {0x7C, U'✿'}, {0x7D, U'❝'},
+            {0x7E, U'❞'}, {0x9E, U'·'}, {0x9F, U'•'}, {0xA0, U'▪'}, {0xA1, U'○'},
+            {0xA4, U'◉'}, {0xA5, U'◎'}, {0xA7, U'▪'}, {0xA8, U'◻'}, {0xAB, U'★'},
+            {0xD8, U'➢'}, {0xEF, U'⇦'}, {0xF0, U'⇨'}, {0xF1, U'⇧'}, {0xF2, U'⇩'},
+            {0xFB, U'✗'}, {0xFC, U'✔'}, {0xFD, U'☒'}, {0xFE, U'☑'},
+        };
+        const auto it = kWingdings.find(code);
+        return it == kWingdings.end() ? 0 : it->second;
+    }
+    if (n == "wingdings2") {
+        static const std::map<unsigned, char32_t> kWingdings2 = {
+            {0x4F, U'✗'}, {0x50, U'✓'}, {0x52, U'☑'}, {0x53, U'☒'}, {0x54, U'☒'},
+            {0x97, U'•'}, {0xA3, U'□'},
+        };
+        const auto it = kWingdings2.find(code);
+        return it == kWingdings2.end() ? 0 : it->second;
+    }
+    return 0;
+}
+
+// `text` written in symbol font `family` as Unicode; characters without a
+// known equivalent are kept as they are.
+std::string symbol_text(std::string_view family, std::string_view text) {
+    std::string out;
+    for (std::size_t i = 0; i < text.size();) {
+        const char32_t cp = next_code_point(text, i);
+        const char32_t u = cp == U' ' ? 0 : symbol_to_unicode(family, static_cast<unsigned>(cp));
+        append_utf8(out, u != 0 ? u : cp);
+    }
+    return out;
+}
+
 // Upper case of `cp` for <w:caps>/<w:smallCaps>: Latin (incl. Latin-1,
 // Extended-A and Vietnamese), Greek and Cyrillic, one code point to one
 // (so ß stays ß); anything else is returned unchanged.
@@ -718,23 +820,29 @@ constexpr double kSmallCapsScale = 0.8;
 
 // One piece of a paragraph's inline content in document order.
 struct Fragment {
-    enum class Kind { Text, Tab, LineBreak, PageBreak } kind = Kind::Text;
+    enum class Kind { Text, Tab, LineBreak, PageBreak, ColumnBreak } kind = Kind::Text;
     std::string text;
     TextStyle   style;
     bool        small_caps_lower = false;  // style.size_pt already scaled by kSmallCapsScale
+    std::string note;  // a footnote/endnote reference mark: its note's key ("f:2", "e:1")
 };
 
 // Walks a paragraph's inline content in document order, producing styled
 // fragments. `style_of_run` resolves a <w:r>'s formatting. Complex fields
 // (<w:fldChar begin/separate/end> + <w:instrText>) are tracked on a stack
 // so a field's instruction is never printed and PAGE/NUMPAGES can replace
-// their cached result.
+// their cached result. Footnote/endnote references
+// (<w:footnoteReference>/<w:endnoteReference>) become their note's mark,
+// tagged with the note's key; <w:footnoteRef>/<w:endnoteRef> inside a note
+// the mark of the note being laid out (`note_mark` with key "ref").
 class ParagraphText {
 public:
     using StyleOfRun = std::function<TextStyle(pugi::xml_node run)>;
+    using NoteMark   = std::function<std::string(std::string_view key)>;
 
-    ParagraphText(const PageFields& pf, StyleOfRun style_of_run, TextStyle base)
-        : pf_(pf), style_of_run_(std::move(style_of_run)), style_(std::move(base)) {}
+    ParagraphText(const PageFields& pf, StyleOfRun style_of_run, TextStyle base, NoteMark note_mark = {})
+        : pf_(pf), style_of_run_(std::move(style_of_run)), style_(std::move(base)),
+          note_mark_(std::move(note_mark)) {}
 
     std::vector<Fragment> run(pugi::xml_node p) {
         walk(p);
@@ -791,12 +899,15 @@ private:
 
     void push(Fragment::Kind kind, std::string_view text, const TextStyle& style,
               bool small_caps_lower = false) {
-        if (kind == Fragment::Kind::Text && !out_.empty() &&
-            out_.back().kind == Fragment::Kind::Text && out_.back().style == style) {
+        if (kind == Fragment::Kind::Text && !out_.empty() && note_.empty() &&
+            out_.back().kind == Fragment::Kind::Text && out_.back().style == style &&
+            out_.back().note.empty()) {
             out_.back().text += text;
             return;
         }
-        out_.push_back({kind, std::string(text), style, small_caps_lower});
+        out_.push_back({kind, std::string(text), style, small_caps_lower, {}});
+        // The reference mark (or a custom mark's first text) carries the note.
+        if (kind == Fragment::Kind::Text && !note_.empty()) out_.back().note = std::exchange(note_, {});
     }
 
     void walk(pugi::xml_node node) {
@@ -809,14 +920,53 @@ private:
                 style_ = style_of_run_(child);
                 walk(child);
                 style_ = std::move(saved);
+                note_.clear();  // a custom mark is in its reference's run
+            } else if (name == "w:footnoteReference" || name == "w:endnoteReference") {
+                if (printing() && !style_.hidden && note_mark_) {
+                    const std::string key = std::string(name == "w:footnoteReference" ? "f:" : "e:") +
+                                            child.attribute("w:id").value();
+                    note_ = key;
+                    // customMarkFollows: the run's own text is the mark.
+                    const std::string_view custom = child.attribute("w:customMarkFollows").value();
+                    if (!(custom == "1" || custom == "true" || custom == "on")) {
+                        emit(Fragment::Kind::Text, note_mark_(key));
+                    }
+                }
+            } else if (name == "w:footnoteRef" || name == "w:endnoteRef") {
+                if (printing() && note_mark_) emit(Fragment::Kind::Text, note_mark_("ref"));
             } else if (name == "w:t") {
-                if (printing()) emit(Fragment::Kind::Text, child.text().get());
+                if (printing()) {
+                    if (is_symbol_font(style_.font)) {
+                        TextStyle saved = style_;
+                        const std::string text = symbol_text(style_.font, child.text().get());
+                        style_.font.clear();
+                        emit(Fragment::Kind::Text, text);
+                        style_ = std::move(saved);
+                    } else {
+                        emit(Fragment::Kind::Text, child.text().get());
+                    }
+                }
+            } else if (name == "w:sym") {
+                // Unknown symbols are left out (strict mode rejects them).
+                const char* font = child.attribute("w:font").value();
+                const char32_t cp = symbol_to_unicode(
+                    *font != '\0' ? std::string_view(font) : std::string_view(style_.font),
+                    static_cast<unsigned>(std::strtoul(child.attribute("w:char").value(), nullptr, 16)));
+                if (printing() && cp != 0) {
+                    std::string text;
+                    append_utf8(text, cp);
+                    TextStyle saved = style_;
+                    style_.font.clear();
+                    emit(Fragment::Kind::Text, text);
+                    style_ = std::move(saved);
+                }
             } else if (name == "w:tab") {
                 if (printing()) emit(Fragment::Kind::Tab);
             } else if (name == "w:br") {
                 if (printing()) {
-                    emit(std::strcmp(child.attribute("w:type").value(), "page") == 0
-                             ? Fragment::Kind::PageBreak : Fragment::Kind::LineBreak);
+                    const std::string_view type = child.attribute("w:type").value();
+                    emit(type == "page"     ? Fragment::Kind::PageBreak
+                         : type == "column" ? Fragment::Kind::ColumnBreak : Fragment::Kind::LineBreak);
                 }
             } else if (name == "w:cr") {
                 if (printing()) emit(Fragment::Kind::LineBreak);
@@ -876,6 +1026,8 @@ private:
     const PageFields&     pf_;
     StyleOfRun            style_of_run_;
     TextStyle             style_;
+    NoteMark              note_mark_;
+    std::string           note_;  // the note key the next text fragment carries
     std::vector<Field>    fields_;
     std::vector<Fragment> out_;
 };
@@ -928,7 +1080,13 @@ struct CellStyle {
 
 class StyleSheet {
 public:
-    StyleSheet(const pugi::xml_document& styles, const Theme& theme) : theme_(theme) {
+    // `normal_beats_table_style`: settings' compatSetting
+    // overrideTableStyleFontSizeAndJustification (see paragraph_base()).
+    // `add_spacing`: settings.xml's doNotUseHTMLParagraphAutoSpacing (see
+    // ParaProps::add_spacing).
+    StyleSheet(const pugi::xml_document& styles, const Theme& theme, bool normal_beats_table_style,
+               bool add_spacing = false)
+        : theme_(theme), normal_beats_table_style_(normal_beats_table_style), add_spacing_(add_spacing) {
         pugi::xml_node root = styles.child("w:styles");
         rpr_defaults_ = root.child("w:docDefaults").child("w:rPrDefault").child("w:rPr");
         ppr_defaults_ = root.child("w:docDefaults").child("w:pPrDefault").child("w:pPr");
@@ -968,11 +1126,20 @@ public:
                          const CellStyle* cell = nullptr) const {
         ParaProps pp;
         pp.style_id = paragraph_style_id(p);
+        pp.add_spacing = add_spacing_;
         apply_ppr(ppr_defaults_, pp);
         if (cell != nullptr) {
             for (pugi::xml_node ppr : cell->ppr) apply_ppr(ppr, pp);
         }
         for (pugi::xml_node s : chain(pp.style_id)) apply_ppr(s.child("w:pPr"), pp);
+        if (cell != nullptr && normal_overridden(pp.style_id, "w:pPr", "w:jc", [](pugi::xml_node jc) {
+                const std::string_view v = jc.attribute("w:val").value();
+                return v == "left" || v == "start";
+            })) {
+            for (pugi::xml_node ppr : cell->ppr) {
+                if (pugi::xml_node jc = ppr.child("w:jc")) pp.align = alignment(jc);
+            }
+        }
         if (numbering_level) apply_ppr(numbering_level.child("w:pPr"), pp);
         apply_ppr(p.child("w:pPr"), pp);
         return pp;
@@ -985,6 +1152,26 @@ public:
             if (pugi::xml_node n = s.child("w:pPr").child("w:numPr")) return n;
         }
         return {};
+    }
+
+    // Table style `id` and the styles it's <w:basedOn>, base-most first;
+    // empty if `id` names no table style.
+    std::vector<pugi::xml_node> table_style_chain(const std::string& id) const {
+        if (id.empty()) return {};
+        std::vector<pugi::xml_node> out = chain(id);
+        if (out.empty() || std::strcmp(out.back().attribute("w:type").value(), "table") != 0) return {};
+        std::erase_if(out, [](pugi::xml_node s) { return std::strcmp(s.attribute("w:type").value(), "table") != 0; });
+        return out;
+    }
+
+    // The document's language (<w:lang w:val>): the default paragraph
+    // style's, else the document defaults'.
+    std::string language() const {
+        std::string lang = rpr_defaults_.child("w:lang").attribute("w:val").value();
+        for (pugi::xml_node s : chain(default_paragraph_)) {
+            if (const char* v = s.child("w:rPr").child("w:lang").attribute("w:val").value(); *v) lang = v;
+        }
+        return lang;
     }
 
     // Formatting on top of the defaults from an rPr (e.g. a list level's).
@@ -1029,13 +1216,41 @@ public:
             const std::string_view v = c.attribute("w:val").value();
             if (auto col = word_color(c, "w:val", "w:themeColor", "w:themeTint", "w:themeShade", theme_)) {
                 st.color = *col;
+                st.color_set = true;
             } else if (v == "auto") {
                 st.color = Color{};
+                st.color_set = false;
             }
         }
     }
 
 private:
+    static ParaProps::Align alignment(pugi::xml_node jc) {
+        const std::string_view v = jc.attribute("w:val").value();
+        if (v == "center")                         return ParaProps::Align::Center;
+        if (v == "right" || v == "end")            return ParaProps::Align::Right;
+        if (v == "both" || v == "distribute")      return ParaProps::Align::Justify;
+        return ParaProps::Align::Left;
+    }
+
+    // Word's compatibility quirk for tables: a table style's font size and
+    // justification lose to the paragraph style's like any other property —
+    // except against the default paragraph style (Normal) when that sets
+    // 11 or 12 pt / left alignment, where the table style wins, unless the
+    // document opts out with overrideTableStyleFontSizeAndJustification
+    // (Word 2013+ writes it into new documents); as LibreOffice imports it.
+    // Whether it applies to `tag` in `props` ("w:rPr"/"w:pPr") for a
+    // paragraph of style `style_id`: Normal's chain sets it to a `quirky` value.
+    template <typename Pred>
+    bool normal_overridden(const std::string& style_id, const char* props, const char* tag, Pred quirky) const {
+        if (normal_beats_table_style_ || style_id != default_paragraph_) return false;
+        pugi::xml_node value;
+        for (pugi::xml_node s : chain(style_id)) {
+            if (pugi::xml_node n = s.child(props).child(tag)) value = n;
+        }
+        return value && quirky(value);
+    }
+
     TextStyle paragraph_base(pugi::xml_node p, const CellStyle* cell) const {
         TextStyle st;
         st.font = theme_.minor_font;
@@ -1043,19 +1258,24 @@ private:
         if (cell != nullptr) {
             for (pugi::xml_node rpr : cell->rpr) apply_rpr(rpr, st);
         }
-        for (pugi::xml_node s : chain(paragraph_style_id(p))) apply_rpr(s.child("w:rPr"), st);
+        const std::string style_id = paragraph_style_id(p);
+        for (pugi::xml_node s : chain(style_id)) apply_rpr(s.child("w:rPr"), st);
+        if (cell != nullptr && normal_overridden(style_id, "w:rPr", "w:sz", [](pugi::xml_node sz) {
+                const long long half_points = sz.attribute("w:val").as_llong(0);
+                return half_points == 22 || half_points == 24;
+            })) {
+            for (pugi::xml_node rpr : cell->rpr) {
+                if (const double half_points = rpr.child("w:sz").attribute("w:val").as_double(0.0); half_points > 0.0) {
+                    st.size_pt = half_points / 2.0;
+                }
+            }
+        }
         return st;
     }
 
     void apply_ppr(pugi::xml_node ppr, ParaProps& pp) const {
         if (!ppr) return;
-        if (pugi::xml_node jc = ppr.child("w:jc")) {
-            const std::string_view v = jc.attribute("w:val").value();
-            if (v == "center")                                      pp.align = ParaProps::Align::Center;
-            else if (v == "right" || v == "end")                    pp.align = ParaProps::Align::Right;
-            else if (v == "both" || v == "distribute")              pp.align = ParaProps::Align::Justify;
-            else                                                    pp.align = ParaProps::Align::Left;
-        }
+        if (pugi::xml_node jc = ppr.child("w:jc")) pp.align = alignment(jc);
         if (pugi::xml_node ind = ppr.child("w:ind")) {
             auto twips = [&](const char* a, const char* b) -> std::optional<double> {
                 for (const char* name : {a, b}) {
@@ -1088,6 +1308,7 @@ private:
         }
         if (pugi::xml_node cs = ppr.child("w:contextualSpacing")) pp.contextual = on_off(cs);
         if (pugi::xml_node kn = ppr.child("w:keepNext")) pp.keep_next = on_off(kn);
+        if (pugi::xml_node wc = ppr.child("w:widowControl")) pp.widow_control = on_off(wc);
         if (pugi::xml_node bdr = ppr.child("w:pBdr")) {
             ParaProps::Borders& b = pp.borders;
             for (auto [name, alt, side] : {std::tuple{"w:top", "", &b.top}, std::tuple{"w:left", "w:start", &b.left},
@@ -1150,6 +1371,8 @@ private:
     }
 
     const Theme&                          theme_;
+    bool                                  normal_beats_table_style_ = true;
+    bool                                  add_spacing_ = false;
     pugi::xml_node                        rpr_defaults_;
     pugi::xml_node                        ppr_defaults_;
     std::map<std::string, pugi::xml_node> by_id_;
@@ -1227,7 +1450,9 @@ public:
         const std::string fmt = lvl.child("w:numFmt").attribute("w:val").value();
         const std::string lvl_text = lvl.child("w:lvlText").attribute("w:val").value();
         if (fmt == "bullet") {
-            m.text = bullet_text(lvl_text);
+            const pugi::xml_node f = lvl.child("w:rPr").child("w:rFonts");
+            m.text = bullet_text(lvl_text, *f.attribute("w:hAnsi").value() ? f.attribute("w:hAnsi").value()
+                                                                           : f.attribute("w:ascii").value());
         } else if (fmt != "none") {
             for (std::size_t i = 0; i < lvl_text.size(); ++i) {
                 if (lvl_text[i] == '%' && i + 1 < lvl_text.size() &&
@@ -1293,9 +1518,19 @@ private:
         return level(num_id, ilvl).child("w:start").attribute("w:val").as_int(1);
     }
 
-    // Symbol/Wingdings bullets are private-use code points (U+F0xx) that only
-    // mean something in those fonts — draw them as a plain bullet.
-    static std::string bullet_text(const std::string& lvl_text) {
+    // Symbol/Wingdings bullets are private-use code points (U+F0xx) or bytes
+    // that only mean something in those fonts — drawn as the Unicode
+    // character with the same picture, else as a plain bullet.
+    static std::string bullet_text(const std::string& lvl_text, std::string_view font) {
+        if (is_symbol_font(font)) {
+            std::string out;
+            for (std::size_t i = 0; i < lvl_text.size();) {
+                const char32_t cp = next_code_point(lvl_text, i);
+                const char32_t u = symbol_to_unicode(font, static_cast<unsigned>(cp));
+                append_utf8(out, u != 0 ? u : U'•');
+            }
+            return out.empty() ? std::string("•") : out;
+        }
         std::string out;
         for (std::size_t i = 0; i < lvl_text.size(); ++i) {
             const auto b0 = static_cast<unsigned char>(lvl_text[i]);
@@ -1341,7 +1576,7 @@ RelMap build_rel_map(const PartMap& parts,
     if (it == parts.end()) return out;
 
     pugi::xml_document rels_doc;
-    if (!rels_doc.load_buffer(it->second.data(), it->second.size())) return out;
+    if (!rels_doc.load_buffer(it->second.data(), it->second.size(), kXmlParse)) return out;
 
     for (pugi::xml_node rel : rels_doc.child("Relationships").children("Relationship")) {
         const std::string id = rel.attribute("Id").value();
@@ -1435,6 +1670,7 @@ struct ChartSeriesData {
     std::vector<Color>   point_colors;  // per category: pie/doughnut wedges
     ChartKind            kind   = ChartKind::Bar;
     bool                 marker = false;  // line: draw point markers
+    double               line_width = 2.25;  // line: <c:spPr><a:ln w>, else Office's default
     std::string          number_format;   // the values' <c:formatCode>
     DataLabels           labels;          // for every point, unless overridden
     std::map<std::size_t, DataLabels> point_labels;  // <c:dLbl> by point index
@@ -1450,10 +1686,56 @@ struct ChartGroup {
     std::vector<std::size_t> series;           // indices into ChartData::series
 };
 
+// Decimal and digit grouping separators of the numbers a chart shows (axis
+// and data labels). Word and Excel take them from the system's regional
+// settings; the chart's language (<c:lang>), else the document's, stands
+// in for that here — so a Russian report shows "1 234,5", not "1,234.5".
+struct NumberLocale {
+    std::string decimal = ".";
+    std::string group   = ",";
+};
+
+NumberLocale number_locale(std::string_view tag) {
+    std::string lang(tag);
+    std::transform(lang.begin(), lang.end(), lang.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    const std::size_t dash = lang.find_first_of("-_");
+    const std::string primary = lang.substr(0, dash);
+    const std::string region  = dash == std::string::npos ? std::string() : lang.substr(dash + 1);
+    auto one_of = [](const std::string& v, std::initializer_list<const char*> list) {
+        return std::any_of(list.begin(), list.end(), [&](const char* x) { return v == x; });
+    };
+    constexpr const char* kNbsp = " ";  // what Windows groups digits with in these locales
+    if ((primary == "de" || primary == "it") && (region == "ch" || region == "li")) return {".", "’"};
+    if (primary == "es" && one_of(region, {"mx", "us", "pr", "gt", "hn", "ni", "pa", "sv", "do"})) return {".", ","};
+    if (primary == "pt") return region == "pt" ? NumberLocale{",", kNbsp} : NumberLocale{",", "."};
+    if (one_of(primary, {"ru", "uk", "be", "kk", "ky", "uz", "tg", "tt", "ba", "bg", "pl", "cs", "sk", "fr",
+                         "fi", "sv", "nb", "nn", "no", "hu", "lt", "lv", "et", "hy", "ka", "az", "sq"})) {
+        return {",", kNbsp};
+    }
+    if (one_of(primary, {"de", "es", "it", "nl", "da", "tr", "id", "el", "ro", "hr", "sl", "sr", "bs", "vi",
+                         "is", "ca", "gl", "eu", "mk"})) {
+        return {",", "."};
+    }
+    return {};
+}
+
+// `number` written with "." and "," (as fmt produces it) in `nl`'s separators.
+std::string localized_number(std::string_view number, const NumberLocale& nl) {
+    std::string out;
+    for (const char ch : number) {
+        if (ch == '.')      out += nl.decimal;
+        else if (ch == ',') out += nl.group;
+        else                out += ch;
+    }
+    return out;
+}
+
 struct ChartData {
     std::vector<std::string>     categories;
     std::vector<ChartSeriesData> series;
     std::vector<ChartGroup>      groups;
+    NumberLocale                 numbers;
 };
 
 std::string read_series_name(pugi::xml_node ser) {
@@ -1521,6 +1803,7 @@ void read_chart_group(pugi::xml_node type_node, ChartKind kind, const Theme& the
             : drawingml_color(sp_pr.child("a:solidFill"), theme);
         if (!color) color = drawingml_color(sp_pr.child("a:solidFill"), theme);
         if (!color) color = drawingml_color(sp_pr.child("a:ln").child("a:solidFill"), theme);
+        if (pugi::xml_attribute w = sp_pr.child("a:ln").attribute("w")) s.line_width = std::max(emu_to_pt(w.as_double()), 0.25);
         // Default colors follow the series' <c:idx>, as Office assigns them.
         s.color = color.value_or(theme.accent(ser.child("c:idx").attribute("val").as_uint(
             static_cast<unsigned>(data.series.size()))));
@@ -1605,9 +1888,13 @@ void append_arc(PoDoFo::PdfPainterPath& path, double cx, double cy, double r,
     }
 }
 
-// Value axis scale the way spreadsheet charts pick it: always includes 0,
-// about five intervals of a "nice" step (1, 2, 2.5 or 5 × 10^n), ends
-// rounded out to whole steps — 0..25000 by 5000 for data up to 21080.
+// Value axis scale the way LibreOffice picks it for a chart without fixed
+// bounds (worked out from its output): always includes 0; the data's end
+// gets 5 % headroom (not on a 100 % axis); the step is the smallest
+// 1, 2 or 5 × 10^n that gives at most 10 intervals, each at least
+// `min_gap` points long on an axis `axis_len` long (0: no such limit); the
+// ends are rounded out to whole steps — 0..18000 by 2000 for data up to
+// 15320 on a 115 pt axis, 0..25000 by 5000 for 21080.
 struct AxisScale {
     double min      = 0.0;
     double max      = 1.0;
@@ -1615,34 +1902,44 @@ struct AxisScale {
     int    decimals = 0;  // digits after the point that the step needs
 };
 
-AxisScale nice_axis_scale(double lo, double hi) {
+AxisScale nice_axis_scale(double lo, double hi, double axis_len = 0.0, double min_gap = 0.0,
+                          bool headroom = true) {
     lo = std::min(lo, 0.0);
     hi = std::max(hi, 0.0);
+    if (headroom) {
+        lo *= 1.05;
+        hi *= 1.05;
+    }
     if (hi - lo <= 0.0) hi = lo + 1.0;
 
-    const double raw = (hi - lo) / 5.0;
-    const double mag = std::pow(10.0, std::floor(std::log10(raw)));
-    double step = 10.0 * mag;
-    for (const double m : {1.0, 2.0, 2.5, 5.0}) {
-        if (raw <= m * mag * (1.0 + 1e-9)) { step = m * mag; break; }
-    }
-
     AxisScale sc;
-    sc.step = step;
-    sc.min  = std::floor(lo / step + 1e-9) * step;
-    sc.max  = std::ceil(hi / step - 1e-9) * step;
-    if (sc.max <= sc.min) sc.max = sc.min + step;
+    double mag = std::pow(10.0, std::floor(std::log10((hi - lo) / 10.0)));
+    for (bool found = false; !found; mag *= 10.0) {
+        for (const double m : {1.0, 2.0, 5.0}) {
+            const double step = m * mag;
+            const double mn = std::floor(lo / step + 1e-9) * step;
+            const double mx = std::max(std::ceil(hi / step - 1e-9) * step, mn + step);
+            const double n = std::round((mx - mn) / step);
+            if (n > 10.0 || (axis_len > 0.0 && axis_len / n < min_gap)) continue;
+            sc.step = step;
+            sc.min  = mn;
+            sc.max  = mx;
+            found = true;
+            break;
+        }
+        if (mag > 1e300) break;
+    }
     while (sc.decimals < 6) {
-        const double scaled = step * std::pow(10.0, sc.decimals);
+        const double scaled = sc.step * std::pow(10.0, sc.decimals);
         if (std::abs(scaled - std::round(scaled)) < 1e-6 * std::max(1.0, scaled)) break;
         ++sc.decimals;
     }
     return sc;
 }
 
-std::string format_axis_value(double v, int decimals) {
+std::string format_axis_value(double v, int decimals, const NumberLocale& nl) {
     if (std::abs(v) < 1e-12) v = 0.0;  // no "-0"
-    return fmt::format("{:.{}f}", v, decimals);
+    return localized_number(fmt::format("{:.{}f}", v, decimals), nl);
 }
 
 // A chart value in an Excel number format code, the kinds data labels
@@ -1650,8 +1947,8 @@ std::string format_axis_value(double v, int decimals) {
 // ("#,##0"); percent ("0%", "0.0%"); literal text around the number
 // ("0 \"₽\"", "\$#,##0"). Only the first section of "pos;neg;zero" codes
 // is used (negatives keep their minus sign); [colors]/[$-locale] are
-// skipped. Separators are "." and "," like the axis labels.
-std::string format_chart_number(double v, std::string_view code) {
+// skipped. Separators are `nl`'s, like the axis labels.
+std::string format_chart_number(double v, std::string_view code, const NumberLocale& nl) {
     code = code.substr(0, code.find(';'));
     std::string prefix, suffix, pattern;
     for (std::size_t i = 0; i < code.size(); ++i) {
@@ -1687,7 +1984,7 @@ std::string format_chart_number(double v, std::string_view code) {
         if (std::abs(v) < 1e-12) return "0";
         std::string g = fmt::format("{:.10g}", v);
         if (g.find('e') != std::string::npos) g = fmt::format("{:.2f}", v);
-        return prefix + g + suffix;
+        return prefix + localized_number(g, nl) + suffix;
     }
     const bool percent = pattern.find('%') != std::string::npos;
     const std::size_t dot = pattern.find('.');
@@ -1710,7 +2007,7 @@ std::string format_chart_number(double v, std::string_view code) {
         const std::size_t int_end = num.find('.') == std::string::npos ? num.size() : num.find('.');
         for (std::size_t k = int_end; k > 3; k -= 3) num.insert(k - 3, ",");
     }
-    return (x < 0.0 ? "-" : "") + prefix + num + (percent ? "%" : "") + suffix;
+    return (x < 0.0 ? "-" : "") + prefix + localized_number(num, nl) + (percent ? "%" : "") + suffix;
 }
 
 // Labels for point `i` of a series: its own <c:dLbl>, else the series'.
@@ -1723,14 +2020,18 @@ const DataLabels& labels_at(const ChartSeriesData& s, std::size_t i) {
 // Office's order, joined by the separator. `fraction`: the point's share
 // of the whole (pie/doughnut), for the percentage.
 std::string data_label_text(const DataLabels& dl, const ChartSeriesData& s, const std::string& category,
-                            double value, std::optional<double> fraction = std::nullopt) {
+                            double value, const NumberLocale& nl, std::optional<double> fraction = std::nullopt) {
     if (!dl.custom_text.empty()) return dl.custom_text;
     std::vector<std::string> parts;
     if (dl.series) parts.push_back(s.name);
     if (dl.category) parts.push_back(category);
-    if (dl.value) parts.push_back(format_chart_number(value, dl.format.empty() ? std::string_view(s.number_format) : std::string_view(dl.format)));
+    if (dl.value) {
+        parts.push_back(format_chart_number(
+            value, dl.format.empty() ? std::string_view(s.number_format) : std::string_view(dl.format), nl));
+    }
     if (dl.percent && fraction) {
-        parts.push_back(format_chart_number(*fraction, dl.format.find('%') != std::string::npos ? std::string_view(dl.format) : "0%"));
+        parts.push_back(format_chart_number(
+            *fraction, dl.format.find('%') != std::string::npos ? std::string_view(dl.format) : "0%", nl));
     }
     std::string out;
     for (const std::string& part : parts) {
@@ -1740,11 +2041,57 @@ std::string data_label_text(const DataLabels& dl, const ChartSeriesData& s, cons
     return sanitize_single_line(out);
 }
 
+// Look of a piece of chart text: from <c:txPr> / rich text's a:defRPr and
+// a:rPr (sz in hundredths of a point, b, solidFill).
+struct ChartText {
+    double size  = 10.0;  // Office's default chart text
+    bool   bold  = false;
+    Color  color;         // black
+};
+
+// `base` with what a <c:txPr> or <c:rich> sets: its paragraph defaults,
+// then (rich text) its first run's own properties.
+ChartText chart_text(pugi::xml_node tx, ChartText base, const Theme& theme) {
+    pugi::xml_node para = tx.child("a:p");
+    for (pugi::xml_node rpr : {para.child("a:pPr").child("a:defRPr"), para.child("a:r").child("a:rPr")}) {
+        if (pugi::xml_attribute sz = rpr.attribute("sz")) base.size = std::clamp(sz.as_double() / 100.0, 4.0, 72.0);
+        if (pugi::xml_attribute b = rpr.attribute("b")) base.bold = std::strcmp(b.value(), "1") == 0;
+        if (auto c = drawingml_color(rpr.child("a:solidFill"), theme)) base.color = *c;
+    }
+    return base;
+}
+
+// A line from <c:spPr><a:ln>: none (a:noFill), or width and color, each
+// falling back to `fallback` when not given.
+struct ChartLine {
+    bool   shown = true;
+    double width = 0.75;
+    Color  color = {0.7, 0.7, 0.7};
+};
+
+ChartLine chart_line(pugi::xml_node sp_pr, ChartLine fallback, const Theme& theme) {
+    pugi::xml_node ln = sp_pr.child("a:ln");
+    if (!ln) return fallback;
+    if (ln.child("a:noFill")) return ChartLine{false, 0.0, {}};
+    if (pugi::xml_attribute w = ln.attribute("w")) fallback.width = std::max(emu_to_pt(w.as_double()), 0.25);
+    if (auto c = drawingml_color(ln.child("a:solidFill"), theme)) fallback.color = *c;
+    return fallback;
+}
+
 struct ChartAxis {
     std::string           title;
+    std::vector<std::string> title_paragraphs;  // the title's rich text paragraphs
     std::optional<double> min, max;        // <c:scaling> overrides
     bool                  reversed = false;  // <c:orientation val="maxMin">
     bool                  deleted  = false;
+    ChartText             labels;            // tick labels
+    ChartText             title_text;
+    std::optional<double> title_rot;         // <c:title><c:tx><c:rich><a:bodyPr rot>, degrees; none: by the axis' side
+    // <c:majorTickMark>/<c:minorTickMark>; absent means cross (the schema's default).
+    enum class Tick { None, In, Out, Cross } major = Tick::Cross, minor = Tick::Cross;
+    bool                  major_grid = false, minor_grid = false;  // <c:majorGridlines>/<c:minorGridlines>
+    ChartLine             grid  = {true, 0.5, {0.75, 0.75, 0.75}};
+    ChartLine             line  = {true, 0.75, {0.0, 0.0, 0.0}};  // the axis line
 };
 
 struct ResolvedChart {
@@ -1752,13 +2099,34 @@ struct ResolvedChart {
     double    hole_frac = 0.5;   // only meaningful for Doughnut
     ChartData data;
     std::string title;           // empty = no title shown
+    std::vector<std::string> title_paragraphs;  // the title's lines as written (rich text paragraphs)
     bool      horizontal = false;  // bar chart with <c:barDir val="bar">
     bool      has_secondary = false;
     ChartAxis cat_axis;
     ChartAxis val_axis;
     ChartAxis val2_axis;         // secondary value axis
+    // Points on the category axis' ticks, the first and last at the plot's
+    // edges (<c:crossBetween val="midCat">), rather than mid-way between
+    // them. Without crossBetween: so for area charts (as Office writes
+    // them and LibreOffice draws them), not for bars and lines.
+    bool      on_ticks = false;
     double    width_pt  = 0.0;   // from the drawing's <wp:extent>
     double    height_pt = 0.0;
+    // <c:legend>: where (None: the chart has no legend), whether it
+    // overlaps the plot instead of taking room from it, entries removed
+    // (<c:legendEntry><c:delete/>, by series or — pie — category index),
+    // text size.
+    struct Legend {
+        enum class Pos { None, Right, Left, Top, Bottom, TopRight } pos = Pos::None;
+        bool                  overlay = false;
+        std::set<std::size_t> deleted;
+        ChartText             text;
+    } legend;
+    ChartText title_text;         // the chart title's look
+    // Chart area (<c:chartSpace><c:spPr>): background and border. Without
+    // spPr Office draws a thin grey border and no background.
+    std::optional<Color> area_fill;
+    ChartLine            area_line;
 };
 
 // DrawingML boolean (<c:delete val="1"/>): present without val means true.
@@ -1769,8 +2137,9 @@ bool on_off_val(pugi::xml_node n) {
 }
 
 // Plain text of a <c:title>'s rich text (paragraphs joined by a space).
-std::string rich_title_text(pugi::xml_node title) {
-    std::string out;
+// The paragraphs of a <c:title>'s rich text, empty ones left out.
+std::vector<std::string> rich_title_paragraphs(pugi::xml_node title) {
+    std::vector<std::string> out;
     for (pugi::xml_node para : title.child("c:tx").child("c:rich").children("a:p")) {
         std::string line;
         for (pugi::xml_node r : para.children()) {
@@ -1778,11 +2147,18 @@ std::string rich_title_text(pugi::xml_node title) {
                 line += r.child_value("a:t");
             }
         }
-        if (line.empty()) continue;
-        if (!out.empty()) out += ' ';
-        out += line;
+        if (!line.empty()) out.push_back(sanitize_single_line(line));
     }
-    return sanitize_single_line(out);
+    return out;
+}
+
+std::string rich_title_text(pugi::xml_node title) {
+    std::string out;
+    for (const std::string& para : rich_title_paragraphs(title)) {
+        if (!out.empty()) out += ' ';
+        out += para;
+    }
+    return out;
 }
 
 // Chart title as Word shows it: the title's own text; for an auto title
@@ -1803,9 +2179,11 @@ std::string chart_title_text(pugi::xml_node chart, const ChartData& data) {
 // just under a different Id), classifies the plot type, and reads its
 // series/category data plus the drawing's natural (unscaled) size. Throws
 // NotImplemented for anything outside bar/line/area/pie/doughnut (their 3D
-// variants rendered flat, no projection) — see PLAN.md.
+// variants rendered flat, no projection) — see PLAN.md. `doc_lang`: the
+// document's language, for number separators when the chart names none.
 ResolvedChart resolve_chart(pugi::xml_node drawing, pugi::xml_node chart_ref,
-                            const RelMap& rels, const PartMap& parts, const Theme& theme) {
+                            const RelMap& rels, const PartMap& parts, const Theme& theme,
+                            std::string_view doc_lang) {
     const std::string rid = chart_ref.attribute("r:id").value();
     const auto rel_it = rels.find(rid);
     if (rel_it == rels.end()) {
@@ -1822,7 +2200,7 @@ ResolvedChart resolve_chart(pugi::xml_node drawing, pugi::xml_node chart_ref,
     }
 
     pugi::xml_document chart_doc;
-    if (!chart_doc.load_buffer(part_it->second.data(), part_it->second.size())) {
+    if (!chart_doc.load_buffer(part_it->second.data(), part_it->second.size(), kXmlParse)) {
         throw ReportException(
             ReportError::CantCopyDocxTemplate,
             fmt::format("native PDF backend: chart part '{}' failed to parse", chart_part_name));
@@ -1876,10 +2254,40 @@ ResolvedChart resolve_chart(pugi::xml_node drawing, pugi::xml_node chart_ref,
         }
         return {};
     };
+    // Text and lines: the chart's defaults (<c:chartSpace><c:txPr>), then
+    // each part's own.
+    pugi::xml_node chart_space = chart_doc.child("c:chartSpace");
+    const ChartText chart_default = chart_text(chart_space.child("c:txPr"), ChartText{}, theme);
+    auto read_tick = [](pugi::xml_node t) {
+        const std::string_view v = t.attribute("val").value();
+        if (!t) return ChartAxis::Tick::Cross;
+        return v == "none" ? ChartAxis::Tick::None : v == "in" ? ChartAxis::Tick::In
+             : v == "out" ? ChartAxis::Tick::Out : ChartAxis::Tick::Cross;
+    };
     auto read_axis = [&](pugi::xml_node ax) {
         ChartAxis a;
+        a.labels = chart_default;
         if (!ax) return a;
-        a.title    = rich_title_text(ax.child("c:title"));
+        a.labels = chart_text(ax.child("c:txPr"), chart_default, theme);
+        a.title  = rich_title_text(ax.child("c:title"));
+        a.title_paragraphs = rich_title_paragraphs(ax.child("c:title"));
+        ChartText title_base = chart_default;
+        title_base.bold = true;
+        a.title_text = chart_text(ax.child("c:title").child("c:txPr"), title_base, theme);
+        a.title_text = chart_text(ax.child("c:title").child("c:tx").child("c:rich"), a.title_text, theme);
+        for (pugi::xml_node body : {ax.child("c:title").child("c:tx").child("c:rich").child("a:bodyPr"),
+                                    ax.child("c:title").child("c:txPr").child("a:bodyPr")}) {
+            if (pugi::xml_attribute rot = body.attribute("rot")) {
+                a.title_rot = rot.as_double() / 60000.0;
+                break;
+            }
+        }
+        a.major = read_tick(ax.child("c:majorTickMark"));
+        a.minor = read_tick(ax.child("c:minorTickMark"));
+        a.major_grid = static_cast<bool>(ax.child("c:majorGridlines"));
+        a.minor_grid = static_cast<bool>(ax.child("c:minorGridlines"));
+        a.grid = chart_line(ax.child(a.major_grid ? "c:majorGridlines" : "c:minorGridlines").child("c:spPr"), a.grid, theme);
+        a.line = chart_line(ax.child("c:spPr"), a.line, theme);
         a.deleted  = on_off_val(ax.child("c:delete"));
         a.reversed = std::strcmp(ax.child("c:scaling").child("c:orientation").attribute("val").value(), "maxMin") == 0;
         if (pugi::xml_node mn = ax.child("c:scaling").child("c:min")) a.min = mn.attribute("val").as_double();
@@ -1903,6 +2311,8 @@ ResolvedChart resolve_chart(pugi::xml_node drawing, pugi::xml_node chart_ref,
             if (!cat_ax) cat_ax = plot_area.child("c:dateAx");
             rc.cat_axis = read_axis(cat_ax);
             rc.val_axis = read_axis(val_ax);
+            const std::string_view between = val_ax.child("c:crossBetween").attribute("val").value();
+            rc.on_ticks = between.empty() ? kind == ChartKind::Area : between == "midCat";
         } else if (val_ax && val_ax != primary_val) {
             rc.data.groups.back().secondary = true;
             rc.has_secondary = true;
@@ -1925,6 +2335,39 @@ ResolvedChart resolve_chart(pugi::xml_node drawing, pugi::xml_node chart_ref,
             "native PDF backend: chart has no readable category/series data");
     }
     rc.title = chart_title_text(chart_doc.child("c:chartSpace").child("c:chart"), rc.data);
+    rc.title_paragraphs = rich_title_paragraphs(chart_doc.child("c:chartSpace").child("c:chart").child("c:title"));
+    if (rc.title_paragraphs.empty() && !rc.title.empty()) rc.title_paragraphs.push_back(rc.title);
+    if (pugi::xml_node lg = chart_doc.child("c:chartSpace").child("c:chart").child("c:legend")) {
+        using Pos = ResolvedChart::Legend::Pos;
+        const std::string_view pos = lg.child("c:legendPos").attribute("val").value();
+        rc.legend.pos = pos == "l" ? Pos::Left : pos == "t" ? Pos::Top : pos == "b" ? Pos::Bottom
+                      : pos == "tr" ? Pos::TopRight : Pos::Right;  // "r", also the default
+        rc.legend.overlay = on_off_val(lg.child("c:overlay"));
+        for (pugi::xml_node e : lg.children("c:legendEntry")) {
+            if (on_off_val(e.child("c:delete"))) {
+                rc.legend.deleted.insert(static_cast<std::size_t>(e.child("c:idx").attribute("val").as_uint()));
+            }
+        }
+        rc.legend.text = chart_text(lg.child("c:txPr"), chart_default, theme);
+    }
+    // Title: 1.8 times the chart's text (18 pt by default) and bold unless
+    // it says otherwise — Office's default title, which LibreOffice draws
+    // for a title without its own size too.
+    {
+        pugi::xml_node title = chart_space.child("c:chart").child("c:title");
+        ChartText base = chart_default;
+        base.size = chart_default.size * 1.8;
+        base.bold = true;
+        rc.title_text = chart_text(title.child("c:txPr"), base, theme);
+        rc.title_text = chart_text(title.child("c:tx").child("c:rich"), rc.title_text, theme);
+    }
+    // Chart area.
+    rc.area_line = chart_line(chart_space.child("c:spPr"), ChartLine{}, theme);
+    if (pugi::xml_node sp = chart_space.child("c:spPr"); sp && !sp.child("a:noFill")) {
+        rc.area_fill = drawingml_color(sp.child("a:solidFill"), theme);
+    }
+    const std::string_view chart_lang = chart_doc.child("c:chartSpace").child("c:lang").attribute("val").value();
+    rc.data.numbers = number_locale(chart_lang.empty() ? doc_lang : chart_lang);
     if (rc.kind == ChartKind::Doughnut) {
         // <c:holeSize val="50"/> — percentage of outer radius the hole
         // occupies; only meaningful for doughnut, absent on pie.
@@ -1939,25 +2382,6 @@ ResolvedChart resolve_chart(pugi::xml_node drawing, pugi::xml_node chart_ref,
     return rc;
 }
 
-// Finds a table style's own <w:style> node in styles.xml by id — only the
-// direct w:type="table" entries; <w:basedOn> inheritance chains (e.g.
-// TableGrid and PlainTable4 both declare w:basedOn="TableNormal") aren't
-// followed, so a style whose own <w:tblPr> has no border info is treated
-// as "this style deliberately specifies none" rather than climbing to its
-// parent's. Confirmed against a real template: Word's built-in "Plain
-// Table 4" style has no <w:tblBorders> anywhere in its own definition
-// (banding comes from cell shading, not lines) and TableGrid defines every
-// side as "single" directly — TableNormal's own (usually empty) borders
-// never actually come into play for either in practice.
-pugi::xml_node find_table_style(const pugi::xml_document& styles_doc, const std::string& style_id) {
-    if (style_id.empty()) return {};
-    for (pugi::xml_node style : styles_doc.child("w:styles").children("w:style")) {
-        if (std::strcmp(style.attribute("w:type").value(), "table") != 0) continue;
-        if (style_id == style.attribute("w:styleId").value()) return style;
-    }
-    return {};
-}
-
 // A border side by name; left/right also by their bidi-neutral names.
 pugi::xml_node border_side(pugi::xml_node borders, const char* side) {
     if (pugi::xml_node b = borders.child(side)) return b;
@@ -1966,8 +2390,11 @@ pugi::xml_node border_side(pugi::xml_node borders, const char* side) {
     return {};
 }
 
+// `style_borders`: the <w:tblBorders> of the table style and the styles it
+// is based on, nearest first — a side the style leaves out comes from its
+// base style.
 Border cell_border(const Theme& theme, pugi::xml_node tc, pugi::xml_node tbl_borders,
-                   pugi::xml_node style_borders, bool style_resolved,
+                   const std::vector<pugi::xml_node>& style_borders, bool style_resolved,
                    const std::optional<Border>& conditional,
                    const char* cell_side, const char* table_outer_side,
                    const char* table_inside_side, bool is_outer_edge) {
@@ -1975,7 +2402,9 @@ Border cell_border(const Theme& theme, pugi::xml_node tc, pugi::xml_node tbl_bor
     if (conditional) return *conditional;
     const char* side = is_outer_edge ? table_outer_side : table_inside_side;
     if (pugi::xml_node b = border_side(tbl_borders, side)) return parse_border(b, theme);
-    if (pugi::xml_node b = border_side(style_borders, side)) return parse_border(b, theme);
+    for (pugi::xml_node borders : style_borders) {
+        if (pugi::xml_node b = border_side(borders, side)) return parse_border(b, theme);
+    }
     Border fallback;
     if (!style_resolved) fallback.style = Border::Style::Single;
     return fallback;
@@ -1990,7 +2419,7 @@ struct StyleBorders {
 };
 
 CellBorderSides resolve_cell_borders(const Theme& theme, pugi::xml_node tc, pugi::xml_node tbl_borders,
-                                     pugi::xml_node style_borders, bool style_resolved,
+                                     const std::vector<pugi::xml_node>& style_borders, bool style_resolved,
                                      const StyleBorders& conditional,
                                      bool first_row, bool last_row,
                                      bool first_col, bool last_col) {
@@ -2074,6 +2503,30 @@ std::vector<double> cell_widths_for_row(const std::vector<pugi::xml_node>& cells
     return widths;
 }
 
+// Shapes (<wps:wsp>) the renderer draws — see ShapeBlock.
+bool is_shape(pugi::xml_node drawing) {
+    const std::string_view uri = find_descendant(drawing, "a:graphicData").attribute("uri").value();
+    return uri.find("wordprocessingShape") != std::string_view::npos;
+}
+
+// What of a <wps:wsp> ShapeBlock can't draw; nullopt if it can.
+std::optional<std::string> shape_unsupported(pugi::xml_node wsp) {
+    pugi::xml_node sp_pr = wsp.child("wps:spPr");
+    if (sp_pr.child("a:custGeom")) return "freeform shapes";
+    const std::string_view prst = sp_pr.child("a:prstGeom").attribute("prst").value();
+    static constexpr std::string_view kDrawn[] = {"rect", "roundRect", "ellipse", "line", "straightConnector1"};
+    if (!prst.empty() && std::find(std::begin(kDrawn), std::end(kDrawn), prst) == std::end(kDrawn)) {
+        return fmt::format("shapes of type '{}'", prst);
+    }
+    if (sp_pr.child("a:xfrm").attribute("rot").as_llong(0) % 21600000 != 0) return "rotated shapes";
+    if (sp_pr.child("a:blipFill")) return "picture-filled shapes";
+    pugi::xml_node body_pr = wsp.child("wps:bodyPr");
+    const std::string_view vert = body_pr.attribute("vert").value();
+    if (!vert.empty() && vert != "horz") return "vertical text in text boxes";
+    if (body_pr.attribute("rot").as_llong(0) % 21600000 != 0) return "rotated text in text boxes";
+    return std::nullopt;
+}
+
 // ── Strict mode ─────────────────────────────────────────────────────────────
 //
 // Before drawing anything, the whole document (and the headers/footers it
@@ -2116,7 +2569,11 @@ public:
     UnsupportedScan(const PartMap& parts, const StyleSheet& styles, const Numbering& numbering)
         : parts_(parts), styles_(styles), numbering_(numbering) {}
 
-    void scan(pugi::xml_node root, const RelMap& rels) { walk(root, rels); }
+    void scan(pugi::xml_node root, const RelMap& rels) {
+        walk(root, rels);
+        // Word puts footnotes under each column; the footnote area here spans the page.
+        if (multi_column_ && footnotes_) found_.insert("footnotes in multi-column layout");
+    }
 
     const std::set<std::string>& found() const { return found_; }
 
@@ -2133,19 +2590,32 @@ private:
                     }
                 }
             } else if (name == "w:txbxContent") {
-                found_.insert("text boxes");
-            } else if (name == "w:footnoteReference" || name == "w:endnoteReference") {
-                found_.insert("footnotes and endnotes");
+                ++in_text_box_;
+                walk(child, rels);
+                --in_text_box_;
+                continue;
             } else if (name == "w:sym") {
-                found_.insert("symbol characters (w:sym)");
+                const char* font = child.attribute("w:font").value();
+                if (*font == '\0') {
+                    const pugi::xml_node f = node.child("w:rPr").child("w:rFonts");
+                    font = *f.attribute("w:hAnsi").value() ? f.attribute("w:hAnsi").value()
+                                                           : f.attribute("w:ascii").value();
+                }
+                const char* code = child.attribute("w:char").value();
+                if (symbol_to_unicode(font, static_cast<unsigned>(std::strtoul(code, nullptr, 16))) == 0) {
+                    found_.insert(fmt::format("symbol character {} of font '{}' (w:sym)", code, font));
+                }
             } else if (name == "w:object") {
                 found_.insert("embedded objects (w:object)");
             } else if (name == "m:oMath") {
                 found_.insert("equations");
             } else if (name == "w:pict") {
                 found_.insert("legacy VML graphics (w:pict)");
-            } else if (name == "w:cols" && child.attribute("w:num").as_int(1) > 1) {
-                found_.insert("multi-column page layout");
+            } else if (name == "w:cols" &&
+                       (child.attribute("w:num").as_int(1) > 1 || child.select_node("w:col[2]"))) {
+                multi_column_ = true;
+            } else if (name == "w:footnoteReference") {
+                footnotes_ = true;
             } else if (name == "w:drawing") {
                 check_drawing(child, rels);
             }
@@ -2154,6 +2624,7 @@ private:
     }
 
     void check_drawing(pugi::xml_node drawing, const RelMap& rels) {
+        if (in_text_box_ > 0 && drawing.child("wp:anchor")) found_.insert("floating objects inside text boxes");
         pugi::xml_node data = find_descendant(drawing, "a:graphicData");
         const std::string uri = data.attribute("uri").value();
         if (uri == kPictureUri) {
@@ -2173,10 +2644,11 @@ private:
             found_.insert("Office 2016+ charts (waterfall, histogram, treemap, ...)");
         } else if (uri.find("diagram") != std::string::npos) {
             found_.insert("SmartArt");
-        } else if (uri.find("wordprocessingShape") != std::string::npos ||
-                   uri.find("wordprocessingGroup") != std::string::npos ||
+        } else if (uri.find("wordprocessingShape") != std::string::npos) {
+            if (auto what = shape_unsupported(find_descendant(data, "wps:wsp"))) found_.insert(*what);
+        } else if (uri.find("wordprocessingGroup") != std::string::npos ||
                    uri.find("wordprocessingCanvas") != std::string::npos) {
-            found_.insert("shapes and drawing groups");
+            found_.insert("shape groups and drawing canvases");
         } else {
             found_.insert(fmt::format("drawings of type '{}'", uri));
         }
@@ -2186,7 +2658,7 @@ private:
         const auto part = parts_.find(part_name);
         if (part == parts_.end()) return;
         pugi::xml_document chart;
-        if (!chart.load_buffer(part->second.data(), part->second.size())) return;
+        if (!chart.load_buffer(part->second.data(), part->second.size(), kXmlParse)) return;
         pugi::xml_node plot_area = chart.child("c:chartSpace").child("c:chart").child("c:plotArea");
 
         std::vector<pugi::xml_node> types;
@@ -2228,6 +2700,9 @@ private:
     const StyleSheet&     styles_;
     const Numbering&      numbering_;
     std::set<std::string> found_;
+    bool                  multi_column_ = false;
+    bool                  footnotes_    = false;
+    int                   in_text_box_ = 0;
 };
 
 // Explicit env override (mirrors the DOCWEFT_SOFFICE pattern) first, then
@@ -2297,19 +2772,119 @@ public:
 
     PoDoFo::PdfFont& get(const TextStyle& st, std::string_view text = {}) {
         const std::string& family = st.font.empty() ? default_family_ : st.font;
-        if (PoDoFo::PdfFont* f = search(family, st.bold, st.italic); f != nullptr && covers(*f, text)) {
-            return *f;
-        }
-        return st.bold ? *fallback_bold_ : *fallback_regular_;
+        PoDoFo::PdfFont* f = search(family, st.bold, st.italic);
+        if (f != nullptr && covers(*f, text)) return *f;
+        return substitute(classify(family, f), st.bold, st.italic, text);
     }
 
-    // `preferred` if it can draw `text`, else the fallback font.
+    // `text` cut where the run's own font starts or stops having the
+    // glyphs: get() then draws each piece in the run's font when it can, so
+    // only the letters it lacks take a substitute — the punctuation and
+    // digits between them stay in the run's font, as in LibreOffice (a
+    // whole word in the substitute is wider: lines broke a word earlier).
+    std::vector<std::string> pieces_by_font(const TextStyle& st, std::string_view text) {
+        const std::string& family = st.font.empty() ? default_family_ : st.font;
+        PoDoFo::PdfFont* f = search(family, st.bold, st.italic);
+        if (f == nullptr || covers(*f, text)) return {std::string(text)};
+        std::vector<std::string> out;
+        int last = -1;  // whether the previous character was covered
+        for (std::size_t i = 0; i < text.size();) {
+            const std::size_t start = i;
+            next_code_point(text, i);
+            const std::string_view ch = text.substr(start, i - start);
+            const int has = covers(*f, ch) ? 1 : 0;
+            if (has != last) out.emplace_back();
+            out.back() += ch;
+            last = has;
+        }
+        return out;
+    }
+
+    // `text` cut where `font` starts or stops having the glyphs (see
+    // pieces_by_font()), each with the font to draw it in.
+    std::vector<std::pair<std::string, PoDoFo::PdfFont*>> pieces_for(PoDoFo::PdfFont& font, std::string_view text) {
+        std::vector<std::pair<std::string, PoDoFo::PdfFont*>> out;
+        if (covers(font, text)) {
+            out.emplace_back(std::string(text), &font);
+            return out;
+        }
+        int last = -1;
+        for (std::size_t i = 0; i < text.size();) {
+            const std::size_t start = i;
+            next_code_point(text, i);
+            const std::string_view ch = text.substr(start, i - start);
+            const int has = covers(font, ch) ? 1 : 0;
+            if (has != last) out.emplace_back(std::string(), nullptr);
+            out.back().first += ch;
+            last = has;
+        }
+        for (auto& [piece, f] : out) f = &for_text(font, piece);
+        return out;
+    }
+
+    // `preferred` if it can draw `text`, else a font like it that can.
     PoDoFo::PdfFont& for_text(PoDoFo::PdfFont& preferred, std::string_view text) {
         if (covers(preferred, text)) return preferred;
-        return &preferred == fallback_bold_ ? *fallback_bold_ : *fallback_regular_;
+        const auto style = static_cast<unsigned>(preferred.GetMetrics().GetStyle());
+        return substitute(classify(std::string(preferred.GetMetrics().GeFontFamilyNameSafe()), &preferred),
+                          (style & static_cast<unsigned>(PoDoFo::PdfFontStyle::Bold)) != 0 || &preferred == fallback_bold_,
+                          (style & static_cast<unsigned>(PoDoFo::PdfFontStyle::Italic)) != 0, text);
     }
 
 private:
+    // A font lacking glyphs the text needs (Cyrillic in Caladea, the
+    // substitute for Cambria, say) is replaced by one of the same kind, as
+    // LibreOffice does through fontconfig: serif text stays serif,
+    // monospaced stays monospaced, bold/italic stay so.
+    enum class FontClass { Sans, Serif, Mono };
+
+    // By the family's name, else by the found font's own flags.
+    static FontClass classify(const std::string& family, PoDoFo::PdfFont* found) {
+        const std::string n = normalized(family);
+        auto starts = [&](std::string_view p) { return n.rfind(p, 0) == 0; };
+        if (n.find("mono") != std::string::npos || starts("courier") || starts("consolas") ||
+            starts("lucidaconsole") || starts("cousine") || starts("menlo") || starts("monaco") ||
+            starts("sourcecode") || n == "fixedsys") {
+            return FontClass::Mono;
+        }
+        if ((n.find("serif") != std::string::npos && n.find("sans") == std::string::npos) ||
+            starts("cambria") || starts("caladea") || starts("times") || starts("georgia") ||
+            starts("gelasio") || starts("garamond") || starts("bookantiqua") || starts("palatino") ||
+            starts("constantia") || starts("century") || starts("bookman") || starts("tinos") ||
+            starts("sylfaen") || starts("bodoni") || starts("baskerville") || starts("didot") ||
+            starts("minion") || starts("charter") || starts("cochin")) {
+            return FontClass::Serif;
+        }
+        if (found != nullptr) {
+            PoDoFo::PdfFontDescriptorFlags flags{};
+            if (found->GetMetrics().TryGetFlags(flags)) {
+                const auto f = static_cast<std::uint32_t>(flags);
+                if (f & static_cast<std::uint32_t>(PoDoFo::PdfFontDescriptorFlags::FixedPitch)) return FontClass::Mono;
+                if (f & static_cast<std::uint32_t>(PoDoFo::PdfFontDescriptorFlags::Serif)) return FontClass::Serif;
+            }
+        }
+        return FontClass::Sans;
+    }
+
+    // The first font of `cls` that draws `text`, from well-known families
+    // (DejaVu first, as fontconfig's defaults pick on Linux; PoDoFo's font
+    // search doesn't resolve generic names like "serif"), else the general
+    // fallback.
+    PoDoFo::PdfFont& substitute(FontClass cls, bool bold, bool italic, std::string_view text) {
+        static const std::map<FontClass, std::vector<const char*>> kNames = {
+            {FontClass::Serif, {"DejaVu Serif", "Liberation Serif", "Times New Roman", "Tinos", "Noto Serif",
+                                "PT Serif"}},
+            {FontClass::Mono,  {"DejaVu Sans Mono", "Liberation Mono", "Courier New", "Cousine", "Noto Sans Mono"}},
+            {FontClass::Sans,  {"DejaVu Sans", "Liberation Sans", "Arial", "Arimo", "Noto Sans"}},
+        };
+        // Searched one by one, as needed (each search asks fontconfig/GDI;
+        // search() caches the answers).
+        for (const char* name : kNames.at(cls)) {
+            if (PoDoFo::PdfFont* f = search(name, bold, italic); f != nullptr && covers(*f, text)) return *f;
+        }
+        return bold ? *fallback_bold_ : *fallback_regular_;
+    }
+
     static std::string normalized(std::string_view name) {
         std::string out;
         for (const char ch : name) {
@@ -2404,6 +2979,7 @@ struct Box {
     TextStyle        style;
     PoDoFo::PdfFont* font  = nullptr;
     double           width = 0.0;
+    std::string      note;             // Text: a note reference mark's key (Fragment::note)
 };
 
 struct Line {
@@ -2414,21 +2990,37 @@ struct Line {
     double ascent  = 0.0;
     bool   justify = false;  // stretch spaces to fill (justified, not a paragraph's last line)
     bool   page_break_before = false;
+    bool   column_break_before = false;
+    double skip    = 0.0;    // empty space above it: moved below a floating object it can't go beside
 };
+
+// Room for a line beside floating objects (wrapSquare/Tight/Through): how
+// much of its width is cut off on the left and right, or — when there's no
+// usable room beside them — how far down to move it first.
+struct LineSlot {
+    double left = 0.0, right = 0.0;
+    double skip = 0.0;
+};
+// Asked for each line: its top's distance below the paragraph's first line
+// top, its expected height, and its start and width without floats.
+using LineSlotFn = std::function<LineSlot(double y_offset, double height, double x0, double avail)>;
 
 struct LaidParagraph {
     ParaProps         props;
     std::vector<Line> lines;
     double lines_height() const {
         double h = 0.0;
-        for (const Line& l : lines) h += l.height;
+        for (const Line& l : lines) h += l.skip + l.height;
         return h;
     }
 };
 
 // Spacing between consecutive paragraphs of one container (body, cell,
-// header): the previous paragraph's space after plus this one's space
-// before, each dropped under contextualSpacing between same-style
+// header): the larger of the previous paragraph's space after and this
+// one's space before (10 pt after then 24 pt before is 24 pt, 30 and 24 is
+// 30), or both added up when the document has the compat setting "Don't use
+// HTML paragraph auto spacing" — Word's rule, as LibreOffice implements it
+// for DOCX — each dropped under contextualSpacing between same-style
 // paragraphs (list items, typically).
 struct FlowState {
     double      pending_after   = 0.0;
@@ -2440,7 +3032,7 @@ struct FlowState {
         const bool same = has_prev && prev_style == pp.style_id;
         const double after  = (same && prev_contextual) ? 0.0 : pending_after;
         const double before = (same && pp.contextual) ? 0.0 : pp.before;
-        return after + before;
+        return pp.add_spacing ? after + before : std::max(after, before);
     }
     void finished(const ParaProps& pp) {
         pending_after   = pp.after;
@@ -2477,9 +3069,17 @@ struct ParaBox {
     }
 };
 
+struct ShapeBlock;
+
 struct CellPart {
-    enum class Kind { Paragraph, Image, Chart, NestedTable } kind = Kind::Paragraph;
+    // Shape: an inline shape or text box (`shape`). Float: a floating
+    // (<wp:anchor>) picture, chart or shape — `image`, `chart` or `shape`,
+    // `drawing` its <w:drawing>, `paragraph.props` its paragraph's, `y` the
+    // top of that paragraph; placed relative to the cell when drawn.
+    enum class Kind { Paragraph, Image, Chart, NestedTable, Float, Shape } kind = Kind::Paragraph;
     LaidParagraph   paragraph;
+    pugi::xml_node  drawing;
+    std::shared_ptr<ShapeBlock> shape;  // Shape, or a Float that is one
     ImageBlock      image;
     ResolvedChart   chart;
     std::shared_ptr<TableLayout> nested;
@@ -2499,6 +3099,120 @@ struct CellContent {
     double                height = 0.0;
 };
 
+// ── Shapes and text boxes (<wps:wsp>) ──────────────────────────────────────
+//
+// A DrawingML shape of a preset geometry Word's shapes and text boxes use —
+// rectangle, rounded rectangle, ellipse, straight line — with its fill and
+// outline (the shape's own, else what its <wps:style> refers to in the
+// theme) and its text (<wps:txbx>/<w:txbxContent>): laid out like a table
+// cell's content inside the body insets, anchored to the top, middle or
+// bottom; under <a:spAutoFit> the shape takes the height its text needs.
+// Text without a color of its own takes the style's font color (white on
+// a default Word shape). Strict mode rejects the rest: shape_unsupported().
+
+struct ShapeBlock {
+    enum class Geometry { Rect, RoundRect, Ellipse, Line } geometry = Geometry::Rect;
+    double               corner = 0.16667;  // RoundRect: radius over the shorter side
+    bool                 flip_h = false, flip_v = false;  // Line: its direction
+    std::optional<Color> fill;
+    Border               outline;           // style None: no outline
+    double               width_pt = 0.0, height_pt = 0.0;
+    pugi::xml_node       text;              // <w:txbxContent>, if any
+    double               inset_l = 7.2, inset_t = 3.6, inset_r = 7.2, inset_b = 3.6;
+    enum class Anchor { Top, Center, Bottom } anchor = Anchor::Top;
+    bool                 auto_fit = false;
+    std::optional<Color> text_color;        // <wps:style>/<a:fontRef>
+    std::shared_ptr<CellContent> content;   // the laid-out text (Layout::shape_of())
+};
+
+// A fill (<a:solidFill>, <a:noFill>, ...) among `props`' children: set
+// whether there is one; its color — a gradient's first stop, a pattern's
+// foreground: the nearest flat color. nullopt for none.
+std::optional<Color> own_fill(pugi::xml_node props, const Theme& theme, bool& specified) {
+    specified = true;
+    if (props.child("a:noFill")) return std::nullopt;
+    if (pugi::xml_node solid = props.child("a:solidFill")) return drawingml_color(solid, theme);
+    if (pugi::xml_node grad = props.child("a:gradFill")) return drawingml_color(grad.child("a:gsLst").child("a:gs"), theme);
+    if (pugi::xml_node patt = props.child("a:pattFill")) return drawingml_color(patt.child("a:fgClr"), theme);
+    specified = false;
+    return std::nullopt;
+}
+
+ShapeBlock resolve_shape(pugi::xml_node drawing, const Theme& theme) {
+    ShapeBlock sh;
+    pugi::xml_node wsp   = find_descendant(drawing, "wps:wsp");
+    pugi::xml_node sp_pr = wsp.child("wps:spPr");
+    pugi::xml_node style = wsp.child("wps:style");
+    auto flag = [](pugi::xml_attribute a) {
+        const std::string_view v = a.value();
+        return v == "1" || v == "true";
+    };
+
+    pugi::xml_node geom = sp_pr.child("a:prstGeom");
+    const std::string_view prst = geom.attribute("prst").value();
+    sh.geometry = prst == "roundRect" ? ShapeBlock::Geometry::RoundRect
+                : prst == "ellipse"   ? ShapeBlock::Geometry::Ellipse
+                : prst == "line" || prst == "straightConnector1" ? ShapeBlock::Geometry::Line
+                                      : ShapeBlock::Geometry::Rect;
+    for (pugi::xml_node gd : geom.child("a:avLst").children("a:gd")) {
+        const std::string_view fmla = gd.attribute("fmla").value();
+        if (std::strcmp(gd.attribute("name").value(), "adj") == 0 && fmla.substr(0, 4) == "val ") {
+            sh.corner = std::strtod(std::string(fmla.substr(4)).c_str(), nullptr) / 100000.0;
+        }
+    }
+    sh.flip_h = flag(sp_pr.child("a:xfrm").attribute("flipH"));
+    sh.flip_v = flag(sp_pr.child("a:xfrm").attribute("flipV"));
+
+    pugi::xml_node extent = find_descendant(drawing, "wp:extent");
+    sh.width_pt  = emu_to_pt(extent.attribute("cx").as_double(0.0));
+    sh.height_pt = emu_to_pt(extent.attribute("cy").as_double(0.0));
+
+    // Fill: the shape's own, else the style's (idx 0: none). A line has none.
+    bool fill_given = false;
+    sh.fill = own_fill(sp_pr, theme, fill_given);
+    pugi::xml_node fill_ref = style.child("a:fillRef");
+    if (!fill_given && fill_ref.attribute("idx").as_uint(0) != 0) sh.fill = drawingml_color(fill_ref, theme);
+    if (sh.geometry == ShapeBlock::Geometry::Line) sh.fill.reset();
+
+    // Outline: <a:ln>'s own color and width, else the style's line.
+    pugi::xml_node ln = sp_pr.child("a:ln");
+    pugi::xml_node ln_ref = style.child("a:lnRef");
+    bool line_given = false;
+    std::optional<Color> line_color = own_fill(ln, theme, line_given);
+    if (!line_given && ln_ref.attribute("idx").as_uint(0) != 0) line_color = drawingml_color(ln_ref, theme);
+    if (line_color) {
+        const unsigned idx = ln_ref.attribute("idx").as_uint(1);
+        sh.outline.color = *line_color;
+        // Office's theme line styles: 0.5, 1 and 1.5 pt.
+        sh.outline.width = ln.attribute("w") ? emu_to_pt(ln.attribute("w").as_double(9525.0))
+                                             : (idx <= 1 ? 0.5 : idx == 2 ? 1.0 : 1.5);
+        const std::string_view dash = ln.child("a:prstDash").attribute("val").value();
+        sh.outline.style = dash.empty() || dash == "solid"            ? Border::Style::Single
+                         : dash == "dot" || dash == "sysDot"          ? Border::Style::Dotted
+                         : dash.find("Dot") != std::string_view::npos ? Border::Style::DotDash
+                                                                      : Border::Style::Dashed;
+    }
+
+    // Text.
+    sh.text = wsp.child("wps:txbx").child("w:txbxContent");
+    pugi::xml_node body_pr = wsp.child("wps:bodyPr");
+    auto inset = [&](const char* name, double fallback) {
+        pugi::xml_attribute a = body_pr.attribute(name);
+        return a ? emu_to_pt(a.as_double(0.0)) : fallback;
+    };
+    sh.inset_l = inset("lIns", 7.2);
+    sh.inset_t = inset("tIns", 3.6);
+    sh.inset_r = inset("rIns", 7.2);
+    sh.inset_b = inset("bIns", 3.6);
+    const std::string_view anchor = body_pr.attribute("anchor").value();
+    sh.anchor = anchor == "ctr" ? ShapeBlock::Anchor::Center
+              : anchor == "b"   ? ShapeBlock::Anchor::Bottom
+                                : ShapeBlock::Anchor::Top;
+    sh.auto_fit = static_cast<bool>(body_pr.child("a:spAutoFit"));
+    if (pugi::xml_node font_ref = style.child("a:fontRef")) sh.text_color = drawingml_color(font_ref, theme);
+    return sh;
+}
+
 struct CellLayout {
     pugi::xml_node       tc;
     CellContent          content;
@@ -2514,17 +3228,20 @@ struct CellLayout {
 
 struct RowLayout {
     std::vector<CellLayout> cells;
-    double                  height = 0.0;
+    double                  height = 0.0;    // borders included (see border_top/bottom)
     bool                    header = false;  // <w:tblHeader>: repeated on each page
+    // Room for the horizontal borders, part of `height`: the table's top
+    // and bottom border whole, half of one between two rows each.
+    double                  border_top = 0.0, border_bottom = 0.0;
 };
 
 struct TableLayout {
     std::vector<RowLayout> rows;
     double                 width    = 0.0;
     double                 x_offset = 0.0;   // from the available area's left edge
-    pugi::xml_node         tbl_borders;
-    pugi::xml_node         style_borders;
-    bool                   style_resolved = false;
+    pugi::xml_node              tbl_borders;
+    std::vector<pugi::xml_node> style_borders;  // the table style chain's <w:tblBorders>, nearest first
+    bool                        style_resolved = false;
     double total_height() const {
         double h = 0.0;
         for (const RowLayout& r : rows) h += r.height;
@@ -2557,9 +3274,50 @@ struct HeaderFooterSet {
 
 // One document section: the blocks up to and including the paragraph whose
 // <w:pPr> carries its <w:sectPr> (the last section's sectPr is the body's).
+// <w:cols>: the text columns of a section, left to right.
+struct Columns {
+    struct Column { double x = 0.0, w = 0.0; };  // x: from the left margin
+    std::vector<Column> cols;
+    bool sep = false;  // <w:cols w:sep>: a line between columns
+
+    std::size_t count() const { return cols.size(); }
+};
+
+// Equal columns `w:space` apart (default 1/2 inch), or each <w:col>'s own
+// width and space after it when equalWidth is off.
+Columns read_columns(pugi::xml_node sect, const PageMetrics& pm) {
+    Columns c;
+    const double width = pm.width_pt - pm.margin_left_pt - pm.margin_right_pt;
+    pugi::xml_node cols = sect.child("w:cols");
+    auto truthy = [](pugi::xml_attribute a) {
+        const std::string_view v = a.value();
+        return v == "1" || v == "true" || v == "on";
+    };
+    c.sep = truthy(cols.attribute("w:sep"));
+    pugi::xml_attribute equal = cols.attribute("w:equalWidth");
+    if (cols.child("w:col") && equal && !truthy(equal)) {
+        double x = 0.0;
+        for (pugi::xml_node col : cols.children("w:col")) {
+            const double w = twips_to_pt(col.attribute("w:w").as_llong(0));
+            if (w <= 0.0) continue;
+            c.cols.push_back({x, w});
+            x += w + twips_to_pt(col.attribute("w:space").as_llong(0));
+        }
+    }
+    if (c.cols.empty()) {
+        const int n = std::max(1, cols.attribute("w:num").as_int(1));
+        const double space = n > 1 ? twips_to_pt(cols.attribute("w:space").as_llong(720)) : 0.0;
+        const double w = std::max((width - space * (n - 1)) / n, 10.0);
+        for (int i = 0; i < n; ++i) c.cols.push_back({i * (w + space), w});
+    }
+    if (c.count() < 2) c.sep = false;
+    return c;
+}
+
 struct Section {
     enum class Start { NextPage, Continuous, EvenPage, OddPage };
     PageMetrics                 pm;
+    Columns                     columns;
     HeaderFooterSet             hf;
     std::vector<pugi::xml_node> blocks;
     Start                       start = Start::NextPage;
@@ -2573,7 +3331,7 @@ struct Section {
 // bookmark landed on (PAGEREF — TOC page numbers are PAGEREF fields) and
 // the page counts (NUMPAGES/SECTIONPAGES in body text, which is laid out
 // before the count is known).
-// A floating picture or chart (<wp:anchor>, outside table cells) placed
+// A floating picture, chart or shape (<wp:anchor>) placed
 // on a page: drawn over the text at the end of its page, or — behindDoc —
 // under it, which needs a pass that knows about it before the page's text
 // (PoDoFo can only append to a page).
@@ -2582,8 +3340,9 @@ struct FloatingObject {
     std::size_t                    page = 0;  // index into the pages laid out
     double                         x = 0.0, y = 0.0, w = 0.0, h = 0.0;  // y: bottom edge
     long long                      z = 0;     // <wp:anchor relativeHeight>: stacking order
-    std::shared_ptr<ImageBlock>    image;     // one of the two
+    std::shared_ptr<ImageBlock>    image;     // one of the three
     std::shared_ptr<ResolvedChart> chart;
+    std::shared_ptr<ShapeBlock>    shape;
 
     bool operator==(const FloatingObject& o) const {
         return drawing == o.drawing && page == o.page && x == o.x && y == o.y && w == o.w && h == o.h;
@@ -2595,26 +3354,142 @@ struct LayoutFacts {
     int                         total = 0;
     std::map<std::size_t, int>  section_pages;
     std::vector<FloatingObject> behind;          // behindDoc floating objects
+    std::map<std::string, std::size_t> note_pages;  // footnote key → page index of its reference
     bool operator==(const LayoutFacts&) const = default;
+};
+
+// ── Footnotes and endnotes ──────────────────────────────────────────────────
+//
+// Note text lives in word/footnotes.xml / word/endnotes.xml, referenced by
+// id from <w:footnoteReference>/<w:endnoteReference> runs. Marks are
+// numbered in document order as <w:footnotePr>/<w:endnotePr> say (the
+// settings', overridden by each section's: numFmt, numStart, numRestart);
+// a reference with customMarkFollows shows its run's own text instead and
+// takes no number. Footnotes go to the bottom of the page their reference
+// lands on (Layout::commit_footnotes()), endnotes after the document's (or
+// each section's) last block.
+
+struct NotePr {
+    std::string fmt;            // <w:numFmt>; "" = decimal for footnotes, lowerRoman for endnotes
+    int         start = 1;
+    enum class Restart { Continuous, EachSection, EachPage } restart = Restart::Continuous;
+    bool        beneath_text = false;  // footnotes: <w:pos w:val="beneathText">, right under the text
+};
+
+NotePr read_note_pr(pugi::xml_node pr, NotePr base) {
+    if (pugi::xml_node pos = pr.child("w:pos")) {
+        base.beneath_text = std::strcmp(pos.attribute("w:val").value(), "beneathText") == 0;
+    }
+    if (pugi::xml_node f = pr.child("w:numFmt")) base.fmt = f.attribute("w:val").value();
+    if (pugi::xml_node st = pr.child("w:numStart")) base.start = st.attribute("w:val").as_int(1);
+    if (pugi::xml_node r = pr.child("w:numRestart")) {
+        const std::string_view v = r.attribute("w:val").value();
+        base.restart = v == "eachSect" ? NotePr::Restart::EachSection
+                     : v == "eachPage" ? NotePr::Restart::EachPage
+                                       : NotePr::Restart::Continuous;
+    }
+    return base;
+}
+
+struct NoteSet {
+    struct Part {
+        std::unique_ptr<pugi::xml_document> doc;
+        RelMap                              rels;
+        std::map<std::string, std::vector<pugi::xml_node>> notes;  // id → the note's blocks
+        std::vector<pugi::xml_node>         separator, continuation;  // <w:separator>, <w:continuationSeparator> notes
+        std::vector<pugi::xml_node>         notice;   // <w:continuationNotice>: under a note continued on the next page
+    };
+    struct Ref {
+        std::string key;              // "f:<id>" / "e:<id>"
+        std::size_t section = 0;
+        bool        custom  = false;  // customMarkFollows
+    };
+    Part                               foot, end;
+    std::vector<Ref>                   refs;       // document order, each note once
+    std::map<std::string, std::size_t> ref_index;  // key → index into refs
+    std::vector<NotePr>                foot_pr, end_pr;  // per section
+    bool                               endnotes_at_section_end = false;
+
+    static bool is_foot(std::string_view key) { return key.substr(0, 2) == "f:"; }
+    const Part& part_of(std::string_view key) const { return is_foot(key) ? foot : end; }
+    const std::vector<pugi::xml_node>* blocks_of_note(std::string_view key) const {
+        const Part& part = part_of(key);
+        const auto it = part.notes.find(std::string(key.substr(2)));
+        return it == part.notes.end() ? nullptr : &it->second;
+    }
+    bool has_footnotes() const {
+        return std::any_of(refs.begin(), refs.end(), [](const Ref& r) { return is_foot(r.key); });
+    }
+
+    // Notes of `parts` and the references to them in `sections`' blocks.
+    void load(const PartMap& parts, const std::vector<Section>& sections,
+              const std::vector<pugi::xml_node>& sect_prs, pugi::xml_node settings) {
+        auto load_part = [&](const char* name, const char* rels_name, const char* tag, Part& part) {
+            const auto it = parts.find(name);
+            if (it == parts.end()) return;
+            part.doc = std::make_unique<pugi::xml_document>();
+            if (!part.doc->load_buffer(it->second.data(), it->second.size(), kXmlParse)) return;
+            part.rels = build_rel_map(parts, rels_name);
+            for (pugi::xml_node n : part.doc->first_child().children(tag)) {
+                const std::string_view type = n.attribute("w:type").value();
+                if (type == "separator") part.separator = blocks_of(n);
+                else if (type == "continuationSeparator") part.continuation = blocks_of(n);
+                else if (type == "continuationNotice") part.notice = blocks_of(n);
+                else if (type.empty() || type == "normal") part.notes[n.attribute("w:id").value()] = blocks_of(n);
+            }
+        };
+        load_part("word/footnotes.xml", "word/_rels/footnotes.xml.rels", "w:footnote", foot);
+        load_part("word/endnotes.xml", "word/_rels/endnotes.xml.rels", "w:endnote", end);
+
+        const NotePr foot_base = read_note_pr(settings.child("w:footnotePr"), {});
+        const NotePr end_base  = read_note_pr(settings.child("w:endnotePr"), {});
+        endnotes_at_section_end =
+            std::strcmp(settings.child("w:endnotePr").child("w:pos").attribute("w:val").value(), "sectEnd") == 0;
+        for (std::size_t si = 0; si < sections.size(); ++si) {
+            foot_pr.push_back(read_note_pr(sect_prs[si].child("w:footnotePr"), foot_base));
+            end_pr.push_back(read_note_pr(sect_prs[si].child("w:endnotePr"), end_base));
+            for (pugi::xml_node b : sections[si].blocks) collect_refs(b, si);
+        }
+    }
+
+private:
+    void collect_refs(pugi::xml_node node, std::size_t section) {
+        for (pugi::xml_node child : node.children()) {
+            const std::string_view name = child.name();
+            if (name == "mc:Fallback" || name == "w:del" || name == "w:moveFrom") continue;
+            if (name == "w:footnoteReference" || name == "w:endnoteReference") {
+                std::string key = std::string(name == "w:footnoteReference" ? "f:" : "e:") +
+                                  child.attribute("w:id").value();
+                const std::string_view custom = child.attribute("w:customMarkFollows").value();
+                if (ref_index.emplace(key, refs.size()).second) {
+                    refs.push_back({std::move(key), section, custom == "1" || custom == "true" || custom == "on"});
+                }
+            } else if (child.first_child()) {
+                collect_refs(child, section);
+            }
+        }
+    }
 };
 
 class Layout {
 public:
     // `known`: facts from a previous pass, for PAGEREF/NUMPAGES in the body.
     Layout(PoDoFo::PdfMemDocument& doc, std::vector<Section>& sections, FontBook& fonts,
-           const TextStyle& default_style, const pugi::xml_document& styles_doc,
-           const StyleSheet& styles, Numbering& numbering,
-           const Theme& theme, double default_tab, const LayoutFacts* known = nullptr)
+           const TextStyle& default_style, const StyleSheet& styles, Numbering& numbering,
+           const Theme& theme, double default_tab, const LayoutFacts* known = nullptr,
+           const NoteSet* notes = nullptr)
         : doc_(doc), sections_(sections), pm_(sections.front().pm), fonts_(fonts),
           regular_(fonts.get(default_style)),
           bold_(fonts.get([&] { TextStyle b = default_style; b.bold = true; return b; }())),
-          styles_doc_(styles_doc), styles_(styles), numbering_(numbering),
-          theme_(theme), default_tab_(default_tab > 0.0 ? default_tab : 36.0), known_(known) {}
+          styles_(styles), numbering_(numbering),
+          theme_(theme), doc_lang_(styles.language()),
+          default_tab_(default_tab > 0.0 ? default_tab : 36.0), known_(known), notes_(notes) {}
 
     LayoutFacts facts() const {
         LayoutFacts f;
         f.bookmark_pages = bookmark_pages_;
         f.behind         = behind_floats_;
+        f.note_pages     = note_pages_;
         f.total          = static_cast<int>(pages_.size());
         for (const PageInfo& info : pages_) ++f.section_pages[info.section];
         return f;
@@ -2623,8 +3498,11 @@ public:
     // Measures every section's headers/footers once (at that section's
     // text width); page geometry depends on them.
     void measure_headers_footers(const PartMap& parts) {
+        parts_ = &parts;
         for (Section& sec : sections_) {
             pm_ = sec.pm;
+            page_left_  = pm_.margin_left_pt;
+            page_right_ = pm_.margin_right_pt;
             for (auto* set : {&sec.hf.header, &sec.hf.footer}) {
                 for (HeaderFooterPart& part : *set) {
                     if (part.present) part.height = measure_blocks(part.blocks, part.rels, parts);
@@ -2637,33 +3515,62 @@ public:
     // Lays out every section's blocks, starting pages as each section's
     // break type asks.
     void layout_sections(const RelMap& rels, const PartMap& parts) {
+        parts_ = &parts;
         for (std::size_t si = 0; si < sections_.size(); ++si) {
             const Section& sec = sections_[si];
             const Section::Start start = si == 0 ? Section::Start::NextPage : sec.start;
             section_ = si;
+            balance_.reset();
             if (start == Section::Start::Continuous) {
-                // Same page, new margins for what follows.
+                // Same page, below the previous section's columns, with
+                // new margins and columns for what follows.
+                close_columns();
+                cursor_y_ = std::min(cursor_y_, col_low_);
                 pm_.margin_left_pt  = sec.pm.margin_left_pt;
                 pm_.margin_right_pt = sec.pm.margin_right_pt;
+                begin_columns(sec.columns, cursor_y_);
             } else {
+                close_columns();
                 pm_ = sec.pm;
+                columns_ = sec.columns;
                 if (sec.page_number_start > 0) next_number_ = sec.page_number_start;
                 first_in_section_ = true;
-                new_page();
+                start_page();
                 // Even/odd page breaks insert a blank page when needed.
                 const int number = pages_.back().number;
                 if ((start == Section::Start::EvenPage && number % 2 != 0) ||
                     (start == Section::Start::OddPage && number % 2 == 0)) {
-                    new_page();
+                    start_page();
                 }
+            }
+            // Columns before a continuous section break end level.
+            if (columns_.count() > 1 && si + 1 < sections_.size() &&
+                sections_[si + 1].start == Section::Start::Continuous) {
+                plan_balance(sec.blocks, rels, parts);
             }
             flow_.reset();
             draw_blocks(sec.blocks, rels, parts);
+            if (notes_ != nullptr && notes_->endnotes_at_section_end) draw_endnotes(si, parts);
         }
+        if (notes_ != nullptr && !notes_->endnotes_at_section_end) draw_endnotes(std::nullopt, parts);
     }
 
+    // Content doesn't fit where it is: on to the next column of the
+    // section, or the next page after the last one.
     void new_page() {
+        if (col_ + 1 < columns_.count()) {
+            col_low_ = std::min(col_low_, cursor_y_);
+            set_column(col_ + 1);
+            cursor_y_ = col_top_;
+            return;
+        }
+        start_page();
+    }
+
+    void start_page() {
+        close_columns();
         if (page_open_) {
+            if (!pages_.empty()) current_page_notes().body_end = cursor_y_;
             flush_front_floats();
             painter_.FinishDrawing();
         }
@@ -2692,11 +3599,136 @@ public:
         cursor_y_ = page_top_;
         float_page_ = pages_.size() - 1;
         bands_.clear();
+        sides_.clear();
+        page_notes_[float_page_].bottom = bottom_limit_;
+        place_carried_footnotes();
         draw_known_behind(float_page_);
+        begin_columns(columns_, cursor_y_);
+    }
+
+    // ── Columns (<w:cols>) ──────────────────────────────────────────────────
+    //
+    // The current column is the body area: pm_'s left/right margins are
+    // moved to its edges (page_left_/page_right_ keep the section's), so
+    // everything laid out goes into it. When content doesn't fit, new_page()
+    // moves to the top of the next column — at col_top_, where the columns
+    // started on this page (a continuous section break can start them part
+    // way down) — and to a new page after the last.
+
+    // Columns `c` from `top` down, starting with the first.
+    void begin_columns(const Columns& c, double top) {
+        columns_     = c;
+        page_left_   = pm_.margin_left_pt;
+        page_right_  = pm_.margin_right_pt;
+        body_bottom_ = bottom_limit_;
+        col_top_ = col_low_ = top;
+        cols_open_ = true;
+        set_column(0);
+    }
+
+    void set_column(std::size_t i) {
+        col_ = i;
+        if (columns_.count() < 2) return;
+        const Columns::Column& c = columns_.cols[i];
+        pm_.margin_left_pt  = page_left_ + c.x;
+        pm_.margin_right_pt = pm_.width_pt - pm_.margin_left_pt - c.w;
+        // Levelled columns (plan_balance()) end higher, all but the last.
+        bottom_limit_ = body_bottom_;
+        if (balance_ && balance_->page == pages_.size() - 1 && i + 1 < columns_.count()) {
+            bottom_limit_ = std::max(body_bottom_, col_top_ - balance_->height);
+        }
+    }
+
+    // Done with the columns on this page: separator lines between the ones
+    // used, from their top to the lowest one's end; the body continues
+    // below them in a single column.
+    void close_columns() {
+        if (!page_open_ || !cols_open_) return;
+        cols_open_ = false;
+        col_low_ = std::min(col_low_, cursor_y_);
+        if (columns_.count() < 2) return;
+        if (columns_.sep && col_ > 0 && !dry_run_ && col_low_ < col_top_) {
+            painter_.Save();
+            painter_.GraphicsState.SetStrokingColor(PoDoFo::PdfColor(0, 0, 0));
+            painter_.GraphicsState.SetLineWidth(0.5);
+            for (std::size_t i = 1; i <= col_; ++i) {
+                const Columns::Column& a = columns_.cols[i - 1];
+                const Columns::Column& b = columns_.cols[i];
+                const double x = page_left_ + (a.x + a.w + b.x) / 2.0;
+                painter_.DrawLine(x, col_top_, x, col_low_);
+            }
+            painter_.Restore();
+        }
+        pm_.margin_left_pt  = page_left_;
+        pm_.margin_right_pt = page_right_;
+        bottom_limit_ = body_bottom_;
+        col_ = 0;
+        col_top_ = col_low_;
+    }
+
+    // Columns that end at a continuous section break are levelled, as in
+    // Word: on the section's last page each but the last column ends at
+    // the height that lets the rest fit, found from a dry run's line and
+    // row boundaries (laid out at the first column's width). The last
+    // column keeps the page's bottom, so a misestimate can't push content
+    // onto another page.
+    void plan_balance(const std::vector<pugi::xml_node>& blocks, const RelMap& rels, const PartMap& parts) {
+        balance_.reset();
+        std::vector<double> cuts;
+        const Numbering::Snapshot saved = numbering_.snapshot();
+        std::vector<double>* const saved_cuts = std::exchange(cuts_, &cuts);
+        const double total = measure_blocks(blocks, rels, parts);
+        cuts_ = saved_cuts;
+        numbering_.restore(saved);
+        if (total <= 0.0) return;
+        cuts.push_back(total);
+        std::sort(cuts.begin(), cuts.end());
+
+        const std::size_t n = columns_.count();
+        // How far content starting at `from` gets in n columns `h` tall.
+        auto fill = [&](double from, double h) {
+            double pos = from;
+            for (std::size_t c = 0; c < n && pos < total - 0.01; ++c) {
+                double next = pos;
+                for (const double cut : cuts) {
+                    if (cut <= pos + 0.01) continue;
+                    if (cut > pos + h + 0.01) {
+                        if (next == pos) next = cut;  // a unit taller than h still goes
+                        break;
+                    }
+                    next = cut;
+                }
+                pos = next;
+            }
+            return pos;
+        };
+        double from = 0.0;
+        std::size_t page = pages_.size() - 1;
+        double room = col_top_ - body_bottom_;
+        for (int guard = 0; ; ++guard) {
+            if (room <= 0.0 || guard > 10000) return;
+            const double reached = fill(from, room);
+            if (reached >= total - 0.01) break;
+            if (reached <= from) return;
+            from = reached;
+            ++page;
+            room = page_top_ - body_bottom_;
+        }
+        double lo = (total - from) / static_cast<double>(n), hi = room;
+        for (int i = 0; i < 40 && hi - lo > 0.05; ++i) {
+            const double mid = (lo + hi) / 2.0;
+            (fill(from, mid) >= total - 0.01 ? hi : lo) = mid;
+        }
+        balance_ = Balance{page, hi + 0.5};
+        set_column(col_);
     }
 
     void finish() {
+        // What is left of footnotes continued from page to page.
+        while (!carry_.empty() && page_open_) start_page();
+        close_columns();
         if (page_open_) {
+            if (!pages_.empty()) current_page_notes().body_end = cursor_y_;
             flush_front_floats();
             painter_.FinishDrawing();
             page_open_ = false;
@@ -2719,6 +3751,8 @@ public:
             painter_.SetCanvas(doc_.GetPages().GetPageAt(static_cast<unsigned>(i)));
             float_page_    = i;
             pm_            = sec.pm;
+            page_left_     = pm_.margin_left_pt;
+            page_right_    = pm_.margin_right_pt;
             fields_        = {info.number, static_cast<int>(pages_.size()), section_pages[info.section],
                               sec.page_number_format, known_ != nullptr ? &known_->bookmark_pages : nullptr};
             no_page_break_ = true;
@@ -2731,6 +3765,68 @@ public:
                 cursor_y_ = pm_.footer_dist_pt + footer.height;
                 flow_.reset();
                 draw_blocks(footer.blocks, footer.rels, parts);
+            }
+            no_page_break_ = false;
+            flush_front_floats();
+            painter_.FinishDrawing();
+        }
+    }
+
+    // Draws each page's footnote area — separator, then the notes (pieces
+    // of continued ones clipped to their part) — at the bottom of its body
+    // area. Call after finish().
+    void draw_footnotes(const PartMap& parts) {
+        if (notes_ == nullptr) return;
+        std::map<std::size_t, int> section_pages;
+        for (const PageInfo& info : pages_) ++section_pages[info.section];
+        for (const auto& [pi, pn] : page_notes_) {
+            if (pn.slices.empty() || pi >= pages_.size()) continue;
+            const PageInfo& info = pages_[pi];
+            const Section& sec = sections_[info.section];
+            painter_.SetCanvas(doc_.GetPages().GetPageAt(static_cast<unsigned>(pi)));
+            float_page_    = pi;
+            pm_            = sec.pm;
+            page_left_     = pm_.margin_left_pt;
+            page_right_    = pm_.margin_right_pt;
+            fields_        = {info.number, static_cast<int>(pages_.size()), section_pages[info.section],
+                              sec.page_number_format, known_ != nullptr ? &known_->bookmark_pages : nullptr};
+            no_page_break_ = true;
+            // At the bottom of the page, or (beneathText) right under the
+            // text — which the body's reserved room always leaves space for.
+            double top = pn.bottom + notes_area_height(pn);
+            if (notes_->foot_pr[info.section].beneath_text) top = std::max(top, std::min(pn.body_end, page_top_of(pi)));
+            draw_note_separator(pn.continuation, top, pn.separator);
+            top -= pn.separator;
+            for (const NoteSlice& slice : pn.slices) {
+                const std::vector<pugi::xml_node>* blocks = notes_->blocks_of_note(slice.key);
+                const double h = slice.to - slice.from;
+                // Drawn at the width it was measured (and split) at — a note
+                // continued into a section with other margins keeps its lines.
+                const double saved_right = pm_.margin_right_pt;
+                pm_.margin_right_pt = pm_.width_pt - pm_.margin_left_pt - slice.width;
+                const bool partial = slice.from > 0.01 || slice.to < measure_note(slice.key, slice.width).height - 0.01;
+                // A piece of a continued note: only its own lines and rows
+                // are drawn (not just clipped — the text would still be
+                // there for search and copying), graphics are clipped.
+                if (partial) {
+                    painter_.Save();
+                    painter_.SetClipRect(0.0, top - h, pm_.width_pt, h);
+                    note_window_ = {top, top - h};
+                }
+                cursor_y_     = top + slice.from;
+                current_note_ = slice.key;
+                flow_.reset();
+                draw_blocks(*blocks, notes_->part_of(slice.key).rels, parts);
+                if (partial) painter_.Restore();
+                note_window_.reset();
+                pm_.margin_right_pt = saved_right;
+                top -= h;
+            }
+            current_note_.clear();
+            if (pn.notice > 0.0) {
+                cursor_y_ = top;
+                flow_.reset();
+                draw_blocks(notes_->foot.notice, notes_->foot.rels, parts);
             }
             no_page_break_ = false;
             flush_front_floats();
@@ -2759,7 +3855,8 @@ public:
                         pugi::xml_node prev = {}, pugi::xml_node next = {}) {
         if (on_off(p.child("w:pPr").child("w:pageBreakBefore"))) break_page();
 
-        const LaidParagraph lp = layout_paragraph(p, content_width());
+        const Numbering::Snapshot numbering_before = numbering_.snapshot();
+        LaidParagraph lp = layout_paragraph(p, content_width());
         const ParaProps& pp = lp.props;
         const std::optional<ParaProps> prev_pp = props_of(prev), next_pp = props_of(next);
         const ParaBox box(pp, prev_pp ? &*prev_pp : nullptr, next_pp ? &*next_pp : nullptr);
@@ -2770,7 +3867,9 @@ public:
         if (lp.props.keep_next && next && !dry_run_ && !no_page_break_ && cursor_y_ < page_top_) {
             double own = gap + box.top + lp.lines_height() + box.bottom;
             for (pugi::xml_node drawing : flow_drawings(p)) own += drawing_height(drawing, rels, parts);
-            const double together = own + first_part_height(next, rels, parts);
+            std::vector<std::string> keys;  // footnotes they bring along
+            for (const Line& line : lp.lines) collect_notes(line, keys);
+            const double together = own + first_part_height(next, rels, parts, &keys) + footnotes_room(keys);
             if (cursor_y_ - together < bottom_limit_ && together < page_top_ - bottom_limit_) new_page();
         }
         // A box continued from the previous paragraph also covers the gap.
@@ -2794,35 +3893,65 @@ public:
         };
         if (lp.lines.empty() || !flow_drawings(p).empty()) place();
 
+        // Beside floating objects that let text flow around them, the lines
+        // are laid out again, each in the room left at its height.
+        const auto rewrap = [&]() -> bool {
+            if (dry_run_ || no_page_break_ || lp.lines.empty() || !wraps_below(cursor_y_)) return false;
+            numbering_.restore(numbering_before);
+            const LineSlotFn slot = beside_floats(cursor_y_);
+            lp = layout_paragraph(p, content_width(), &slot);
+            return true;
+        };
+
         // Pictures and charts first, then the paragraph's own text (if any):
         // a paragraph holding both keeps both, just not interleaved.
         for (pugi::xml_node drawing : flow_drawings(p)) {
             if (pugi::xml_node chart_ref = find_descendant(drawing, "c:chart")) {
                 draw_chart_block(drawing, chart_ref, rels, parts, lp.props);
+            } else if (is_shape(drawing)) {
+                draw_shape_block(*shape_of(drawing, rels, parts), lp.props);
             } else {
                 draw_image(resolve_image(drawing, rels, parts), lp.props);
             }
         }
-        for (const Line& line : lp.lines) {
+        if (floats_placed) rewrap();
+        for (std::size_t li = 0; li < lp.lines.size(); ++li) {
+            const Line& line = lp.lines[li];
+            if (line.skip > 0.0 && !dry_run_ && !no_page_break_) cursor_y_ -= line.skip;
+            // Footnotes referenced on the line go to the bottom of its page:
+            // the line moves on when not even their first line fits there.
+            std::vector<std::string> line_notes;
+            collect_notes(line, line_notes);
+            const bool notes_break = !footnotes_fit(line_notes, line.height);
+            const bool widow_break = widow_break_before(lp, li);
             // A box broken by a page: its lines so far are finished on this page.
             const bool breaks = !dry_run_ && !no_page_break_ && cursor_y_ < page_top_ &&
-                                (line.page_break_before || cursor_y_ - line.height < bottom_limit_);
+                                (line.page_break_before || line.column_break_before ||
+                                 cursor_y_ - line.height < bottom_limit_ || notes_break || widow_break);
             if (breaks && pp.boxed()) {
                 stroke_box(pp, box, area_left, area_width, seg_top, cursor_y_, top_line, false);
                 top_line.reset();
             }
             if (line.page_break_before) break_page();
-            ensure_space(line.height);
-            if (&line == &lp.lines.front() && !floats_placed) {
+            else if (line.column_break_before) break_column();
+            else if (notes_break || widow_break) new_page();
+            ensure_space(line.height, true);
+            if (li == 0 && !floats_placed) {
                 place();
-                ensure_space(line.height);  // its own floating objects may push it down
+                ensure_space(line.height, true);  // its own floating objects may push it down
+                if (rewrap()) {
+                    li = static_cast<std::size_t>(-1);  // again from the first line, as laid out now
+                    continue;
+                }
             }
+            commit_footnotes(line_notes, line.height);
             if (breaks) seg_top = cursor_y_;
-            if (&line == &lp.lines.front()) record_bookmarks(p);
+            if (li == 0) record_bookmarks(p);
             // Shading strip by strip, each under its own text.
             fill_box(pp, area_left, area_width, cursor_y_, cursor_y_ - line.height);
             draw_text_line(line, lp.props, pm_.margin_left_pt, cursor_y_);
             cursor_y_ -= line.height;
+            if (cuts_ != nullptr && dry_run_) cuts_->push_back(-cursor_y_);
         }
         if (lp.lines.empty()) record_bookmarks(p);
         fill_box(pp, area_left, area_width, cursor_y_, cursor_y_ - box.bottom);
@@ -2831,57 +3960,104 @@ public:
         flow_.finished(lp.props);
     }
 
+    // Widow/orphan control (ParaProps::widow_control): whether line `li`
+    // of a paragraph should go to the next page (column) although it fits
+    // here — because it is the first line and no more than it would fit
+    // (or two would, but only the last line would be left over), or
+    // because it would leave the paragraph's last line alone over there.
+    bool widow_break_before(const LaidParagraph& lp, std::size_t li) const {
+        const std::vector<Line>& lines = lp.lines;
+        const std::size_t n = lines.size();
+        if (dry_run_ || no_page_break_ || n < 2 || !(cursor_y_ < page_top_) || !lp.props.widow_control) return false;
+        // Lines from li that fit here, up to a manual break.
+        std::size_t fits = 0;
+        double y = cursor_y_;
+        for (std::size_t j = li; j < n; ++j) {
+            if (j > li && (lines[j].page_break_before || lines[j].column_break_before)) return false;
+            if (y - lines[j].skip - lines[j].height < bottom_limit_) break;
+            y -= lines[j].skip + lines[j].height;
+            ++fits;
+        }
+        const std::size_t rest = n - li - fits;  // lines for the next page
+        if (rest == 0 || fits == 0) return false;
+        if (li == 0) return fits < 2 || (rest == 1 && fits == 2);
+        return rest == 1 && fits == 1;
+    }
+
     // ── Floating pictures and charts (<wp:anchor>) ─────────────────────────
     //
     // Placed on the page their paragraph starts on, where <wp:positionH>/
     // <wp:positionV> say: an offset or an alignment within the page, the
     // margins, the paragraph/line, the character position (taken as the
     // paragraph's indent). Wrapping: wrapNone takes no room; every other
-    // kind reserves the picture's band across the page and text continues
-    // under it (wrapSquare/Tight/Through flow text beside it in Word — not
-    // done here, the side stays empty). In front of the text: drawn when
+    // kind keeps text out of the picture's band: wrapTopAndBottom across
+    // the page, the text continuing under it; wrapSquare/Tight/Through (the
+    // latter two by their bounding box) let lines of text go beside it —
+    // on the side wrapText says, the larger one for bothSides/largest —
+    // anything else moves below it. In front of the text: drawn when
     // the page is finished; behindDoc: drawn first on the page, which
     // takes a second layout pass (see LayoutFacts).
 
     void place_floats(pugi::xml_node p, const RelMap& rels, const PartMap& parts, const ParaProps& pp,
                       double para_top) {
-        if (dry_run_ || in_cell_ || pages_.empty()) return;
+        if (dry_run_ || pages_.empty()) return;
         for (pugi::xml_node drawing : visible_drawings(p)) {
             pugi::xml_node anchor = drawing.child("wp:anchor");
             if (!anchor) continue;
             FloatingObject f;
             f.drawing = drawing;
-            f.page    = float_page_;
-            f.z       = anchor.attribute("relativeHeight").as_llong(0);
             if (pugi::xml_node chart_ref = find_descendant(drawing, "c:chart")) {
-                f.chart = std::make_shared<ResolvedChart>(resolve_chart(drawing, chart_ref, rels, parts, theme_));
+                f.chart = std::make_shared<ResolvedChart>(resolve_chart(drawing, chart_ref, rels, parts, theme_, doc_lang_));
                 f.w = f.chart->width_pt;
                 f.h = f.chart->height_pt;
+            } else if (is_shape(drawing)) {
+                f.shape = shape_of(drawing, rels, parts);
+                f.w = f.shape->width_pt;
+                f.h = f.shape->height_pt;
             } else {
                 f.image = std::make_shared<ImageBlock>(resolve_image(drawing, rels, parts));
                 f.w = f.image->width_pt;
                 f.h = f.image->height_pt;
             }
             position_float(anchor, pp, para_top, f);
-
-            const bool behind = on_off_attr(anchor.attribute("behindDoc"));
-            if (!anchor.child("wp:wrapNone") && !behind) {
+            if (!anchor.child("wp:wrapNone") && !on_off_attr(anchor.attribute("behindDoc"))) {
                 const double dist_t = emu_to_pt(anchor.attribute("distT").as_double(0.0));
                 const double dist_b = emu_to_pt(anchor.attribute("distB").as_double(0.0));
-                bands_.push_back({f.y + f.h + dist_t, f.y - dist_b});
+                pugi::xml_node beside = anchor.child("wp:wrapSquare");
+                if (!beside) beside = anchor.child("wp:wrapTight");
+                if (!beside) beside = anchor.child("wp:wrapThrough");
+                if (beside) {
+                    const double dist_l = emu_to_pt(anchor.attribute("distL").as_double(0.0));
+                    const double dist_r = emu_to_pt(anchor.attribute("distR").as_double(0.0));
+                    const std::string_view text = beside.attribute("wrapText").value();
+                    sides_.push_back({f.y + f.h + dist_t, f.y - dist_b, f.x - dist_l, f.x + f.w + dist_r,
+                                      text == "left" ? Side::Text::Left
+                                      : text == "right" ? Side::Text::Right : Side::Text::Larger});
+                } else {
+                    bands_.push_back({f.y + f.h + dist_t, f.y - dist_b});
+                }
             }
-            if (!behind) {
-                front_floats_.push_back(std::move(f));
-                continue;
-            }
-            // Already drawn under the page's text if the previous pass
-            // placed it the same; otherwise drawn now (over what's there
-            // already) and the next pass gets it right.
-            const bool known = known_ != nullptr &&
-                std::find(known_->behind.begin(), known_->behind.end(), f) != known_->behind.end();
-            if (!known) draw_float(f);
-            behind_floats_.push_back(std::move(f));
+            add_float(std::move(f));
         }
+    }
+
+    // A positioned floating object onto the current page: in front of the
+    // text (drawn when the page is finished) or behind it.
+    void add_float(FloatingObject f) {
+        pugi::xml_node anchor = f.drawing.child("wp:anchor");
+        f.page = float_page_;
+        f.z    = anchor.attribute("relativeHeight").as_llong(0);
+        if (!on_off_attr(anchor.attribute("behindDoc"))) {
+            front_floats_.push_back(std::move(f));
+            return;
+        }
+        // Already drawn under the page's text if the previous pass
+        // placed it the same; otherwise drawn now (over what's there
+        // already) and the next pass gets it right.
+        const bool known = known_ != nullptr &&
+            std::find(known_->behind.begin(), known_->behind.end(), f) != known_->behind.end();
+        if (!known) draw_float(f);
+        behind_floats_.push_back(std::move(f));
     }
 
     static bool on_off_attr(pugi::xml_attribute a) {
@@ -2890,7 +4066,13 @@ public:
     }
 
     // Sets f.x/f.y (bottom-left, points) from the anchor's position.
-    void position_float(pugi::xml_node anchor, const ParaProps& pp, double para_top, FloatingObject& f) const {
+    // `cell`: the left edge and width of the table cell (inside its
+    // margins) the anchor sits in, if it is laid out in the cell
+    // (layoutInCell) — its column, margin and character positions are
+    // then the cell's, as in Word.
+    struct CellFrame { double x = 0.0, w = 0.0; };
+    void position_float(pugi::xml_node anchor, const ParaProps& pp, double para_top, FloatingObject& f,
+                        const std::optional<CellFrame>& cell = std::nullopt) const {
         const double page_w = pm_.width_pt, page_h = pm_.height_pt;
         auto offset = [](pugi::xml_node pos) { return emu_to_pt(pos.child("wp:posOffset").text().as_double(0.0)); };
 
@@ -2904,19 +4086,26 @@ public:
         // Horizontal frame: left edge and width.
         pugi::xml_node ph = anchor.child("wp:positionH");
         const std::string_view hrel = ph.attribute("relativeFrom").value();
-        double fx = pm_.margin_left_pt, fw = content_width();  // margin, column
+        double fx = pm_.margin_left_pt, fw = content_width();  // column (the margins without columns)
+        if (cell) {
+            fx = cell->x;
+            fw = cell->w;
+        } else if (hrel == "margin") {
+            fx = page_left_;
+            fw = page_w - page_left_ - page_right_;
+        }
         if (hrel == "page") {
             fx = 0.0;
             fw = page_w;
         } else if (hrel == "leftMargin" || hrel == "insideMargin") {
             fx = 0.0;
-            fw = pm_.margin_left_pt;
+            fw = page_left_;
         } else if (hrel == "rightMargin" || hrel == "outsideMargin") {
-            fx = page_w - pm_.margin_right_pt;
-            fw = pm_.margin_right_pt;
+            fx = page_w - page_right_;
+            fw = page_right_;
         } else if (hrel == "character") {
-            fx = pm_.margin_left_pt + pp.ind_left;
-            fw = std::max(content_width() - pp.ind_left, 0.0);
+            fx += pp.ind_left;
+            fw = std::max(fw - pp.ind_left, 0.0);
         }
         if (pugi::xml_node a = ph.child("wp:align")) {
             const std::string_view v = a.text().get();
@@ -2958,6 +4147,10 @@ public:
             draw_chart_in_box(*f.chart, f.x, f.y, f.w, f.h);
             return;
         }
+        if (f.shape) {
+            draw_shape(*f.shape, f.x, f.y);
+            return;
+        }
         std::unique_ptr<PoDoFo::PdfImage> image = doc_.CreateImage();
         image->LoadFromBuffer(PoDoFo::bufferview(f.image->png_bytes.data(), f.image->png_bytes.size()));
         painter_.DrawImage(*image, f.x, f.y, f.w / static_cast<double>(image->GetWidth()),
@@ -2965,11 +4158,16 @@ public:
     }
 
     // In-front floating objects of the page being finished, bottom to top.
+    // (Drawing one may add more — a floating picture in a table inside a
+    // text box: those are drawn too.)
     void flush_front_floats() {
-        std::stable_sort(front_floats_.begin(), front_floats_.end(),
-                         [](const FloatingObject& a, const FloatingObject& b) { return a.z < b.z; });
-        for (const FloatingObject& f : front_floats_) draw_float(f);
-        front_floats_.clear();
+        while (!front_floats_.empty()) {
+            std::vector<FloatingObject> floats = std::move(front_floats_);
+            front_floats_.clear();
+            std::stable_sort(floats.begin(), floats.end(),
+                             [](const FloatingObject& a, const FloatingObject& b) { return a.z < b.z; });
+            for (const FloatingObject& f : floats) draw_float(f);
+        }
     }
 
     // behindDoc objects the previous pass placed on page `page`, drawn
@@ -3056,15 +4254,20 @@ public:
         for (std::size_t ri = 0; ri < t.rows.size(); ++ri) {
             const RowLayout& row = t.rows[ri];
             double block_height = row.height;
+            std::vector<std::string> block_notes;  // footnotes referenced in the block's cells
             if (ri >= keep_until) {
                 keep_until = merged_block_end(t, ri);
                 block_height = 0.0;
-                for (std::size_t k = ri; k < keep_until; ++k) block_height += t.rows[k].height;
+                for (std::size_t k = ri; k < keep_until; ++k) {
+                    block_height += t.rows[k].height;
+                    collect_notes(t.rows[k], block_notes);
+                }
             } else {
                 block_height = 0.0;  // part of a block that already fitted
             }
             if (block_height > 0.0 && !dry_run_ && !no_page_break_) avoid_bands(block_height);
-            if (block_height > 0.0 && !dry_run_ && !no_page_break_ && cursor_y_ - block_height < bottom_limit_ &&
+            if (block_height > 0.0 && !dry_run_ && !no_page_break_ &&
+                (cursor_y_ - block_height < bottom_limit_ || !footnotes_fit(block_notes, block_height)) &&
                 cursor_y_ < page_top_) {
                 new_page();
                 // Repeat header rows, unless they'd fill the page themselves.
@@ -3076,8 +4279,11 @@ public:
                     }
                 }
             }
+            commit_footnotes(block_notes, block_height);
             draw_row(t, ri, x, cursor_y_);
             cursor_y_ -= row.height;
+            // A note may be split between rows, not inside vertically merged ones.
+            if (cuts_ != nullptr && dry_run_ && ri + 1 >= keep_until) cuts_->push_back(-cursor_y_);
         }
     }
 
@@ -3086,9 +4292,14 @@ private:
 
     // Height a picture/chart paragraph's drawing takes in the page flow.
     double drawing_height(pugi::xml_node drawing, const RelMap& rels, const PartMap& parts) {
-        constexpr double kLegendRowHeight = 16.0;
         if (pugi::xml_node chart_ref = find_descendant(drawing, "c:chart")) {
-            return resolve_chart(drawing, chart_ref, rels, parts, theme_).height_pt + kLegendRowHeight;
+            return resolve_chart(drawing, chart_ref, rels, parts, theme_, doc_lang_).height_pt;
+        }
+        if (is_shape(drawing)) {
+            const Numbering::Snapshot saved = numbering_.snapshot();  // lists in its text
+            const double h = shape_of(drawing, rels, parts)->height_pt;
+            numbering_.restore(saved);
+            return h;
         }
         const ImageBlock img = resolve_image(drawing, rels, parts);
         const double w = img.width_pt;
@@ -3098,19 +4309,27 @@ private:
     // Height of the first thing `block` puts on a page: a table's first
     // row, or a paragraph's pictures and first line. List counters are
     // left untouched.
-    double first_part_height(pugi::xml_node block, const RelMap& rels, const PartMap& parts) {
+    // `notes`, if given, gets the footnotes referenced in that first part.
+    double first_part_height(pugi::xml_node block, const RelMap& rels, const PartMap& parts,
+                             std::vector<std::string>* notes = nullptr) {
         const Numbering::Snapshot saved = numbering_.snapshot();
         double h = 0.0;
         if (std::strcmp(block.name(), "w:tbl") == 0) {
             const TableLayout t = measure_table(block, content_width(), false, rels, parts);
             if (!t.rows.empty()) {
-                for (std::size_t k = 0; k < merged_block_end(t, 0); ++k) h += t.rows[k].height;
+                for (std::size_t k = 0; k < merged_block_end(t, 0); ++k) {
+                    h += t.rows[k].height;
+                    if (notes) collect_notes(t.rows[k], *notes);
+                }
             }
         } else {
             const LaidParagraph lp = layout_paragraph(block, content_width());
             h = lp.props.before;
             for (pugi::xml_node drawing : flow_drawings(block)) h += drawing_height(drawing, rels, parts);
-            if (!lp.lines.empty()) h += lp.lines.front().height;
+            if (!lp.lines.empty()) {
+                h += lp.lines.front().height;
+                if (notes) collect_notes(lp.lines.front(), *notes);
+            }
         }
         numbering_.restore(saved);
         return h;
@@ -3156,7 +4375,7 @@ private:
 
     // Lays `p` out at `width` points: numbering marker, styled words broken
     // into lines (greedy), tabs, line and page breaks, line heights.
-    LaidParagraph layout_paragraph(pugi::xml_node p, double width) {
+    LaidParagraph layout_paragraph(pugi::xml_node p, double width, const LineSlotFn* slot = nullptr) {
         LaidParagraph lp;
         const pugi::xml_node num_pr = styles_.num_pr(p);
         const pugi::xml_node level  = num_pr ? numbering_.level_of(num_pr) : pugi::xml_node{};
@@ -3180,10 +4399,21 @@ private:
         struct PendingTab { std::size_t box = 0; double stop = 0.0; double start_x = 0.0;
                             ParaProps::Tab::Kind kind = ParaProps::Tab::Kind::Left; bool active = false; } ptab;
 
+        double y_used = 0.0;  // lines so far, for `slot`
         auto start_line = [&](bool first) {
             cur = Line{};
             cur.x0    = pp.ind_left + (first ? pp.ind_first : 0.0);
             cur.avail = std::max(width - cur.x0 - pp.ind_right, 10.0);
+            if (slot != nullptr) {
+                const double est = lp.lines.empty() ? metrics_of(mark).line : lp.lines.back().height;
+                for (;;) {
+                    const LineSlot ls = (*slot)(y_used + cur.skip, est, cur.x0, cur.avail);
+                    if (ls.skip > 0.0) { cur.skip += ls.skip; continue; }
+                    cur.x0    += ls.left;
+                    cur.avail = std::max(cur.avail - ls.left - ls.right, 10.0);
+                    break;
+                }
+            }
             x = 0.0;
             pending.clear();
             ptab.active = false;
@@ -3228,6 +4458,7 @@ private:
             cur.ascent = pp.line_rule == ParaProps::LineRule::Exact
                 ? std::max(0.0, cur.height - m.descent) : m.ascent + std::max(0.0, m.line - m.ascent - m.descent) / 2.0;
             cur.justify = justify && pp.align == ParaProps::Align::Justify;
+            y_used += cur.skip + cur.height;
             lp.lines.push_back(std::move(cur));
             start_line(false);
         };
@@ -3289,6 +4520,7 @@ private:
                     if (x + chunk_w > cur.avail && (x > 0.0 || !chunk.empty())) {
                         if (!chunk.empty()) {
                             Box part = make_box(Box::Kind::Text, chunk, piece.style);
+                            part.note = piece.note;
                             x += part.width;
                             cur.boxes.push_back(std::move(part));
                             chunk.clear();
@@ -3299,6 +4531,7 @@ private:
                 }
                 if (!chunk.empty()) {
                     Box part = make_box(Box::Kind::Text, chunk, piece.style);
+                    part.note = piece.note;
                     x += part.width;
                     cur.boxes.push_back(std::move(part));
                 }
@@ -3307,9 +4540,12 @@ private:
         };
 
         std::vector<Box> word;
-        auto flush_piece = [&](std::string& text, const TextStyle& st) {
+        auto flush_piece = [&](std::string& text, const Fragment& f) {
             if (text.empty()) return;
-            word.push_back(make_box(Box::Kind::Text, text, st));
+            for (std::string& part : fonts_.pieces_by_font(f.style, text)) {
+                word.push_back(make_box(Box::Kind::Text, std::move(part), f.style));
+                word.back().note = f.note;
+            }
             text.clear();
         };
 
@@ -3319,7 +4555,7 @@ private:
                     std::string piece;
                     for (const char ch : f.text) {
                         if (ch == ' ') {
-                            flush_piece(piece, f.style);
+                            flush_piece(piece, f);
                             if (!word.empty()) place_word(word);
                             pending.push_back(make_box(Box::Kind::Space, " ", f.style));
                         } else if (static_cast<unsigned char>(ch) < 0x20) {
@@ -3328,7 +4564,7 @@ private:
                             piece += ch;
                         }
                     }
-                    flush_piece(piece, f.style);
+                    flush_piece(piece, f);
                     break;
                 }
                 case Fragment::Kind::Tab: {
@@ -3362,11 +4598,12 @@ private:
                     end_line(false);
                     break;
                 case Fragment::Kind::PageBreak:
-                    // The text after the break starts the next page; a break
-                    // at the very start of a paragraph moves the whole of it.
+                case Fragment::Kind::ColumnBreak:
+                    // The text after the break starts the next page (column);
+                    // a break at the very start of a paragraph moves the whole of it.
                     if (!word.empty()) place_word(word);
                     if (!cur.boxes.empty() || !lp.lines.empty()) end_line(false);
-                    cur.page_break_before = true;
+                    (f.kind == Fragment::Kind::PageBreak ? cur.page_break_before : cur.column_break_before) = true;
                     break;
             }
         }
@@ -3378,7 +4615,7 @@ private:
     // Draws one laid-out line whose top is at `top`; `left` is the
     // paragraph's left edge.
     void draw_text_line(const Line& line, const ParaProps& pp, double left, double top) {
-        if (dry_run_) return;
+        if (dry_run_ || outside_note_window(top, line.height)) return;
         double natural = 0.0;
         std::size_t spaces = 0;
         for (const Box& b : line.boxes) {
@@ -3558,11 +4795,13 @@ private:
     };
 
     // The table style's formatting for the cell at `at`, and the border
-    // visibility its conditional formatting gives it.
-    CellStyle cell_style(pugi::xml_node style, const TableLook& look, const CellPosition& at,
-                                StyleBorders& borders) {
+    // visibility its conditional formatting gives it. `chain`: the style
+    // and the ones it's based on, base-most first — each region takes the
+    // base styles' formatting first, then the derived style's over it.
+    CellStyle cell_style(const std::vector<pugi::xml_node>& chain, const TableLook& look, const CellPosition& at,
+                         StyleBorders& borders) {
         CellStyle cs;
-        if (!style) return cs;
+        if (chain.empty()) return cs;
         // Which edges of a region a cell sits on decides whether a region's
         // top/left/bottom/right or its insideH/insideV border applies.
         enum class Region { Whole, Row, Column, Cell };
@@ -3592,39 +4831,47 @@ private:
             side(borders.left, left_edge, "w:left", "w:start", "w:insideV");
             side(borders.right, right_edge, "w:right", "w:end", "w:insideV");
         };
-        auto region = [&](const char* type) {
-            for (pugi::xml_node n : style.children("w:tblStylePr")) {
-                if (std::strcmp(n.attribute("w:type").value(), type) == 0) return n;
+        auto region = [&](const char* type, Region kind) {
+            for (pugi::xml_node style : chain) {
+                for (pugi::xml_node n : style.children("w:tblStylePr")) {
+                    if (std::strcmp(n.attribute("w:type").value(), type) == 0) add(n, kind);
+                }
             }
-            return pugi::xml_node{};
+        };
+        // Band sizes: the nearest style that sets them.
+        auto band_size = [&](const char* tag) {
+            unsigned size = 1;
+            for (pugi::xml_node style : chain) {
+                if (pugi::xml_node n = style.child("w:tblPr").child(tag)) size = n.attribute("w:val").as_uint(1);
+            }
+            return static_cast<std::size_t>(std::max(1u, size));
         };
 
         const bool header = look.first_row && at.row == 0;
         const bool total  = look.last_row && at.row + 1 == at.rows;
         const bool first  = look.first_col && at.cell == 0;
         const bool last   = look.last_col && at.cell + 1 == at.cells;
-        pugi::xml_node style_pr = style.child("w:tblPr");
-        const std::size_t row_band = std::max(1u, style_pr.child("w:tblStyleRowBandSize").attribute("w:val").as_uint(1));
-        const std::size_t col_band = std::max(1u, style_pr.child("w:tblStyleColBandSize").attribute("w:val").as_uint(1));
+        const std::size_t row_band = band_size("w:tblStyleRowBandSize");
+        const std::size_t col_band = band_size("w:tblStyleColBandSize");
 
-        add(style, Region::Whole);  // the style's own pPr/rPr/tcPr
-        add(region("wholeTable"), Region::Whole);
+        for (pugi::xml_node style : chain) add(style, Region::Whole);  // the styles' own pPr/rPr/tcPr
+        region("wholeTable", Region::Whole);
         if (look.h_band && !header) {
             const std::size_t r = at.row - (look.first_row ? 1 : 0);
-            add(region((r / row_band) % 2 == 0 ? "band1Horz" : "band2Horz"), Region::Row);
+            region((r / row_band) % 2 == 0 ? "band1Horz" : "band2Horz", Region::Row);
         }
         if (look.v_band && !first) {
             const std::size_t c = at.grid_col - (look.first_col && at.grid_col > 0 ? 1 : 0);
-            add(region((c / col_band) % 2 == 0 ? "band1Vert" : "band2Vert"), Region::Column);
+            region((c / col_band) % 2 == 0 ? "band1Vert" : "band2Vert", Region::Column);
         }
-        if (first)  add(region("firstCol"), Region::Column);
-        if (last)   add(region("lastCol"), Region::Column);
-        if (header) add(region("firstRow"), Region::Row);
-        if (total)  add(region("lastRow"), Region::Row);
-        if (header && first) add(region("nwCell"), Region::Cell);
-        if (header && last)  add(region("neCell"), Region::Cell);
-        if (total && first)  add(region("swCell"), Region::Cell);
-        if (total && last)   add(region("seCell"), Region::Cell);
+        if (first)  region("firstCol", Region::Column);
+        if (last)   region("lastCol", Region::Column);
+        if (header) region("firstRow", Region::Row);
+        if (total)  region("lastRow", Region::Row);
+        if (header && first) region("nwCell", Region::Cell);
+        if (header && last)  region("neCell", Region::Cell);
+        if (total && first)  region("swCell", Region::Cell);
+        if (total && last)   region("seCell", Region::Cell);
         return cs;
     }
 
@@ -3636,14 +4883,15 @@ private:
 
         pugi::xml_node tbl_pr = tbl.child("w:tblPr");
         t.tbl_borders = tbl_pr.child("w:tblBorders");
-        pugi::xml_node style = find_table_style(styles_doc_, tbl_pr.child("w:tblStyle").attribute("w:val").value());
-        if (style) {
-            t.style_borders  = style.child("w:tblPr").child("w:tblBorders");
-            t.style_resolved = true;
+        const std::vector<pugi::xml_node> style =
+            styles_.table_style_chain(tbl_pr.child("w:tblStyle").attribute("w:val").value());
+        for (auto it = style.rbegin(); it != style.rend(); ++it) {
+            if (pugi::xml_node b = it->child("w:tblPr").child("w:tblBorders")) t.style_borders.push_back(b);
         }
+        t.style_resolved = !style.empty();
         const TableLook look = read_table_look(tbl_pr.child("w:tblLook"));
         CellMargins table_margins;
-        apply_margins(style.child("w:tblPr").child("w:tblCellMar"), table_margins);
+        for (pugi::xml_node s : style) apply_margins(s.child("w:tblPr").child("w:tblCellMar"), table_margins);
         apply_margins(tbl_pr.child("w:tblCellMar"), table_margins);
 
         const std::vector<double> col_widths = table_column_widths(tbl, avail, force_fit);
@@ -3718,7 +4966,7 @@ private:
                          : va == "bottom" ? CellLayout::VAlign::Bottom : CellLayout::VAlign::Top;
                 if (!c.covered) {
                     c.content = classify_cell(cells[i], std::max(c.width - c.margins.left - c.margins.right, 1.0),
-                                              style ? &cs : nullptr, rels, parts);
+                                              !style.empty() ? &cs : nullptr, rels, parts);
                 }
                 // A merged cell's height is spread over its rows below.
                 if (c.rowspan == 1 && !c.covered) {
@@ -3735,6 +4983,8 @@ private:
             }
             t.rows.push_back(std::move(row));
         }
+
+        reserve_border_room(t, row_nodes);
 
         // Grow the last row of a merged area if the merged cell needs more
         // room than its rows give it. An area taller than a page is drawn
@@ -3762,6 +5012,37 @@ private:
         return t;
     }
 
+    // Horizontal borders take room in their rows, as in Word and
+    // LibreOffice (a 0.5 pt grid makes each row 0.5 pt taller than its
+    // text), instead of being drawn over the text's space: the thickest
+    // border on each edge between rows (a cell's bottom or the next one's
+    // top) is shared half and half by the two rows; the table's outer edges
+    // belong to the first and last row whole. An exact row height
+    // (hRule="exact") stays as it is.
+    void reserve_border_room(TableLayout& t, const std::vector<pugi::xml_node>& row_nodes) const {
+        const std::size_t n = t.rows.size();
+        std::vector<double> edge(n + 1, 0.0);  // edge[r]: above row r; edge[n]: the table's bottom
+        auto thick = [](const Border& b) { return b.visible() ? b.weight() : 0.0; };
+        for (std::size_t r = 0; r < n; ++r) {
+            for (std::size_t i = 0; i < t.rows[r].cells.size(); ++i) {
+                const CellLayout& c = t.rows[r].cells[i];
+                if (c.covered) continue;
+                const CellBorderSides sides = borders_of(t, r, i);
+                edge[r] = std::max(edge[r], thick(sides.top));
+                const std::size_t below = std::min(r + c.rowspan, n);
+                edge[below] = std::max(edge[below], thick(sides.bottom));
+            }
+        }
+        for (std::size_t r = 0; r < n; ++r) {
+            RowLayout& row = t.rows[r];
+            pugi::xml_node h = row_nodes[r].child("w:trPr").child("w:trHeight");
+            if (h && std::strcmp(h.attribute("w:hRule").value(), "exact") == 0) continue;
+            row.border_top    = r == 0 ? edge[0] : edge[r] / 2.0;
+            row.border_bottom = r + 1 == n ? edge[n] : edge[r + 1] / 2.0;
+            row.height += row.border_top + row.border_bottom;
+        }
+    }
+
     // Rows [ri, result) must stay on one page: merged cells starting in
     // them reach down to result - 1.
     static std::size_t merged_block_end(const TableLayout& t, std::size_t ri) {
@@ -3773,7 +5054,7 @@ private:
     }
 
     void draw_row(const TableLayout& t, std::size_t ri, double x, double top) {
-        if (dry_run_) return;
+        if (dry_run_ || outside_note_window(top, t.rows[ri].height)) return;
         const RowLayout& row = t.rows[ri];
         for (std::size_t i = 0; i < row.cells.size(); ++i) {
             const CellLayout& c = row.cells[i];
@@ -3786,11 +5067,12 @@ private:
                 painter_.DrawRectangle(x, top - height, c.width, height, PoDoFo::PdfPathDrawMode::Fill);
                 painter_.GraphicsState.SetNonStrokingColor(PoDoFo::PdfColor(0, 0, 0));
             }
-            const double inner_h = height - c.margins.top - c.margins.bottom;
+            const RowLayout& last = t.rows[std::min(ri + c.rowspan, t.rows.size()) - 1];
+            const double inner_h = height - row.border_top - last.border_bottom - c.margins.top - c.margins.bottom;
             double offset = 0.0;
             if (c.valign == CellLayout::VAlign::Center)      offset = std::max(0.0, (inner_h - c.content.height) / 2.0);
             else if (c.valign == CellLayout::VAlign::Bottom) offset = std::max(0.0, inner_h - c.content.height);
-            draw_cell_content(c.content, x + c.margins.left, top - c.margins.top - offset,
+            draw_cell_content(c.content, x + c.margins.left, top - row.border_top - c.margins.top - offset,
                               std::max(c.width - c.margins.left - c.margins.right, 1.0));
             CellBorderSides sides = borders_of(t, ri, i);
             // A shared edge is drawn once more by the cell below / to the
@@ -3862,17 +5144,24 @@ private:
     // ── Hidden text (<w:vanish>) ────────────────────────────────────────────
 
     std::vector<Fragment> fragments_of(pugi::xml_node p) const {
-        return ParagraphText(current_fields(), [&](pugi::xml_node r) { return styles_.run_style(p, r, cell_style_); },
-                             styles_.mark_style(p, cell_style_))
+        auto shape_color = [&](TextStyle st) {
+            if (shape_text_color_ && !st.color_set) st.color = *shape_text_color_;
+            return st;
+        };
+        return ParagraphText(current_fields(),
+                             [&](pugi::xml_node r) { return shape_color(styles_.run_style(p, r, cell_style_)); },
+                             shape_color(styles_.mark_style(p, cell_style_)),
+                             [this](std::string_view key) { return note_mark(key); })
             .run(p);
     }
 
     // Pictures and charts of `p` laid out in the text flow: the inline ones
-    // (floating ones are placed by place_floats()), all of them in a cell.
+    // (floating ones are placed by place_floats(), in a cell by
+    // classify_cell()).
     std::vector<pugi::xml_node> flow_drawings(pugi::xml_node p) const {
         std::vector<pugi::xml_node> out;
         for (pugi::xml_node d : visible_drawings(p)) {
-            if (in_cell_ || !d.child("wp:anchor")) out.push_back(d);
+            if (!d.child("wp:anchor")) out.push_back(d);
         }
         return out;
     }
@@ -3926,16 +5215,24 @@ private:
             const CellStyle*  value;
             ~Restore() { slot = value; }
         } restore{cell_style_, outer_style};
-        const bool outer_in_cell = in_cell_;
-        in_cell_ = true;
-        struct RestoreFlag {
-            bool& slot;
-            bool  value;
-            ~RestoreFlag() { slot = value; }
-        } restore_flag{in_cell_, outer_in_cell};
         CellContent c;
         FlowState flow;
         double y = 0.0;
+        // Floating objects that text wraps around, relative to their
+        // paragraph: what follows them in the cell goes below (top, bottom
+        // from the content box's top), and the cell grows to hold them.
+        std::vector<std::pair<double, double>> bands;
+        auto clear_bands = [&](double h) {
+            for (bool again = true; again;) {
+                again = false;
+                for (const auto& [top, bottom] : bands) {
+                    if (y < bottom - 0.01 && y + h > top + 0.01) {
+                        y = bottom;
+                        again = true;
+                    }
+                }
+            }
+        };
         auto sized = [&](CellPart& part, double w, double h) {
             part.width  = w;
             part.height = h;
@@ -3959,6 +5256,7 @@ private:
                 part.nested = std::make_shared<TableLayout>(measure_table(block, width, /*force_fit*/true, rels, parts));
                 part.width  = width;
                 part.height = part.nested->total_height();
+                clear_bands(part.height);
                 part.y      = y;
                 y += part.height;
                 c.parts.push_back(std::move(part));
@@ -3973,18 +5271,58 @@ private:
             y += gap;
             const double box_top = y;
             y += box.top;
+            const double para_top = y;
             for (pugi::xml_node drawing : visible_drawings(block)) {
+                pugi::xml_node anchor = drawing.child("wp:anchor");
+                if (!anchor) continue;
+                CellPart part;
+                part.kind    = CellPart::Kind::Float;
+                part.drawing = drawing;
+                part.paragraph.props = lp.props;
+                part.y       = para_top;
+                if (pugi::xml_node chart_ref = find_descendant(drawing, "c:chart")) {
+                    part.chart  = resolve_chart(drawing, chart_ref, rels, parts, theme_, doc_lang_);
+                    part.width  = part.chart.width_pt;
+                    part.height = part.chart.height_pt;
+                } else if (is_shape(drawing)) {
+                    part.shape  = shape_of(drawing, rels, parts);
+                    part.width  = part.shape->width_pt;
+                    part.height = part.shape->height_pt;
+                } else {
+                    part.image  = resolve_image(drawing, rels, parts);
+                    part.width  = part.image.width_pt;
+                    part.height = part.image.height_pt;
+                }
+                // Text wraps around it: keep its band (paragraph-relative
+                // positions only — a page-relative one isn't known yet).
+                const std::string_view vrel = anchor.child("wp:positionV").attribute("relativeFrom").value();
+                if (!anchor.child("wp:wrapNone") && !on_off_attr(anchor.attribute("behindDoc")) &&
+                    cell_relative(anchor) && (vrel == "paragraph" || vrel == "line" || vrel.empty())) {
+                    const double top = para_top + emu_to_pt(anchor.child("wp:positionV").child("wp:posOffset").text().as_double(0.0));
+                    bands.emplace_back(top - emu_to_pt(anchor.attribute("distT").as_double(0.0)),
+                                       top + part.height + emu_to_pt(anchor.attribute("distB").as_double(0.0)));
+                }
+                c.parts.push_back(std::move(part));
+            }
+            for (pugi::xml_node drawing : visible_drawings(block)) {
+                if (drawing.child("wp:anchor")) continue;
                 CellPart part;
                 part.align = lp.props.align;
                 if (pugi::xml_node chart_ref = find_descendant(drawing, "c:chart")) {
                     part.kind  = CellPart::Kind::Chart;
-                    part.chart = resolve_chart(drawing, chart_ref, rels, parts, theme_);
+                    part.chart = resolve_chart(drawing, chart_ref, rels, parts, theme_, doc_lang_);
                     sized(part, part.chart.width_pt, part.chart.height_pt);
+                } else if (is_shape(drawing)) {
+                    part.kind  = CellPart::Kind::Shape;
+                    part.shape = shape_of(drawing, rels, parts);
+                    part.width  = part.shape->width_pt;  // not scaled: its text is laid out at this size
+                    part.height = part.shape->height_pt;
                 } else {
                     part.kind  = CellPart::Kind::Image;
                     part.image = resolve_image(drawing, rels, parts);
                     sized(part, part.image.width_pt, part.image.height_pt);
                 }
+                clear_bands(part.height);
                 part.y = y;
                 y += part.height;
                 c.parts.push_back(std::move(part));
@@ -3993,6 +5331,7 @@ private:
                 CellPart part;
                 part.kind   = CellPart::Kind::Paragraph;
                 part.height = lp.lines_height();
+                clear_bands(part.height);
                 part.y      = y;
                 part.box       = box;
                 part.box_above = y - box_top;
@@ -4008,7 +5347,15 @@ private:
             }
         }
         c.height = y + flow.pending_after;
+        for (const auto& band : bands) c.height = std::max(c.height, band.second);
         return c;
+    }
+
+    // Whether an anchor in a table cell is positioned relative to the cell
+    // (<wp:anchor layoutInCell>, Word's default) rather than the page.
+    static bool cell_relative(pugi::xml_node anchor) {
+        pugi::xml_attribute a = anchor.attribute("layoutInCell");
+        return !a || on_off_attr(a);
     }
 
     // Draws the visible sides as independent line segments rather than one
@@ -4023,20 +5370,25 @@ private:
         stroke_border(sides.right,  x + w, y, x + w, y + h);
     }
 
+    // Dash lengths of a dotted/dashed line style; empty for a solid one.
+    static std::vector<double> dash_pattern(const Border& b) {
+        const double w = b.width;
+        switch (b.style) {
+            case Border::Style::Dotted:  return {std::max(w, 0.5), std::max(2.0 * w, 1.5)};
+            case Border::Style::Dashed:  return {std::max(3.0 * w, 3.0), std::max(2.0 * w, 2.0)};
+            case Border::Style::DotDash: return {std::max(3.0 * w, 3.0), std::max(2.0 * w, 1.5),
+                                                 std::max(w, 0.5), std::max(2.0 * w, 1.5)};
+            default: return {};
+        }
+    }
+
     // One border along a horizontal or vertical edge.
     void stroke_border(const Border& b, double x1, double y1, double x2, double y2) {
         if (!b.visible()) return;
         painter_.GraphicsState.SetStrokingColor(pdf_color(b.color));
         painter_.GraphicsState.SetLineWidth(b.width);
         const double w = b.width;
-        std::vector<double> dash;
-        switch (b.style) {
-            case Border::Style::Dotted:  dash = {std::max(w, 0.5), std::max(2.0 * w, 1.5)}; break;
-            case Border::Style::Dashed:  dash = {std::max(3.0 * w, 3.0), std::max(2.0 * w, 2.0)}; break;
-            case Border::Style::DotDash: dash = {std::max(3.0 * w, 3.0), std::max(2.0 * w, 1.5),
-                                                 std::max(w, 0.5), std::max(2.0 * w, 1.5)}; break;
-            default: break;
-        }
+        const std::vector<double> dash = dash_pattern(b);
         if (!dash.empty()) painter_.SetStrokeStyle(PoDoFo::cspan<double>(dash.data(), dash.size()), 0.0);
         if (b.style == Border::Style::Double) {
             // Two lines of the border's width, a gap of the same (at least
@@ -4059,6 +5411,20 @@ private:
     void draw_cell_content(const CellContent& c, double x, double top_y, double width) {
         for (const CellPart& part : c.parts) {
             const double y = top_y - part.y;
+            if (part.kind == CellPart::Kind::Float) {
+                FloatingObject f;
+                f.drawing = part.drawing;
+                f.w = part.width;
+                f.h = part.height;
+                if (part.shape)                        f.shape = part.shape;
+                else if (part.image.png_bytes.empty()) f.chart = std::make_shared<ResolvedChart>(part.chart);
+                else                                   f.image = std::make_shared<ImageBlock>(part.image);
+                pugi::xml_node anchor = part.drawing.child("wp:anchor");
+                position_float(anchor, part.paragraph.props, y, f,
+                               cell_relative(anchor) ? std::optional<CellFrame>(CellFrame{x, width}) : std::nullopt);
+                add_float(std::move(f));
+                continue;
+            }
             double dx = 0.0;
             if (part.align == ParaProps::Align::Center)     dx = std::max(0.0, (width - part.width) / 2.0);
             else if (part.align == ParaProps::Align::Right) dx = std::max(0.0, width - part.width);
@@ -4088,12 +5454,13 @@ private:
                     break;
                 }
                 case CellPart::Kind::Chart:
-                    // No legend — cells are usually too narrow to spare the
-                    // extra row, and the category/series names are already
-                    // visible via the rest of the cell's own table row/column
-                    // headers in every real template this was tested against.
                     draw_chart_in_box(part.chart, x + dx, y - part.height, part.width, part.height);
                     break;
+                case CellPart::Kind::Shape:
+                    draw_shape(*part.shape, x + dx, y - part.height);
+                    break;
+                case CellPart::Kind::Float:
+                    break;  // placed above
                 case CellPart::Kind::NestedTable: {
                     double ry = y;
                     for (std::size_t ri = 0; ri < part.nested->rows.size(); ++ri) {
@@ -4110,26 +5477,73 @@ private:
         return pm_.width_pt - pm_.margin_left_pt - pm_.margin_right_pt;
     }
 
-    void ensure_space(double needed) {
+    // `text_line`: a line laid out beside floating objects (see
+    // beside_floats()), which needn't move below them.
+    void ensure_space(double needed, bool text_line = false) {
         if (dry_run_ || no_page_break_) return;
         if (cursor_y_ - needed < bottom_limit_ && cursor_y_ < page_top_) new_page();
-        if (avoid_bands(needed) && cursor_y_ - needed < bottom_limit_) new_page();
+        if (avoid_bands(needed, text_line) && cursor_y_ - needed < bottom_limit_) new_page();
     }
 
     // Moves the cursor below any floating object's band that `needed`
     // points from here would run into; whether it moved.
-    bool avoid_bands(double needed) {
+    bool avoid_bands(double needed, bool text_line = false) {
+        auto hits = [&](double top, double bottom) {
+            return cursor_y_ > bottom + 0.01 && cursor_y_ - needed < top;
+        };
         bool moved = false;
         for (bool again = true; again;) {
             again = false;
             for (const Band& b : bands_) {
-                if (cursor_y_ > b.bottom + 0.01 && cursor_y_ - needed < b.top) {
+                if (hits(b.top, b.bottom)) { cursor_y_ = b.bottom; moved = again = true; }
+            }
+            if (text_line) continue;
+            for (const Side& b : sides_) {  // tables, pictures: not beside a float
+                const double left = pm_.margin_left_pt, right = left + content_width();
+                if (b.right > left && b.left < right && hits(b.top, b.bottom)) {
                     cursor_y_ = b.bottom;
                     moved = again = true;
                 }
             }
         }
         return moved;
+    }
+
+    // Whether a text-wrapping floating object reaches below `top`.
+    bool wraps_below(double top) const {
+        return std::any_of(sides_.begin(), sides_.end(),
+                           [&](const Side& b) { return b.bottom < top - 0.01; });
+    }
+
+    // Line slots for a paragraph whose first line's top is at `top`: lines
+    // that meet a wrapSquare/Tight/Through object keep to one side of it,
+    // or move below it when that side is narrower than kMinWrapWidth.
+    LineSlotFn beside_floats(double top) const {
+        constexpr double kMinWrapWidth = 18.0;  // 1/4 inch
+        return [this, top](double y_offset, double height, double x0, double avail) {
+            LineSlot ls;
+            const double y = top - y_offset;
+            if (y - height < bottom_limit_) return ls;  // on a later page, where they aren't
+            const double left0 = pm_.margin_left_pt + x0, right0 = left0 + avail;
+            double left = left0, right = right0;
+            for (const Side& b : sides_) {
+                if (!(y > b.bottom + 0.01 && y - height < b.top - 0.01)) continue;
+                if (b.right <= left || b.left >= right) continue;
+                const double room_left = b.left - left, room_right = right - b.right;
+                const bool on_left = b.text == Side::Text::Left  ? true
+                                   : b.text == Side::Text::Right ? false
+                                   : room_left >= room_right;
+                if ((on_left ? room_left : room_right) < kMinWrapWidth) {
+                    ls = LineSlot{};
+                    ls.skip = y - b.bottom;
+                    return ls;
+                }
+                if (on_left) right = b.left; else left = b.right;
+            }
+            ls.left  = left - left0;
+            ls.right = right0 - right;
+            return ls;
+        };
     }
 
     // Vertical space between blocks; dropped at a page break.
@@ -4146,7 +5560,13 @@ private:
     // current one yet.
     void break_page() {
         if (dry_run_ || no_page_break_) return;
-        if (cursor_y_ < page_top_) new_page();
+        if (cursor_y_ < page_top_ || col_ > 0) start_page();
+    }
+
+    // Column break: the next column, or the next page from the last one.
+    void break_column() {
+        if (dry_run_ || no_page_break_) return;
+        new_page();
     }
 
     // Plain single-style text (chart labels, legends).
@@ -4157,14 +5577,20 @@ private:
         // PoDoFo version (BeginText/EndText are private — meant for a
         // lower-level multi-call text object API this renderer doesn't need).
         const std::string line = sanitize_single_line(text);
-        painter_.TextState.SetFont(fonts_.for_text(font, line), size);
-        painter_.DrawText(line, x, y);
+        // Only the letters `font` lacks in another font (₽ in Carlito, say).
+        for (const auto& [piece, f] : fonts_.pieces_for(font, line)) {
+            painter_.TextState.SetFont(*f, size);
+            painter_.DrawText(piece, x, y);
+            x += text_width(*f, size, piece);
+        }
     }
 
     // Width of chart/legend text as draw_line() will draw it.
     double label_width(PoDoFo::PdfFont& font, double size, const std::string& text) {
         const std::string line = sanitize_single_line(text);
-        return text_width(fonts_.for_text(font, line), size, line);
+        double w = 0.0;
+        for (const auto& [piece, f] : fonts_.pieces_for(font, line)) w += text_width(*f, size, piece);
+        return w;
     }
 
     // Horizontal position of a `w`-wide block in a paragraph with `pp`.
@@ -4174,6 +5600,95 @@ private:
         if (pp.align == ParaProps::Align::Center) return left + std::max(0.0, (avail - w) / 2.0);
         if (pp.align == ParaProps::Align::Right)  return left + std::max(0.0, avail - w);
         return left;
+    }
+
+    // ── Shapes and text boxes ───────────────────────────────────────────────
+
+    // A shape with its text laid out (see ShapeBlock).
+    std::shared_ptr<ShapeBlock> shape_of(pugi::xml_node drawing, const RelMap& rels, const PartMap& parts) {
+        auto sh = std::make_shared<ShapeBlock>(resolve_shape(drawing, theme_));
+        sh->content = std::make_shared<CellContent>();
+        if (!sh->text) return sh;
+        const std::optional<Color> outer_color = shape_text_color_;
+        shape_text_color_ = sh->text_color;
+        struct Restore {
+            std::optional<Color>& slot;
+            std::optional<Color>  value;
+            ~Restore() { slot = value; }
+        } restore{shape_text_color_, outer_color};
+        const double width = std::max(sh->width_pt - sh->inset_l - sh->inset_r, 1.0);
+        *sh->content = classify_cell(sh->text, width, nullptr, rels, parts);
+        if (sh->auto_fit) sh->height_pt = sh->content->height + sh->inset_t + sh->inset_b;
+        return sh;
+    }
+
+    // Draws `sh` with its bottom-left corner at (x, y).
+    void draw_shape(const ShapeBlock& sh, double x, double y) {
+        if (dry_run_) return;
+        const double w = sh.width_pt, h = sh.height_pt;
+        if (sh.geometry == ShapeBlock::Geometry::Line) {
+            // From the top-left to the bottom-right corner, unless flipped.
+            const double y1 = sh.flip_v != sh.flip_h ? y : y + h;
+            const double y2 = sh.flip_v != sh.flip_h ? y + h : y;
+            stroke_border(sh.outline, x, y1, x + w, y2);
+            return;
+        }
+        PoDoFo::PdfPainterPath path;
+        if (sh.geometry == ShapeBlock::Geometry::Ellipse) {
+            const double cx = x + w / 2.0, cy = y + h / 2.0, rx = w / 2.0, ry = h / 2.0;
+            // Four Bézier quarters of a circle, scaled to the ellipse.
+            constexpr double k = 0.5522847498;
+            path.MoveTo(cx + rx, cy);
+            path.AddCubicBezierTo(cx + rx, cy + k * ry, cx + k * rx, cy + ry, cx, cy + ry);
+            path.AddCubicBezierTo(cx - k * rx, cy + ry, cx - rx, cy + k * ry, cx - rx, cy);
+            path.AddCubicBezierTo(cx - rx, cy - k * ry, cx - k * rx, cy - ry, cx, cy - ry);
+            path.AddCubicBezierTo(cx + k * rx, cy - ry, cx + rx, cy - k * ry, cx + rx, cy);
+        } else if (sh.geometry == ShapeBlock::Geometry::RoundRect) {
+            const double r = std::clamp(sh.corner, 0.0, 0.5) * std::min(w, h);
+            constexpr double k = 0.5522847498;
+            path.MoveTo(x + r, y);
+            path.AddLineTo(x + w - r, y);
+            path.AddCubicBezierTo(x + w - r + k * r, y, x + w, y + r - k * r, x + w, y + r);
+            path.AddLineTo(x + w, y + h - r);
+            path.AddCubicBezierTo(x + w, y + h - r + k * r, x + w - r + k * r, y + h, x + w - r, y + h);
+            path.AddLineTo(x + r, y + h);
+            path.AddCubicBezierTo(x + r - k * r, y + h, x, y + h - r + k * r, x, y + h - r);
+            path.AddLineTo(x, y + r);
+            path.AddCubicBezierTo(x, y + r - k * r, x + r - k * r, y, x + r, y);
+        } else {
+            path.AddRectangle(PoDoFo::Rect(x, y, w, h));
+        }
+        path.Close();
+        if (sh.fill) {
+            painter_.GraphicsState.SetNonStrokingColor(pdf_color(*sh.fill));
+            painter_.DrawPath(path, PoDoFo::PdfPathDrawMode::Fill);
+            painter_.GraphicsState.SetNonStrokingColor(PoDoFo::PdfColor(0, 0, 0));
+        }
+        if (sh.outline.visible()) {
+            const Border& b = sh.outline;
+            const std::vector<double> dash = dash_pattern(b);
+            painter_.GraphicsState.SetStrokingColor(pdf_color(b.color));
+            painter_.GraphicsState.SetLineWidth(b.width);
+            if (!dash.empty()) painter_.SetStrokeStyle(PoDoFo::cspan<double>(dash.data(), dash.size()), 0.0);
+            painter_.DrawPath(path, PoDoFo::PdfPathDrawMode::Stroke);
+            if (!dash.empty()) painter_.SetStrokeStyle(PoDoFo::PdfStrokeStyle::Solid);
+            painter_.GraphicsState.SetStrokingColor(PoDoFo::PdfColor(0, 0, 0));
+            painter_.GraphicsState.SetLineWidth(1.0);
+        }
+        if (!sh.content || sh.content->parts.empty()) return;
+        const double inner_h = h - sh.inset_t - sh.inset_b;
+        double offset = 0.0;
+        if (sh.anchor == ShapeBlock::Anchor::Center)      offset = (inner_h - sh.content->height) / 2.0;
+        else if (sh.anchor == ShapeBlock::Anchor::Bottom) offset = inner_h - sh.content->height;
+        draw_cell_content(*sh.content, x + sh.inset_l, y + h - sh.inset_t - std::max(offset, 0.0),
+                          std::max(w - sh.inset_l - sh.inset_r, 1.0));
+    }
+
+    // An inline shape in the page flow, placed like a picture.
+    void draw_shape_block(const ShapeBlock& sh, const ParaProps& pp) {
+        ensure_space(sh.height_pt);
+        if (!dry_run_) draw_shape(sh, block_x(sh.width_pt, pp), cursor_y_ - sh.height_pt);
+        cursor_y_ -= sh.height_pt;
     }
 
     void draw_image(const ImageBlock& img, const ParaProps& pp) {
@@ -4197,48 +5712,108 @@ private:
 
     // Resolves and renders a chart at page scale (bar/line/area/pie/
     // doughnut, 3D variants rendered flat) or throws NotImplemented —
-    // see resolve_chart(). This is the page-flow entry point (with a
-    // legend row); a chart inside a table cell goes through
-    // draw_cell_content() instead, which skips the legend.
+    // see resolve_chart(). This is the page-flow entry point; a chart
+    // inside a table cell goes through draw_cell_content() instead.
     void draw_chart_block(pugi::xml_node drawing, pugi::xml_node chart_ref,
                           const RelMap& rels, const PartMap& parts, const ParaProps& pp) {
-        const ResolvedChart rc = resolve_chart(drawing, chart_ref, rels, parts, theme_);
+        const ResolvedChart rc = resolve_chart(drawing, chart_ref, rels, parts, theme_, doc_lang_);
         const double width_pt  = std::min(rc.width_pt, content_width());
         const double height_pt = rc.height_pt;
 
-        constexpr double kLegendRowHeight = 16.0;
-        ensure_space(height_pt + kLegendRowHeight);
+        ensure_space(height_pt);
 
         const double chart_top = cursor_y_;
-        if (!dry_run_) {
-            const double x = block_x(width_pt, pp);
-            draw_chart_in_box(rc, x, chart_top - height_pt, width_pt, height_pt);
-            if (rc.kind == ChartKind::Pie || rc.kind == ChartKind::Doughnut) {
-                draw_category_legend(rc.data, x, chart_top - height_pt - 4.0);
-            } else {
-                draw_chart_legend(rc.data, x, chart_top - height_pt - 4.0);
-            }
-        }
-        cursor_y_ = chart_top - height_pt - kLegendRowHeight;
+        if (!dry_run_) draw_chart_in_box(rc, block_x(width_pt, pp), chart_top - height_pt, width_pt, height_pt);
+        cursor_y_ = chart_top - height_pt;
     }
 
-    // Title (if any) on top, then the plot in the remaining box.
+    // Chart text in its look (size, weight, color), `y` its baseline.
+    void draw_chart_text(const ChartText& t, const std::string& text, double x, double y) {
+        painter_.GraphicsState.SetNonStrokingColor(pdf_color(t.color));
+        draw_line(t.bold ? bold_ : regular_, t.size, text, x, y);
+        painter_.GraphicsState.SetNonStrokingColor(PoDoFo::PdfColor(0, 0, 0));
+    }
+    double chart_text_width(const ChartText& t, const std::string& text) {
+        return label_width(t.bold ? bold_ : regular_, t.size, text);
+    }
+    // The same turned a quarter left (reading upwards) or right, centred on
+    // (cx, cy).
+    void draw_chart_text_turned(const ChartText& t, const std::string& text, double cx, double cy, bool upwards) {
+        if (dry_run_ || text.empty()) return;
+        const double tw = chart_text_width(t, text);
+        painter_.Save();
+        // Rotation about the text's own origin; its glyphs then stand left
+        // of the baseline (upwards) or right of it.
+        const double bx = upwards ? cx + t.size * 0.35 : cx - t.size * 0.35;
+        const double by = upwards ? cy - tw / 2.0 : cy + tw / 2.0;
+        painter_.GraphicsState.ConcatenateTransformationMatrix(
+            upwards ? PoDoFo::Matrix(0, 1, -1, 0, bx, by) : PoDoFo::Matrix(0, -1, 1, 0, bx, by));
+        draw_chart_text(t, text, 0.0, 0.0);
+        painter_.Restore();
+    }
+
+    // `paragraphs` broken into lines of at most `max_w` points, between
+    // words; a word longer than that keeps a line of its own.
+    std::vector<std::string> wrap_chart_text(const ChartText& t, const std::vector<std::string>& paragraphs, double max_w) {
+        std::vector<std::string> lines;
+        for (const std::string& para : paragraphs) {
+            std::string line;
+            std::size_t i = 0;
+            while (i < para.size()) {
+                const std::size_t sp = para.find(' ', i);
+                const std::string word = para.substr(i, sp == std::string::npos ? std::string::npos : sp - i);
+                i = sp == std::string::npos ? para.size() : sp + 1;
+                if (word.empty()) continue;
+                const std::string longer = line.empty() ? word : line + ' ' + word;
+                if (!line.empty() && chart_text_width(t, longer) > max_w) {
+                    lines.push_back(line);
+                    line = word;
+                } else {
+                    line = longer;
+                }
+            }
+            if (!line.empty()) lines.push_back(line);
+        }
+        return lines;
+    }
+
+    // Chart area (background, border), title on top, legend, then the plot
+    // in the remaining box.
     void draw_chart_in_box(const ResolvedChart& rc, double x, double y, double w, double h) {
         if (dry_run_) return;
-        constexpr double kTitleSize = 10.0;
-        if (!rc.title.empty()) {
-            PoDoFo::PdfTextState title_state;
-            title_state.Font     = &bold_;
-            title_state.FontSize = kTitleSize;
-            const double title_w = label_width(bold_, title_state.FontSize, rc.title);
-            draw_line(bold_, kTitleSize, rc.title,
-                      x + std::max((w - title_w) / 2.0, 0.0), y + h - kTitleSize);
-            h -= kTitleSize * 1.6;
+        const double box_x = x, box_y = y, box_w = w, box_h = h;
+        if (rc.area_fill) {
+            painter_.GraphicsState.SetNonStrokingColor(pdf_color(*rc.area_fill));
+            painter_.DrawRectangle(x, y, w, h, PoDoFo::PdfPathDrawMode::Fill);
+            painter_.GraphicsState.SetNonStrokingColor(PoDoFo::PdfColor(0, 0, 0));
         }
+        // Office keeps the contents a few points off the chart's edges.
+        constexpr double kInset = 5.0;
+        x += kInset; y += kInset; w = std::max(w - 2.0 * kInset, 1.0); h = std::max(h - 2.0 * kInset, 1.0);
+        if (!rc.title.empty()) {
+            // At most 80 % of the chart's width a line, as LibreOffice
+            // wraps titles (worked out with probes: 77 % stays on one line,
+            // 81 % wraps); each line centred.
+            const ChartText& t = rc.title_text;
+            const std::vector<std::string> lines = wrap_chart_text(t, rc.title_paragraphs, box_w * 0.8);
+            for (std::size_t i = 0; i < lines.size(); ++i) {
+                draw_chart_text(t, lines[i], x + std::max((w - chart_text_width(t, lines[i])) / 2.0, 0.0),
+                                y + h - t.size - static_cast<double>(i) * t.size * 1.2);
+            }
+            h -= t.size * 1.6 + static_cast<double>(lines.size() - 1) * t.size * 1.2;
+        }
+        draw_legend(rc, x, y, w, h);
         if (rc.kind == ChartKind::Pie || rc.kind == ChartKind::Doughnut) {
             draw_pie_chart_plot(rc.kind == ChartKind::Doughnut, rc.hole_frac, rc.data, x, y, w, h);
         } else {
             draw_chart_plot(rc, x, y, w, h);
+        }
+        if (rc.area_line.shown) {
+            painter_.GraphicsState.SetStrokingColor(pdf_color(rc.area_line.color));
+            painter_.GraphicsState.SetLineWidth(rc.area_line.width);
+            painter_.DrawRectangle(box_x, box_y, box_w, box_h, PoDoFo::PdfPathDrawMode::Stroke);
+            painter_.GraphicsState.SetStrokingColor(PoDoFo::PdfColor(0, 0, 0));
+            painter_.GraphicsState.SetLineWidth(1.0);
         }
     }
 
@@ -4308,7 +5883,7 @@ private:
                 label_r = radius + 4.0;
                 place = std::cos(a_mid) >= 0.0 ? LabelPlace::Right : LabelPlace::Left;
             }
-            labels.push_back({data_label_text(dl, ser, data.categories[i], values[i], frac),
+            labels.push_back({data_label_text(dl, ser, data.categories[i], values[i], data.numbers, frac),
                               cx + label_r * std::cos(a_mid), cy + label_r * std::sin(a_mid), place, &dl});
         }
 
@@ -4316,31 +5891,107 @@ private:
         painter_.GraphicsState.SetNonStrokingColor(PoDoFo::PdfColor(0, 0, 0));
     }
 
-    // Legend keyed by category (pie/doughnut have one series, many
-    // categories — the wedges, not the series, are what's color-coded).
-    // Same single-row-only simplification as draw_chart_legend().
-    void draw_category_legend(const ChartData& data, double x, double y) {
-        constexpr double kSwatch   = 8.0;
-        constexpr double kGap      = 6.0;
-        constexpr double kFontSize = 8.0;
+    // The legend inside the chart's box (x, y, w, h: below the title),
+    // where <c:legendPos> puts it: a centred row (wrapping into more) at
+    // the top or bottom, a column at the left or right, vertically
+    // centred — or at the top for "tr". Unless it overlays the plot, the
+    // box shrinks by its room, as in Word. Entries: the series (a line
+    // series as its line and marker), or a pie's categories.
+    void draw_legend(const ResolvedChart& rc, double& x, double& y, double& w, double& h) {
+        using Pos = ResolvedChart::Legend::Pos;
+        const ResolvedChart::Legend& lg = rc.legend;
+        if (lg.pos == Pos::None || dry_run_) return;
+        const bool pie = rc.kind == ChartKind::Pie || rc.kind == ChartKind::Doughnut;
 
-        PoDoFo::PdfTextState state;
-        state.Font     = &regular_;
-        state.FontSize = kFontSize;
+        struct Item { std::string name; Color color; bool line = false, marker = false; double width = 0.0; };
+        std::vector<Item> items;
+        const double fs = lg.text.size;
+        const double swatch = fs * 0.8, gap = fs * 0.4;
+        const std::size_t n = pie ? rc.data.categories.size() : rc.data.series.size();
+        for (std::size_t i = 0; i < n; ++i) {
+            if (lg.deleted.count(i)) continue;
+            Item it;
+            if (pie) {
+                it.name  = rc.data.categories[i];
+                it.color = point_color(rc.data, i);
+            } else {
+                const ChartSeriesData& ser = rc.data.series[i];
+                it.name   = ser.name;
+                it.color  = ser.color;
+                it.line   = ser.kind == ChartKind::Line;
+                it.marker = ser.marker;
+            }
+            it.width = (it.line ? swatch * 2.0 : swatch) + gap + chart_text_width(lg.text, it.name);
+            items.push_back(std::move(it));
+        }
+        if (items.empty()) return;
 
-        double       cursor_x = x;
-        const double max_x    = x + content_width();
-        for (std::size_t i = 0; i < data.categories.size(); ++i) {
-            const std::string& name    = data.categories[i];
-            const double        text_w = label_width(regular_, state.FontSize, name);
-            const double        item_w = kSwatch + 4.0 + text_w + kGap * 2.0;
-            if (cursor_x + item_w > max_x && cursor_x > x) break;
-
-            painter_.GraphicsState.SetNonStrokingColor(pdf_color(point_color(data, i)));
-            painter_.DrawRectangle(cursor_x, y, kSwatch, kSwatch, PoDoFo::PdfPathDrawMode::Fill);
+        const double pad = 4.0, row_h = fs * 1.45, item_gap = fs * 1.2;
+        auto draw_item = [&](const Item& it, double ix, double iy) {  // iy: the row's bottom
+            const double sw = it.line ? swatch * 2.0 : swatch;
+            const double mid = iy + row_h / 2.0;
+            if (it.line) {
+                painter_.GraphicsState.SetStrokingColor(pdf_color(it.color));
+                painter_.GraphicsState.SetLineWidth(1.75);
+                painter_.DrawLine(ix, mid, ix + sw, mid);
+                painter_.GraphicsState.SetNonStrokingColor(pdf_color(it.color));
+                if (it.marker) draw_marker(ix + sw / 2.0, mid);
+                painter_.GraphicsState.SetStrokingColor(PoDoFo::PdfColor(0, 0, 0));
+                painter_.GraphicsState.SetLineWidth(1.0);
+            } else {
+                painter_.GraphicsState.SetNonStrokingColor(pdf_color(it.color));
+                painter_.DrawRectangle(ix, mid - swatch / 2.0, swatch, swatch, PoDoFo::PdfPathDrawMode::Fill);
+            }
             painter_.GraphicsState.SetNonStrokingColor(PoDoFo::PdfColor(0, 0, 0));
-            draw_line(regular_, kFontSize, name, cursor_x + kSwatch + 4.0, y + 1.0);
-            cursor_x += item_w;
+            draw_chart_text(lg.text, it.name, ix + sw + gap, mid - fs * 0.35);
+        };
+
+        if (lg.pos == Pos::Top || lg.pos == Pos::Bottom) {
+            // Rows of items that fit the width, each centred.
+            std::vector<std::vector<const Item*>> rows(1);
+            double row_w = 0.0;
+            for (const Item& it : items) {
+                const double add = (rows.back().empty() ? 0.0 : item_gap) + it.width;
+                if (!rows.back().empty() && row_w + add > w - 2.0 * pad) {
+                    rows.emplace_back();
+                    row_w = 0.0;
+                }
+                row_w += rows.back().empty() ? it.width : add;
+                rows.back().push_back(&it);
+            }
+            const double total_h = static_cast<double>(rows.size()) * row_h;
+            double ry = lg.pos == Pos::Top ? y + h - row_h : y + pad + total_h - row_h;
+            for (const auto& row : rows) {
+                double rw = 0.0;
+                for (const Item* it : row) rw += it->width;
+                rw += item_gap * static_cast<double>(row.size() - 1);
+                double ix = x + std::max((w - rw) / 2.0, pad);
+                for (const Item* it : row) {
+                    draw_item(*it, ix, ry);
+                    ix += it->width + item_gap;
+                }
+                ry -= row_h;
+            }
+            if (!lg.overlay) {
+                if (lg.pos == Pos::Bottom) y += total_h + pad;
+                h -= total_h + pad;
+            }
+        } else {
+            // A column, as wide as its widest entry (up to a third of the box).
+            double col_w = 0.0;
+            for (const Item& it : items) col_w = std::max(col_w, it.width);
+            col_w = std::min(col_w, w / 3.0);
+            const double total_h = static_cast<double>(items.size()) * row_h;
+            const double lx = lg.pos == Pos::Left ? x + pad : x + w - pad - col_w;
+            double ry = lg.pos == Pos::TopRight ? y + h - row_h : y + (h + total_h) / 2.0 - row_h;
+            for (const Item& it : items) {
+                draw_item(it, lx, ry);
+                ry -= row_h;
+            }
+            if (!lg.overlay) {
+                if (lg.pos == Pos::Left) x += col_w + 2.0 * pad;
+                w -= col_w + 2.0 * pad;
+            }
         }
     }
 
@@ -4391,7 +6042,10 @@ private:
         bool                                        percent = false;
     };
 
-    AxisTicks axis_ticks(const ChartData& data, const ChartAxis& axis, bool secondary, double label_size) {
+    // `axis_len`: the axis' length on the page; `along_x`: it runs
+    // horizontally, so labels need their width apart rather than a line.
+    AxisTicks axis_ticks(const ChartData& data, const ChartAxis& axis, bool secondary, double label_size,
+                         double axis_len, bool along_x) {
         AxisTicks at;
         at.percent = true;
         bool any = false;
@@ -4402,13 +6056,19 @@ private:
         }
         at.percent = at.percent && any;
         const auto [lo, hi] = axis_range(data, secondary);
-        at.scale = nice_axis_scale(lo, hi);
+        // Labels at least 1.2 lines apart (vertical axis), or their width
+        // plus a space (horizontal; estimated from the data's largest value).
+        const double min_gap = along_x
+            ? label_width(regular_, label_size, format_axis_value(std::max(std::abs(lo), std::abs(hi)), 0, data.numbers)) +
+                  label_size
+            : label_size * 1.2;
+        at.scale = nice_axis_scale(lo, hi, axis_len, min_gap, !at.percent);
         if (axis.min || axis.max) {
             // Explicit bounds: keep them, pick a nice step for the span.
             const double mn = axis.min.value_or(at.scale.min);
             const double mx = axis.max.value_or(at.scale.max);
             if (mx > mn) {
-                AxisScale sc = nice_axis_scale(0.0, mx - mn);
+                AxisScale sc = nice_axis_scale(0.0, mx - mn, axis_len, min_gap, false);
                 sc.min = mn;
                 sc.max = mx;
                 at.scale = sc;
@@ -4418,8 +6078,8 @@ private:
         for (int i = 0; i <= count; ++i) {
             const double v = at.scale.min + at.scale.step * i;
             const std::string label = at.percent
-                ? format_axis_value(v * 100.0, std::max(0, at.scale.decimals - 2)) + "%"
-                : format_axis_value(v, at.scale.decimals);
+                ? format_axis_value(v * 100.0, std::max(0, at.scale.decimals - 2), data.numbers) + "%"
+                : format_axis_value(v, at.scale.decimals, data.numbers);
             at.ticks.emplace_back(v, label);
             at.widest = std::max(at.widest, label_width(regular_, label_size, label));
         }
@@ -4431,61 +6091,106 @@ private:
     // (x, y)-(x+w, y+h): gridlines, axis labels and titles, then areas,
     // bars and lines in that order, as Excel layers them.
     void draw_chart_plot(const ResolvedChart& rc, double x, double y, double w, double h) {
-        constexpr double kLabelSize = 7.0;
-        constexpr double kTitleSize = 8.0;
         const ChartData& data = rc.data;
         const std::size_t ncat = data.categories.size();
         const bool horiz = rc.horizontal;
+        const ChartText& cat_text  = rc.cat_axis.labels;
+        const ChartText& val_text  = rc.val_axis.labels;
+        const ChartText& val2_text = rc.val2_axis.labels;
 
-        const AxisTicks primary   = axis_ticks(data, rc.val_axis, false, kLabelSize);
-        const AxisTicks secondary = rc.has_secondary ? axis_ticks(data, rc.val2_axis, true, kLabelSize) : AxisTicks{};
+        // Scales are picked for the plot's size: first for an estimate (to
+        // size the label margins), then for the plot as laid out.
+        AxisTicks primary   = axis_ticks(data, rc.val_axis, false, val_text.size, (horiz ? w : h) * 0.75, horiz);
+        AxisTicks secondary = rc.has_secondary
+            ? axis_ticks(data, rc.val2_axis, true, val2_text.size, h * 0.75, false) : AxisTicks{};
 
         double widest_cat = 0.0;
-        for (const std::string& c : data.categories) widest_cat = std::max(widest_cat, label_width(regular_, kLabelSize, c));
+        for (const std::string& c : data.categories) widest_cat = std::max(widest_cat, chart_text_width(cat_text, c));
+
+        // Axis titles: along the axis — turned for the side ones (Office's
+        // default, unless the title's bodyPr says rot="0").
+        // Long titles wrap between words, at limits worked out from
+        // LibreOffice with probes on two chart sizes: a flat title at 80 %
+        // of the box's width, a turned one at the box's height (after the
+        // chart title and legend: 165.3 pt stayed whole, 171.2 pt wrapped
+        // in a 168.3 pt box); each paragraph starts a line.
+        struct Title { const ChartAxis* axis; bool side; bool turned; double room; std::vector<std::string> lines; };
+        auto title_of = [&](const ChartAxis& a, bool side) {
+            Title t{&a, side, false, 0.0, {}};
+            if (a.title.empty() || a.deleted) return t;
+            t.turned = side && (!a.title_rot || std::abs(*a.title_rot) > 45.0);
+            const std::vector<std::string> paras = a.title_paragraphs.empty() ? std::vector<std::string>{a.title}
+                                                                                : a.title_paragraphs;
+            t.lines = wrap_chart_text(a.title_text, paras, t.turned ? h : w * 0.8);
+            const double size = a.title_text.size;
+            t.room = size * 1.3 + static_cast<double>(t.lines.size() - 1) * size * 1.2 + 2.0;
+            return t;
+        };
+        // horiz: categories on the left side, values along the bottom.
+        const Title cat_t  = title_of(rc.cat_axis, horiz);
+        const Title val_t  = title_of(rc.val_axis, !horiz);
+        const Title val2_t = rc.has_secondary ? title_of(rc.val2_axis, !horiz) : Title{&rc.val2_axis, false, false, 0.0, {}};
+        auto side_room = [](const Title& t) { return t.turned ? t.room : 0.0; };
+        auto top_room  = [](const Title& t) { return t.side && !t.turned ? t.room : 0.0; };
+        auto foot_room = [](const Title& t) { return !t.side ? t.room : 0.0; };
 
         // Paddings around the plot rectangle.
         double left, right, bottom, top;
         if (horiz) {
-            left   = std::min(widest_cat + 8.0, w * 0.4);
+            left   = std::min(widest_cat + 8.0, w * 0.4) + side_room(cat_t);
             right  = 8.0;
-            bottom = 14.0 + (rc.val_axis.title.empty() ? 0.0 : kTitleSize + 4.0);
-            top    = 4.0 + (rc.cat_axis.title.empty() ? 0.0 : kTitleSize + 4.0);
+            bottom = val_text.size * 1.4 + 4.0 + foot_room(val_t);
+            top    = 4.0 + top_room(cat_t);
         } else {
-            left   = std::max(24.0, primary.widest + 8.0);
-            right  = rc.has_secondary ? secondary.widest + 8.0 : 4.0;
-            bottom = 16.0 + (rc.cat_axis.title.empty() ? 0.0 : kTitleSize + 4.0);
-            top    = 4.0 + ((rc.val_axis.title.empty() && rc.val2_axis.title.empty()) ? 0.0 : kTitleSize + 4.0);
+            left   = std::max(24.0, primary.widest + 8.0) + side_room(val_t);
+            right  = (rc.has_secondary ? secondary.widest + 8.0 : 4.0) + side_room(val2_t);
+            bottom = cat_text.size * 1.4 + 6.0 + foot_room(cat_t);
+            top    = 4.0 + std::max(top_room(val_t), top_room(val2_t));
         }
         const double plot_x = x + left;
         const double plot_y = y + bottom;
         const double plot_w = std::max(w - left - right, 1.0);
         const double plot_h = std::max(h - bottom - top, 1.0);
+        primary = axis_ticks(data, rc.val_axis, false, val_text.size, horiz ? plot_w : plot_h, horiz);
+        if (rc.has_secondary) secondary = axis_ticks(data, rc.val2_axis, true, val2_text.size, plot_h, false);
 
-        // Axis titles, horizontal.
-        if (horiz) {
-            if (!rc.cat_axis.title.empty()) draw_line(regular_, kTitleSize, rc.cat_axis.title, x, y + h - kTitleSize);
-            if (!rc.val_axis.title.empty()) {
-                const double tw = label_width(regular_, kTitleSize, rc.val_axis.title);
-                draw_line(regular_, kTitleSize, rc.val_axis.title, plot_x + std::max((plot_w - tw) / 2.0, 0.0), y + 2.0);
+        auto draw_title = [&](const Title& t, bool right_side) {
+            if (t.room <= 0.0) return;
+            const ChartText& tx = t.axis->title_text;
+            const double step = tx.size * 1.2;
+            const std::size_t n = t.lines.size();
+            for (std::size_t i = 0; i < n; ++i) {
+                const std::string& s = t.lines[i];
+                if (t.turned) {
+                    // Reading upwards the next line is to the right; downwards, to the left.
+                    const bool upwards = !(t.axis->title_rot && *t.axis->title_rot > 45.0);
+                    const double left_edge = right_side ? x + w - t.room : x;
+                    const std::size_t col = upwards ? i : n - 1 - i;
+                    const double cx = left_edge + 1.0 + tx.size * 0.65 + static_cast<double>(col) * step;
+                    draw_chart_text_turned(tx, s, cx, plot_y + plot_h / 2.0, upwards);
+                } else if (t.side) {
+                    draw_chart_text(tx, s, right_side ? x + w - chart_text_width(tx, s) : x,
+                                    y + h - tx.size - static_cast<double>(i) * step);
+                } else {
+                    draw_chart_text(tx, s, plot_x + std::max((plot_w - chart_text_width(tx, s)) / 2.0, 0.0),
+                                    y + 2.0 + static_cast<double>(n - 1 - i) * step);
+                }
             }
-        } else {
-            if (!rc.val_axis.title.empty()) draw_line(regular_, kTitleSize, rc.val_axis.title, x, y + h - kTitleSize);
-            if (!rc.val2_axis.title.empty()) {
-                const double tw = label_width(regular_, kTitleSize, rc.val2_axis.title);
-                draw_line(regular_, kTitleSize, rc.val2_axis.title, x + w - tw, y + h - kTitleSize);
-            }
-            if (!rc.cat_axis.title.empty()) {
-                const double tw = label_width(regular_, kTitleSize, rc.cat_axis.title);
-                draw_line(regular_, kTitleSize, rc.cat_axis.title, plot_x + std::max((plot_w - tw) / 2.0, 0.0), y + 2.0);
-            }
-        }
+        };
+        draw_title(cat_t, false);
+        draw_title(val_t, false);
+        draw_title(val2_t, true);
 
         // Chart space: c = along the category axis, v = along the value axis.
         const double cat_len = horiz ? plot_h : plot_w;
         const double val_len = horiz ? plot_w : plot_h;
         const double slot    = cat_len / static_cast<double>(std::max<std::size_t>(ncat, 1));
+        // Bars need the room between ticks: on_ticks only without them.
+        const bool on_ticks = rc.on_ticks && ncat > 1 &&
+            std::none_of(data.groups.begin(), data.groups.end(), [](const ChartGroup& g) { return g.kind == ChartKind::Bar; });
         auto cat_center = [&](std::size_t i) {
             const std::size_t k = rc.cat_axis.reversed ? ncat - 1 - i : i;
+            if (on_ticks) return static_cast<double>(k) * cat_len / static_cast<double>(ncat - 1);
             return (static_cast<double>(k) + 0.5) * slot;
         };
         auto vpos = [&](const AxisScale& sc, double v) {
@@ -4501,43 +6206,128 @@ private:
             painter_.DrawRectangle(x0, y0, horiz ? dv : dc, horiz ? dc : dv, PoDoFo::PdfPathDrawMode::Fill);
         };
 
-        // Gridlines and value labels (primary), secondary labels on the right.
-        painter_.GraphicsState.SetStrokingColor(PoDoFo::PdfColor(0.75, 0.75, 0.75));
-        painter_.GraphicsState.SetLineWidth(0.5);
+        // Major/minor steps of the primary value axis (minor: a fifth, as in Office).
+        const double major_step = primary.ticks.size() >= 2 ? primary.ticks[1].first - primary.ticks[0].first
+                                                            : primary.scale.max - primary.scale.min;
+        auto set_line = [&](const ChartLine& l) {
+            painter_.GraphicsState.SetStrokingColor(pdf_color(l.color));
+            painter_.GraphicsState.SetLineWidth(l.width);
+        };
+
+        // Gridlines, as the template asks for them: across the plot at the
+        // value axis' (minor) ticks, and between categories for the
+        // category axis'.
+        if (rc.val_axis.minor_grid && major_step > 0.0) {
+            set_line(rc.val_axis.grid);
+            for (double v = primary.scale.min; v <= primary.scale.max + major_step * 1e-6; v += major_step / 5.0) {
+                const double p = vpos(primary.scale, v);
+                painter_.DrawLine(page_x(0, p), page_y(0, p), page_x(cat_len, p), page_y(cat_len, p));
+            }
+        }
+        if (rc.val_axis.major_grid) {
+            set_line(rc.val_axis.grid);
+            for (const auto& tick : primary.ticks) {
+                const double p = vpos(primary.scale, tick.first);
+                painter_.DrawLine(page_x(0, p), page_y(0, p), page_x(cat_len, p), page_y(cat_len, p));
+            }
+        }
+        if (rc.cat_axis.major_grid && ncat > 0) {
+            set_line(rc.cat_axis.grid);
+            for (std::size_t i = 0; i <= ncat; ++i) {
+                if (on_ticks && i == ncat) break;
+                const double c = on_ticks ? cat_center(i) : slot * static_cast<double>(i);
+                painter_.DrawLine(page_x(c, 0), page_y(c, 0), page_x(c, val_len), page_y(c, val_len));
+            }
+        }
+
+        // Value labels (primary), secondary labels on the right.
         for (const auto& [v, label] : primary.ticks) {
+            if (rc.val_axis.deleted) break;
             const double p = vpos(primary.scale, v);
-            painter_.DrawLine(page_x(0, p), page_y(0, p), page_x(cat_len, p), page_y(cat_len, p));
-            if (rc.val_axis.deleted) continue;
-            const double lw = label_width(regular_, kLabelSize, label);
-            if (horiz) draw_line(regular_, kLabelSize, label, plot_x + p - lw / 2.0, plot_y - 10.0);
-            else       draw_line(regular_, kLabelSize, label, plot_x - lw - 4.0, plot_y + p - kLabelSize * 0.3);
+            const double lw = chart_text_width(val_text, label);
+            if (horiz) draw_chart_text(val_text, label, plot_x + p - lw / 2.0, plot_y - val_text.size * 1.3);
+            else       draw_chart_text(val_text, label, plot_x - lw - 5.0, plot_y + p - val_text.size * 0.3);
         }
         if (rc.has_secondary && !rc.val2_axis.deleted && !horiz) {
             for (const auto& [v, label] : secondary.ticks) {
                 const double p = vpos(secondary.scale, v);
-                draw_line(regular_, kLabelSize, label, plot_x + plot_w + 4.0, plot_y + p - kLabelSize * 0.3);
+                draw_chart_text(val2_text, label, plot_x + plot_w + 5.0, plot_y + p - val2_text.size * 0.3);
             }
         }
 
         // Category labels; thinned out when they'd overlap.
         if (!rc.cat_axis.deleted && ncat > 0) {
-            const double room = horiz ? kLabelSize * 1.3 : widest_cat + 4.0;
+            const double room = horiz ? cat_text.size * 1.3 : widest_cat + 4.0;
             const std::size_t every = std::max<std::size_t>(1, static_cast<std::size_t>(std::ceil(room / std::max(slot, 1.0))));
             for (std::size_t i = 0; i < ncat; i += every) {
                 const double c  = cat_center(i);
-                const double lw = label_width(regular_, kLabelSize, data.categories[i]);
-                if (horiz) draw_line(regular_, kLabelSize, data.categories[i], plot_x - lw - 4.0, plot_y + c - kLabelSize * 0.3);
-                else       draw_line(regular_, kLabelSize, data.categories[i], plot_x + c - lw / 2.0, plot_y - 10.0);
+                const double lw = chart_text_width(cat_text, data.categories[i]);
+                if (horiz) draw_chart_text(cat_text, data.categories[i], plot_x - lw - 5.0, plot_y + c - cat_text.size * 0.3);
+                else       draw_chart_text(cat_text, data.categories[i], plot_x + c - lw / 2.0, plot_y - cat_text.size * 1.3);
             }
         }
 
-        // Axis lines: value axis along the plot edge, category axis at 0.
+        // Axis lines: value axis along the plot edge, category axis at 0;
+        // tick marks on them (out: away from the plot).
+        const double zero = vpos(primary.scale, 0.0);
+        auto ticks_along = [&](const ChartAxis& a, ChartAxis::Tick kind, double len, const std::vector<double>& at,
+                               double cross_at, bool along_cat, double outward) {
+            if (a.deleted || kind == ChartAxis::Tick::None || !a.line.shown) return;
+            const double from = kind == ChartAxis::Tick::In ? 0.0 : outward * len;
+            const double to   = kind == ChartAxis::Tick::Out ? 0.0 : -outward * len;
+            set_line(a.line);
+            for (const double p : at) {
+                // Along the category axis: positions in c at value cross_at;
+                // along the value axis: positions in v at category cross_at.
+                if (along_cat) {
+                    const double px = page_x(p, cross_at), py = page_y(p, cross_at);
+                    if (horiz) painter_.DrawLine(px + from, py, px + to, py);
+                    else       painter_.DrawLine(px, py + from, px, py + to);
+                } else {
+                    const double px = page_x(cross_at, p), py = page_y(cross_at, p);
+                    if (horiz) painter_.DrawLine(px, py + from, px, py + to);
+                    else       painter_.DrawLine(px + from, py, px + to, py);
+                }
+            }
+        };
+        if (rc.val_axis.line.shown && !rc.val_axis.deleted) {
+            set_line(rc.val_axis.line);
+            painter_.DrawLine(page_x(0, 0), page_y(0, 0), page_x(0, val_len), page_y(0, val_len));
+        }
+        if (rc.cat_axis.line.shown && !rc.cat_axis.deleted) {
+            set_line(rc.cat_axis.line);
+            painter_.DrawLine(page_x(0, zero), page_y(0, zero), page_x(cat_len, zero), page_y(cat_len, zero));
+        }
+        if (rc.has_secondary && !horiz && rc.val2_axis.line.shown && !rc.val2_axis.deleted) {
+            set_line(rc.val2_axis.line);
+            painter_.DrawLine(plot_x + plot_w, plot_y, plot_x + plot_w, plot_y + plot_h);
+        }
+        {
+            std::vector<double> major, minor;
+            for (const auto& tick : primary.ticks) major.push_back(vpos(primary.scale, tick.first));
+            if (major_step > 0.0) {
+                int k = 0;
+                for (double v = primary.scale.min; v <= primary.scale.max + major_step * 1e-6; v += major_step / 5.0, ++k) {
+                    if (k % 5 != 0) minor.push_back(vpos(primary.scale, v));
+                }
+            }
+            ticks_along(rc.val_axis, rc.val_axis.minor, 2.0, minor, 0.0, false, -1.0);
+            ticks_along(rc.val_axis, rc.val_axis.major, 4.0, major, 0.0, false, -1.0);
+            std::vector<double> bounds;
+            if (on_ticks) {
+                for (std::size_t i = 0; i < ncat; ++i) bounds.push_back(cat_center(i));
+            } else {
+                for (std::size_t i = 0; i <= ncat; ++i) bounds.push_back(slot * static_cast<double>(i));
+            }
+            ticks_along(rc.cat_axis, rc.cat_axis.major, 4.0, bounds, zero, true, -1.0);
+            if (rc.has_secondary && !horiz) {
+                std::vector<double> major2;
+                for (const auto& tick : secondary.ticks) major2.push_back(vpos(secondary.scale, tick.first));
+                ticks_along(rc.val2_axis, rc.val2_axis.major, 4.0, major2, cat_len, false, 1.0);
+            }
+        }
         painter_.GraphicsState.SetStrokingColor(PoDoFo::PdfColor(0, 0, 0));
         painter_.GraphicsState.SetLineWidth(0.75);
-        const double zero = vpos(primary.scale, 0.0);
-        painter_.DrawLine(page_x(0, 0), page_y(0, 0), page_x(0, val_len), page_y(0, val_len));
-        painter_.DrawLine(page_x(0, zero), page_y(0, zero), page_x(cat_len, zero), page_y(cat_len, zero));
-        if (rc.has_secondary && !horiz) painter_.DrawLine(plot_x + plot_w, plot_y, plot_x + plot_w, plot_y + plot_h);
 
         // Data labels, drawn over everything once the plot is done. Values
         // shown are the series' own (not a 100 % stack's shares).
@@ -4545,7 +6335,7 @@ private:
         auto label_text = [&](std::size_t si, std::size_t i) {
             const ChartSeriesData& s = data.series[si];
             const double raw = i < s.values.size() ? s.values[i] : 0.0;
-            return data_label_text(labels_at(s, i), s, i < ncat ? data.categories[i] : std::string(), raw);
+            return data_label_text(labels_at(s, i), s, i < ncat ? data.categories[i] : std::string(), raw, data.numbers);
         };
         // A bar from `base` to `end` (along the value axis) centred at `c`:
         // outside/inside its end, centred, or inside at its base.
@@ -4672,7 +6462,7 @@ private:
                 }
                 const PoDoFo::PdfColor color = pdf_color(data.series[si].color);
                 painter_.GraphicsState.SetStrokingColor(color);
-                painter_.GraphicsState.SetLineWidth(1.75);
+                painter_.GraphicsState.SetLineWidth(data.series[si].line_width);
                 painter_.DrawPath(path, PoDoFo::PdfPathDrawMode::Stroke);
                 if (data.series[si].marker) {
                     painter_.GraphicsState.SetNonStrokingColor(color);
@@ -4748,40 +6538,341 @@ private:
         painter_.DrawPath(diamond, PoDoFo::PdfPathDrawMode::Fill);
     }
 
-    // Single-row legend: swatch (a line with its marker for line series) +
-    // series name, left to right. Series that don't fit in one row are
-    // left out rather than wrapped.
-    void draw_chart_legend(const ChartData& data, double x, double y) {
-        constexpr double kSwatch   = 8.0;
-        constexpr double kGap      = 6.0;
-        constexpr double kFontSize = 8.0;
+    // ── Footnotes and endnotes ──────────────────────────────────────────────
 
-        double       cursor_x = x;
-        const double max_x    = x + content_width();
-        for (std::size_t i = 0; i < data.series.size(); ++i) {
-            const ChartSeriesData& ser = data.series[i];
-            const bool   line   = ser.kind == ChartKind::Line;
-            const double swatch = line ? kSwatch * 2.0 : kSwatch;
-            const double text_w = label_width(regular_, kFontSize, ser.name);
-            const double item_w = swatch + 4.0 + text_w + kGap * 2.0;
-            if (cursor_x + item_w > max_x && cursor_x > x) break;
+    // Part [from, to) of a footnote's laid-out height on one page.
+    struct NoteSlice {
+        std::string key;
+        double      from = 0.0, to = 0.0;
+        double      width = 0.0;  // text width it is laid out at
+    };
+    // What is left of a note continued on the next page.
+    struct CarriedNote {
+        std::string key;
+        double      from  = 0.0;   // offset shown so far
+        double      width = 0.0;   // it was measured (and split) at
+    };
+    // One page's footnote area: it sits on `bottom` (the body's bottom
+    // without it), starting with a separator line — the continuation one
+    // when it begins with the rest of a note from the page before.
+    struct PageNotes {
+        std::vector<NoteSlice> slices;
+        double                 bottom    = 0.0;
+        double                 separator = 0.0;  // its height
+        bool                   continuation = false;
+        double                 notice    = 0.0;  // height of the continuation notice under it, if any
+        double                 body_end  = 0.0;  // where the page's body text ended (beneathText)
+    };
+    struct NoteMeasure {
+        double              height = 0.0;
+        std::vector<double> cuts;  // offsets from the top where a page may split it
+    };
 
-            if (line) {
-                painter_.GraphicsState.SetStrokingColor(pdf_color(ser.color));
-                painter_.GraphicsState.SetLineWidth(1.75);
-                painter_.DrawLine(cursor_x, y + kSwatch / 2.0, cursor_x + swatch, y + kSwatch / 2.0);
-                painter_.GraphicsState.SetNonStrokingColor(pdf_color(ser.color));
-                if (ser.marker) draw_marker(cursor_x + swatch / 2.0, y + kSwatch / 2.0);
-                painter_.GraphicsState.SetStrokingColor(PoDoFo::PdfColor(0, 0, 0));
-                painter_.GraphicsState.SetLineWidth(1.0);
-            } else {
-                painter_.GraphicsState.SetNonStrokingColor(pdf_color(ser.color));
-                painter_.DrawRectangle(cursor_x, y, kSwatch, kSwatch, PoDoFo::PdfPathDrawMode::Fill);
+    // Whether `height` points of content at `top` lie outside the piece of
+    // a continued footnote being drawn.
+    bool outside_note_window(double top, double height) const {
+        return note_window_ && (top > note_window_->first + 0.5 || top - height < note_window_->second - 0.5);
+    }
+
+    // A note reference's mark ("ref": the note being laid out).
+    std::string note_mark(std::string_view key) const {
+        if (key == "ref") key = current_note_;
+        if (notes_ == nullptr) return {};
+        const auto it = notes_->ref_index.find(std::string(key));
+        if (it == notes_->ref_index.end()) return {};
+        const NoteSet::Ref& ref = notes_->refs[it->second];
+        if (ref.custom) return {};
+        const bool foot = NoteSet::is_foot(key);
+        const NotePr& pr = (foot ? notes_->foot_pr : notes_->end_pr)[ref.section];
+        // Numbered per page from the previous pass's layout; the first
+        // pass numbers them per section.
+        auto page_of = [&](const std::string& k) -> std::optional<std::size_t> {
+            if (known_ == nullptr) return std::nullopt;
+            const auto p = known_->note_pages.find(k);
+            if (p == known_->note_pages.end()) return std::nullopt;
+            return p->second;
+        };
+        const auto own_page = page_of(ref.key);
+        int n = pr.start;
+        for (std::size_t j = 0; j < it->second; ++j) {
+            const NoteSet::Ref& o = notes_->refs[j];
+            if (NoteSet::is_foot(o.key) != foot || o.custom) continue;
+            if (pr.restart == NotePr::Restart::EachSection && o.section != ref.section) continue;
+            if (pr.restart == NotePr::Restart::EachPage) {
+                if (own_page ? page_of(o.key) != own_page : o.section != ref.section) continue;
             }
-            painter_.GraphicsState.SetNonStrokingColor(PoDoFo::PdfColor(0, 0, 0));
-            draw_line(regular_, kFontSize, ser.name, cursor_x + swatch + 4.0, y + 1.0);
-            cursor_x += item_w;
+            ++n;
         }
+        return format_number(n, pr.fmt.empty() ? (foot ? "decimal" : "lowerRoman") : std::string_view(pr.fmt));
+    }
+
+    // Keys of the notes referenced on `line` / in `row`'s cells (nested
+    // tables too), appended in order.
+    static void collect_notes(const Line& line, std::vector<std::string>& out) {
+        for (const Box& b : line.boxes) {
+            if (!b.note.empty()) out.push_back(b.note);
+        }
+    }
+    static void collect_notes(const RowLayout& row, std::vector<std::string>& out) {
+        for (const CellLayout& cell : row.cells) {
+            if (cell.covered) continue;
+            for (const CellPart& part : cell.content.parts) {
+                if (part.kind == CellPart::Kind::Paragraph) {
+                    for (const Line& line : part.paragraph.lines) collect_notes(line, out);
+                } else if (part.kind == CellPart::Kind::NestedTable && part.nested) {
+                    for (const RowLayout& r : part.nested->rows) collect_notes(r, out);
+                }
+            }
+        }
+    }
+
+    // Footnotes among `keys` that still need a place, each once.
+    std::vector<std::string> new_footnotes(const std::vector<std::string>& keys) const {
+        std::vector<std::string> out;
+        if (notes_ == nullptr) return out;
+        for (const std::string& k : keys) {
+            if (NoteSet::is_foot(k) && !committed_.count(k) && notes_->blocks_of_note(k) != nullptr &&
+                std::find(out.begin(), out.end(), k) == out.end()) {
+                out.push_back(k);
+            }
+        }
+        return out;
+    }
+
+    PageNotes& current_page_notes() { return page_notes_[pages_.size() - 1]; }
+
+    static double notes_area_height(const PageNotes& pn) {
+        if (pn.slices.empty()) return 0.0;
+        double h = pn.separator + pn.notice;
+        for (const NoteSlice& s : pn.slices) h += s.to - s.from;
+        return h;
+    }
+
+    // The body ends above the page's footnote area.
+    void update_notes_limit() {
+        const PageNotes& pn = current_page_notes();
+        bottom_limit_ = pn.bottom + notes_area_height(pn);
+    }
+
+    // Top of page `pi`'s body area (below its header).
+    double page_top_of(std::size_t pi) const {
+        const PageInfo& info = pages_[pi];
+        const Section& sec = sections_[info.section];
+        const HeaderFooterPart& header = sec.hf.header[sec.hf.kind_for(info.number, info.first_in_section)];
+        double top = sec.pm.height_pt - sec.pm.margin_top_pt;
+        if (header.present) top = std::min(top, sec.pm.height_pt - sec.pm.header_dist_pt - header.height - kBlockGap);
+        return top;
+    }
+
+    // A footnote laid out at `width` points (the current text width if 0;
+    // cached): its height and the line/row boundaries it may be split at.
+    const NoteMeasure& measure_note(const std::string& key, double width = 0.0) {
+        if (width <= 0.0) width = content_width();
+        const auto cache_key = std::make_pair(key, std::llround(width * 100.0));
+        if (const auto it = note_measures_.find(cache_key); it != note_measures_.end()) return it->second;
+        NoteMeasure m;
+        if (const std::vector<pugi::xml_node>* blocks = notes_->blocks_of_note(key); blocks && parts_) {
+            const Numbering::Snapshot saved = numbering_.snapshot();
+            const CellStyle* const saved_cell = std::exchange(cell_style_, nullptr);
+            const std::string saved_note = std::exchange(current_note_, key);
+            std::vector<double>* const saved_cuts = std::exchange(cuts_, &m.cuts);
+            const double saved_right = std::exchange(pm_.margin_right_pt, pm_.width_pt - pm_.margin_left_pt - width);
+            m.height = measure_blocks(*blocks, notes_->part_of(key).rels, *parts_);
+            pm_.margin_right_pt = saved_right;
+            cuts_ = saved_cuts;
+            current_note_ = saved_note;
+            cell_style_ = saved_cell;
+            numbering_.restore(saved);
+        }
+        std::erase_if(m.cuts, [&](double c) { return c <= 0.01 || c > m.height + 0.01; });
+        if (m.cuts.empty() || m.cuts.back() < m.height - 0.01) m.cuts.push_back(m.height);
+        return note_measures_.emplace(cache_key, std::move(m)).first->second;
+    }
+
+    // Height of the footnote (or endnote) separator — its own note's
+    // paragraph, else a line of the default style.
+    double separator_height(bool endnote, bool continuation) {
+        const int slot = (endnote ? 2 : 0) + (continuation ? 1 : 0);
+        if (const auto it = separator_heights_.find(slot); it != separator_heights_.end()) return it->second;
+        const NoteSet::Part& part = endnote ? notes_->end : notes_->foot;
+        const std::vector<pugi::xml_node>& blocks = continuation ? part.continuation : part.separator;
+        double h = 0.0;
+        if (!blocks.empty() && parts_ != nullptr) {
+            const Numbering::Snapshot saved = numbering_.snapshot();
+            h = measure_blocks(blocks, part.rels, *parts_);
+            numbering_.restore(saved);
+        } else {
+            h = metrics_of(styles_.mark_style(pugi::xml_node{})).line;
+        }
+        separator_heights_[slot] = h;
+        return h;
+    }
+
+    // Height of the footnotes' continuation notice (text under a note that
+    // goes on on the next page); 0 when there is none or it prints nothing.
+    double notice_height() {
+        if (notice_height_) return *notice_height_;
+        double h = 0.0;
+        const std::vector<pugi::xml_node>& blocks = notes_->foot.notice;
+        const bool prints = std::any_of(blocks.begin(), blocks.end(), [&](pugi::xml_node b) {
+            return std::strcmp(b.name(), "w:tbl") == 0 || !fragments_of(b).empty() || !visible_drawings(b).empty();
+        });
+        if (prints && parts_ != nullptr) {
+            const Numbering::Snapshot saved = numbering_.snapshot();
+            h = measure_blocks(blocks, notes_->foot.rels, *parts_);
+            numbering_.restore(saved);
+        }
+        notice_height_ = h;
+        return h;
+    }
+
+    // Room the new footnotes of `keys` would take on this page (with the
+    // separator if they are its first); none while notes are carried over.
+    double footnotes_room(const std::vector<std::string>& keys) {
+        if (dry_run_ || no_page_break_ || notes_ == nullptr || pages_.empty() || !carry_.empty()) return 0.0;
+        const std::vector<std::string> fresh = new_footnotes(keys);
+        if (fresh.empty()) return 0.0;
+        double h = current_page_notes().slices.empty() ? separator_height(false, false) : 0.0;
+        for (const std::string& k : fresh) h += measure_note(k).height;
+        return h;
+    }
+
+    // The separator's line across the middle of its `h` high paragraph at
+    // `top`: Word's 2 inches, or the whole text width before a note
+    // continued from the page before.
+    void draw_note_separator(bool continuation, double top, double h) {
+        if (dry_run_) return;
+        const double y = top - h / 2.0;
+        const double w = continuation ? content_width() : std::min(144.0, content_width());
+        painter_.GraphicsState.SetStrokingColor(PoDoFo::PdfColor(0, 0, 0));
+        painter_.GraphicsState.SetLineWidth(0.5);
+        painter_.DrawLine(pm_.margin_left_pt, y, pm_.margin_left_pt + w, y);
+        painter_.GraphicsState.SetLineWidth(1.0);
+    }
+
+    // Whether the new footnotes of `keys` fit below `h` points of content
+    // starting at the cursor — at least their first line, as Word wants
+    // (the rest continues on the next page). An empty page takes them
+    // anyway.
+    bool footnotes_fit(const std::vector<std::string>& keys, double h) {
+        if (dry_run_ || no_page_break_ || notes_ == nullptr || pages_.empty() || keys.empty()) return true;
+        const std::vector<std::string> fresh = new_footnotes(keys);
+        if (fresh.empty() || !carry_.empty()) return true;  // carried over anyway
+        const PageNotes& pn = current_page_notes();
+        const double sep = pn.slices.empty() ? separator_height(false, false) : 0.0;
+        const double room = cursor_y_ - h - bottom_limit_ - sep;
+        double total = 0.0;
+        for (const std::string& k : fresh) total += measure_note(k).height;
+        if (total <= room + 0.01) return true;
+        if (measure_note(fresh.front()).cuts.front() + notice_height() <= room + 0.01) return true;
+        return !(cursor_y_ < page_top_);
+    }
+
+    // Gives the new footnotes of `keys`, referenced in the `h` points of
+    // content at the cursor, their place on this page: whole, or as much
+    // as fits with the rest carried over to the next page.
+    void commit_footnotes(const std::vector<std::string>& keys, double h) {
+        if (dry_run_ || no_page_break_ || notes_ == nullptr || pages_.empty() || keys.empty()) return;
+        for (const std::string& key : new_footnotes(keys)) {
+            committed_.insert(key);
+            note_pages_[key] = pages_.size() - 1;
+            const double width = content_width();
+            if (!carry_.empty()) {  // notes stay in order
+                carry_.push_back({key, 0.0, width});
+                continue;
+            }
+            PageNotes& pn = current_page_notes();
+            const bool first = pn.slices.empty();
+            const double sep = first ? separator_height(false, false) : 0.0;
+            const NoteMeasure& m = measure_note(key);
+            const double room = cursor_y_ - h - bottom_limit_ - sep;
+            double cut = m.height;
+            if (m.height > room + 0.01) {
+                // Split: the continuation notice goes under the first part.
+                const double split_room = room - notice_height();
+                cut = 0.0;
+                for (double c : m.cuts) {
+                    if (c <= split_room + 0.01) cut = c;
+                }
+                if (cut <= 0.0 && first && !(cursor_y_ < page_top_)) cut = m.cuts.front();
+                if (cut >= m.height - 0.01) cut = m.height;
+            }
+            if (cut > 0.0) {
+                if (first) {
+                    pn.separator    = sep;
+                    pn.continuation = false;
+                }
+                pn.slices.push_back({key, 0.0, cut, width});
+            }
+            if (cut < m.height - 0.01) {
+                carry_.push_back({key, cut, width});
+                if (cut > 0.0) pn.notice = notice_height();
+            }
+            update_notes_limit();
+        }
+    }
+
+    // A new page starts with what is left of footnotes from the page
+    // before, leaving room for a couple of body lines.
+    void place_carried_footnotes() {
+        if (carry_.empty()) return;
+        constexpr double kBodyRoom = 28.0;
+        PageNotes& pn = current_page_notes();
+        pn.continuation = carry_.front().from > 0.0;
+        pn.separator    = separator_height(false, pn.continuation);
+        double room = page_top_ - pn.bottom - pn.separator - kBodyRoom;
+        while (!carry_.empty()) {
+            auto& [key, from, width] = carry_.front();
+            const NoteMeasure& m = measure_note(key, width);
+            double to = m.height;
+            if (to - from > room + 0.01) {
+                const double split_room = room - notice_height();
+                to = from;
+                for (double c : m.cuts) {
+                    if (c > from + 0.01 && c - from <= split_room + 0.01) to = c;
+                }
+                if (to <= from + 0.01) {
+                    if (!pn.slices.empty()) break;
+                    // At least one line per page, however tall.
+                    for (double c : m.cuts) {
+                        if (c > from + 0.01) { to = c; break; }
+                    }
+                }
+            }
+            pn.slices.push_back({key, from, to, width});
+            room -= to - from;
+            if (to < m.height - 0.01) {
+                from = to;
+                pn.notice = notice_height();
+                break;
+            }
+            carry_.pop_front();
+        }
+        update_notes_limit();
+    }
+
+    // Endnotes referenced in section `section` (all: the whole document)
+    // after the body text: separator, then each note in reference order.
+    void draw_endnotes(std::optional<std::size_t> section, const PartMap& parts) {
+        std::vector<std::string> keys;
+        for (const NoteSet::Ref& r : notes_->refs) {
+            if (!NoteSet::is_foot(r.key) && (!section || r.section == *section) &&
+                notes_->blocks_of_note(r.key) != nullptr) {
+                keys.push_back(r.key);
+            }
+        }
+        if (keys.empty()) return;
+        advance(flow_.pending_after);
+        flow_.reset();
+        const double sep = separator_height(true, false);
+        ensure_space(sep);
+        draw_note_separator(false, cursor_y_, sep);
+        cursor_y_ -= sep;
+        for (const std::string& key : keys) {
+            current_note_ = key;
+            draw_blocks(*notes_->blocks_of_note(key), notes_->end.rels, parts);
+        }
+        current_note_.clear();
     }
 
     struct PageInfo {
@@ -4796,15 +6887,29 @@ private:
     FontBook&                 fonts_;
     PoDoFo::PdfFont&          regular_;   // document default font: chart text
     PoDoFo::PdfFont&          bold_;
-    const pugi::xml_document& styles_doc_;
     const StyleSheet&         styles_;
     Numbering&                numbering_;
     const Theme&              theme_;
+    const std::string         doc_lang_;  // for chart number separators
     double                    default_tab_;
     PoDoFo::PdfPainter        painter_;
     FlowState                 flow_;
     double                    cursor_y_      = 0.0;
     double                    page_top_      = 0.0;  // body top of the current page
+    // Columns of the current section on this page (see begin_columns()):
+    // the column laid out, the top they start at, the lowest point reached
+    // so far, the section's own side margins and the body's real bottom
+    // (bottom_limit_ may be a levelled column's).
+    Columns                   columns_;
+    std::size_t               col_           = 0;
+    double                    col_top_       = 0.0;
+    double                    col_low_       = 0.0;
+    double                    page_left_     = 0.0;
+    double                    page_right_    = 0.0;
+    double                    body_bottom_   = 0.0;
+    struct Balance { std::size_t page = 0; double height = 0.0; };
+    std::optional<Balance>    balance_;
+    bool                      cols_open_     = false;  // begin_columns() not yet closed
     double                    bottom_limit_  = 0.0;  // body bottom of the current page
     std::vector<PageInfo>     pages_;
     std::size_t               section_       = 0;
@@ -4825,7 +6930,32 @@ private:
     std::size_t               float_page_    = 0;
     struct Band { double top = 0.0, bottom = 0.0; };
     std::vector<Band>         bands_;
-    bool                      in_cell_       = false;  // anchored drawings stay inline in cells
+    // wrapSquare/Tight/Through objects of the current page: lines of text
+    // may go beside them (on the side `text` says), other content not.
+    struct Side {
+        double top = 0.0, bottom = 0.0, left = 0.0, right = 0.0;
+        enum class Text { Larger, Left, Right } text = Text::Larger;
+    };
+    std::vector<Side>         sides_;
+    std::optional<Color>      shape_text_color_;  // text of the shape being laid out: its style's font color
+    // Footnotes and endnotes: the notes, the one being laid out (its
+    // <w:footnoteRef> mark), the page each footnote's reference is on,
+    // footnotes already given a place, each page's footnote area, what is
+    // left of footnotes continued on the next page (key, offset shown so
+    // far), line boundaries a note's measuring records (where it may be
+    // split), measured notes and separators.
+    const NoteSet*            notes_         = nullptr;
+    const PartMap*            parts_         = nullptr;
+    std::string               current_note_;
+    std::map<std::string, std::size_t> note_pages_;
+    std::set<std::string>     committed_;
+    std::map<std::size_t, PageNotes> page_notes_;
+    std::deque<CarriedNote>   carry_;
+    std::vector<double>*      cuts_          = nullptr;
+    std::map<std::pair<std::string, long long>, NoteMeasure> note_measures_;
+    std::map<int, double>     separator_heights_;
+    std::optional<double>     notice_height_;
+    std::optional<std::pair<double, double>> note_window_;  // top, bottom of the piece being drawn
 };
 
 // Whether the body has a field that needs a finished layout: PAGEREF
@@ -4885,7 +7015,7 @@ void render_native_pdf(const pugi::xml_document& document,
     // empty (no styles → built-in defaults, no numbering → no list markers).
     auto load_part = [&](const std::string& name, pugi::xml_document& out) {
         if (const auto it = parts.find(name); it != parts.end()) {
-            out.load_buffer(it->second.data(), it->second.size());
+            out.load_buffer(it->second.data(), it->second.size(), kXmlParse);
         }
     };
     pugi::xml_document styles_doc;
@@ -4899,11 +7029,20 @@ void render_native_pdf(const pugi::xml_document& document,
     for (const auto& [name, bytes] : parts) {
         if (name.rfind("word/theme/", 0) == 0 && name.find("/_rels/") == std::string::npos) {
             pugi::xml_document theme_doc;
-            if (theme_doc.load_buffer(bytes.data(), bytes.size())) theme.load(theme_doc);
+            if (theme_doc.load_buffer(bytes.data(), bytes.size(), kXmlParse)) theme.load(theme_doc);
             break;
         }
     }
-    const StyleSheet styles(styles_doc, theme);
+    bool normal_beats_table_style = false;
+    for (pugi::xml_node cs : settings_doc.child("w:settings").child("w:compat").children("w:compatSetting")) {
+        if (std::strcmp(cs.attribute("w:name").value(), "overrideTableStyleFontSizeAndJustification") == 0) {
+            const std::string_view v = cs.attribute("w:val").value();
+            normal_beats_table_style = v == "1" || v == "true" || v == "on";
+        }
+    }
+    const bool add_spacing =
+        on_off(settings_doc.child("w:settings").child("w:compat").child("w:doNotUseHTMLParagraphAutoSpacing"));
+    const StyleSheet styles(styles_doc, theme, normal_beats_table_style, add_spacing);
     Numbering numbering(numbering_doc);
     const double default_tab = twips_to_pt(
         settings_doc.child("w:settings").child("w:defaultTabStop").attribute("w:val").as_llong(720));
@@ -4930,6 +7069,7 @@ void render_native_pdf(const pugi::xml_document& document,
         // previous section, as in Word.
         if (si > 0) sec.hf = sections[si - 1].hf;
         sec.pm            = read_page_metrics(sect);
+        sec.columns       = read_columns(sect, sec.pm);
         sec.hf.title_page = on_off(sect.child("w:titlePg"));
         sec.hf.even_and_odd = even_and_odd;
         const std::string_view type = sect.child("w:type").attribute("w:val").value();
@@ -4952,7 +7092,7 @@ void render_native_pdf(const pugi::xml_document& document,
                 const auto part = parts.find(part_name);
                 if (part == parts.end()) continue;
                 auto doc = std::make_unique<pugi::xml_document>();
-                if (!doc->load_buffer(part->second.data(), part->second.size())) continue;
+                if (!doc->load_buffer(part->second.data(), part->second.size(), kXmlParse)) continue;
 
                 const std::string file = std::filesystem::path(part_name).filename().string();
                 HeaderFooterPart& hfp = slots[static_cast<std::size_t>(slot)];
@@ -4967,6 +7107,9 @@ void render_native_pdf(const pugi::xml_document& document,
         load_hf("w:footerReference", sec.hf.footer);
     }
 
+    NoteSet notes;
+    notes.load(parts, sections, sect_prs, settings_doc.child("w:settings"));
+
     if (strict_mode_enabled()) {
         UnsupportedScan scan(parts, styles, numbering);
         scan.scan(body, rels);
@@ -4979,6 +7122,9 @@ void render_native_pdf(const pugi::xml_document& document,
                     }
                 }
             }
+        }
+        for (const NoteSet::Part* part : {&notes.foot, &notes.end}) {
+            if (part->doc) scan.scan(part->doc->first_child(), part->rels);
         }
         if (!scan.found().empty()) {
             std::string list;
@@ -5002,12 +7148,13 @@ void render_native_pdf(const pugi::xml_document& document,
             auto doc = std::make_unique<PdfMemDocument>();
             Numbering pass_numbering(numbering_doc);
             FontBook fonts(*doc, default_style.font);
-            Layout layout(*doc, sections, fonts, default_style, styles_doc, styles, pass_numbering, theme,
-                          default_tab, known);
+            Layout layout(*doc, sections, fonts, default_style, styles, pass_numbering, theme,
+                          default_tab, known, &notes);
             layout.measure_headers_footers(parts);
             layout.layout_sections(rels, parts);
             layout.finish();
             layout.draw_headers_footers(parts);
+            layout.draw_footnotes(parts);
             learned = layout.facts();
             return doc;
         };
@@ -5020,6 +7167,12 @@ void render_native_pdf(const pugi::xml_document& document,
         LayoutFacts facts;
         std::unique_ptr<PdfMemDocument> doc = render(nullptr, facts);
         bool more_passes = body_needs_layout_facts(body) || has_behind_floats(body);
+        // Footnotes numbered per page need to know where their references landed.
+        if (notes.has_footnotes()) {
+            for (const NotePr& pr : notes.foot_pr) {
+                if (pr.restart == NotePr::Restart::EachPage) more_passes = true;
+            }
+        }
         for (const Section& sec : sections) {
             for (const auto* set : {&sec.hf.header, &sec.hf.footer}) {
                 for (const HeaderFooterPart& part : *set) {

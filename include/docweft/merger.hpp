@@ -47,11 +47,29 @@ public:
     /// Throws ReportException{CantOpenTemplate | CantCopyDocxTemplate}.
     virtual void load(const std::string& path) = 0;
 
+    /// Whether save() may convert .pdf/.html through Microsoft Word.
+    enum class WordConversion {
+        /// Windows: yes, unless DOCWEFT_NO_MSWORD is set. macOS: only when
+        /// DOCWEFT_MSWORD is set — there Word asks for Automation and
+        /// file-access permissions and comes to the front, so a host opts
+        /// in on purpose.
+        Default,
+        /// Word first in the chain (Windows, macOS), whatever the env says.
+        Enabled,
+        /// Never Word, whatever the env says.
+        Disabled,
+    };
+
+    /// Choose whether save() tries Microsoft Word (see WordConversion).
+    /// Takes effect on the next save(); no effect on Linux.
+    virtual void setWordConversion(WordConversion mode) = 0;
+
     /// Save the current document to disk.
     /// Format is inferred from the file extension:
     ///   .docx → native save
-    ///   .pdf / .html → first working converter of: Microsoft Word (Windows,
-    ///                  macOS), LibreOffice, native PDF renderer
+    ///   .pdf / .html → first working converter of: Microsoft Word (Windows;
+    ///                  macOS when opted in, see setWordConversion),
+    ///                  LibreOffice, native PDF renderer
     ///                  (DOCWEFT_ENABLE_NATIVE_PDF, .pdf only), remote
     ///                  converter (DOCWEFT_ENABLE_REMOTE_CONVERTER +
     ///                  DOCWEFT_CONVERTER_URL, .pdf only)
@@ -191,7 +209,14 @@ public:
     /// text — only the string itself is replaced, not the styling. (A
     /// title with several differently-formatted runs still collapses to
     /// one run using the first run's style, since this call sets one
-    /// plain string.)
+    /// plain string.) A title created here is styled as Word styles one
+    /// added in its UI: 14 pt (axis titles: 10 pt bold), and
+    /// `<c:overlay val="0"/>` so it doesn't overlay the plot.
+    ///
+    /// The template's layout isn't changed: if its plot area has a manual
+    /// layout (`c:plotArea/c:layout/c:manualLayout`), the plot keeps its
+    /// size and a new title may overlap it — leave the plot area on
+    /// automatic layout in templates whose titles are set here.
     ///
     /// Throws ReportException:
     ///   - InvalidBookmark: bookmark not found, not in a <w:p>, or that

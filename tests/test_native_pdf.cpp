@@ -11,15 +11,19 @@
 #include <pugixml.hpp>
 
 #include "docweft/error.hpp"
+#include "docx/merger.hpp"
 #include "docx/pdf_native.hpp"
 #include "fixture_helpers.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <set>
 #include <sstream>
 #include <cstdlib>
 #include <filesystem>
+#include <random>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -29,6 +33,16 @@ namespace fs = std::filesystem;
 namespace {
 
 using Parts = std::unordered_map<std::string, std::string>;
+
+// A temp PDF path no other test process uses (ctest -j runs each case in
+// its own process, so fixed names race).
+fs::path temp_pdf(const std::string& stem) {
+    static const unsigned long long tag = std::random_device{}() ^
+        static_cast<unsigned long long>(std::chrono::steady_clock::now().time_since_epoch().count());
+    static unsigned counter = 0;
+    return fs::temp_directory_path() /
+           (stem + "_" + std::to_string(tag) + "_" + std::to_string(counter++) + ".pdf");
+}
 
 constexpr const char* kNamespaces =
     R"( xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main")"
@@ -71,9 +85,9 @@ Parts make_parts(const std::string& body, const std::vector<Rel>& rels = {},
 std::vector<std::string> render_pages(const Parts& parts) {
     pugi::xml_document doc;
     const std::string& xml = parts.at("word/document.xml");
-    REQUIRE(doc.load_buffer(xml.data(), xml.size()));
+    REQUIRE(doc.load_buffer(xml.data(), xml.size(), docweft::docx::kXmlParse));
 
-    const fs::path out = fs::temp_directory_path() / "docweft_native_test.pdf";
+    const fs::path out = temp_pdf("docweft_native_test");
     docweft::docx::render_native_pdf(doc, parts, out);
 
     PoDoFo::PdfMemDocument pdf;
@@ -100,9 +114,9 @@ struct TextEntry {
 std::vector<TextEntry> render_entries(const Parts& parts) {
     pugi::xml_document doc;
     const std::string& xml = parts.at("word/document.xml");
-    REQUIRE(doc.load_buffer(xml.data(), xml.size()));
+    REQUIRE(doc.load_buffer(xml.data(), xml.size(), docweft::docx::kXmlParse));
 
-    const fs::path out = fs::temp_directory_path() / "docweft_native_test_entries.pdf";
+    const fs::path out = temp_pdf("docweft_native_test_entries");
     docweft::docx::render_native_pdf(doc, parts, out);
 
     PoDoFo::PdfMemDocument pdf;
@@ -172,6 +186,30 @@ std::string chart_xml(const std::string& type_element_open, const std::string& t
            "</c:ser>" + type_element_close +
            R"(<c:catAx><c:axId val="1"/><c:title><c:tx><c:rich><a:bodyPr/><a:p><a:r><a:t>Quarter</a:t></a:r></a:p></c:rich></c:tx></c:title></c:catAx>)"
            "</c:plotArea></c:chart></c:chartSpace>";
+}
+
+// A <wps:wsp> drawing in a run: inline, or anchored in front of the text
+// with no wrapping at (x, y) points from the page's top-left corner.
+// `sp_pr` goes into <wps:spPr> after the geometry, `style` is the whole
+// <wps:style> (or empty), `body_pr` the <wps:bodyPr> attributes and
+// children, `content` the text box's blocks (no text box if empty).
+std::string shape_run(bool anchored, double x, double y, double w, double h, const std::string& geom,
+                      const std::string& sp_pr, const std::string& style = {},
+                      const std::string& content = {}, const std::string& body_pr = "<wps:bodyPr/>") {
+    auto emu = [](double pt) { return std::to_string(static_cast<long long>(pt * 12700)); };
+    const std::string extent = R"(<wp:extent cx=")" + emu(w) + R"(" cy=")" + emu(h) + R"("/>)";
+    const std::string graphic =
+        R"(<wp:docPr id="7" name="s"/><a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">)"
+        R"(<wps:wsp xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:cNvSpPr/><wps:spPr>)"
+        R"(<a:xfrm><a:off x="0" y="0"/><a:ext cx=")" + emu(w) + R"(" cy=")" + emu(h) + R"("/></a:xfrm>)"
+        R"(<a:prstGeom prst=")" + geom + R"("><a:avLst/></a:prstGeom>)" + sp_pr + "</wps:spPr>" + style +
+        (content.empty() ? "" : "<wps:txbx><w:txbxContent>" + content + "</w:txbxContent></wps:txbx>") + body_pr +
+        "</wps:wsp></a:graphicData></a:graphic>";
+    if (!anchored) return "<w:r><w:drawing><wp:inline>" + extent + graphic + "</wp:inline></w:drawing></w:r>";
+    return R"(<w:r><w:drawing><wp:anchor distT="0" distB="0" distL="0" distR="0" simplePos="0" relativeHeight="5" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1">)"
+           R"(<wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="page"><wp:posOffset>)" + emu(x) +
+           R"(</wp:posOffset></wp:positionH><wp:positionV relativeFrom="page"><wp:posOffset>)" + emu(y) +
+           "</wp:posOffset></wp:positionV>" + extent + "<wp:wrapNone/>" + graphic + "</wp:anchor></w:drawing></w:r>";
 }
 
 std::string chart_paragraph(const std::string& rid) {
@@ -300,6 +338,38 @@ TEST_CASE("native PDF draws list markers", "[native_pdf]") {
     }
 }
 
+TEST_CASE("native PDF draws Symbol and Wingdings characters as Unicode", "[native_pdf]") {
+    const std::string numbering =
+        std::string(R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:numbering)") + kNamespaces + ">"
+        R"(<w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/><w:lvlText w:val="&#xF0D8;"/>)"
+        R"(<w:rPr><w:rFonts w:ascii="Wingdings" w:hAnsi="Wingdings"/></w:rPr></w:lvl></w:abstractNum>)"
+        R"(<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>)";
+    const std::string body =
+        R"(<w:p><w:r><w:t xml:space="preserve">done </w:t></w:r><w:r><w:sym w:font="Wingdings" w:char="F0FE"/></w:r>)"
+        R"(<w:r><w:sym w:font="Wingdings" w:char="F0FC"/></w:r><w:r><w:sym w:font="Symbol" w:char="F061"/></w:r>)"
+        R"(<w:r><w:sym w:font="Symbol" w:char="B3"/></w:r></w:p>)"
+        R"(<w:p><w:r><w:rPr><w:rFonts w:ascii="Wingdings" w:hAnsi="Wingdings"/></w:rPr><w:t>&#xFD;o</w:t></w:r></w:p>)"
+        R"(<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>item</w:t></w:r></w:p>)";
+    // Strict mode doesn't object: every symbol here has a Unicode equivalent.
+    const std::string text = all_text(render_pages(
+        make_parts(body, {{"rIdN", "numbering", "numbering.xml"}}, {{"word/numbering.xml", numbering}})));
+    for (const char* expected : {"☑", "✔", "α", "≥", "☒", "□", "➢"}) {
+        INFO(expected);
+        REQUIRE(contains(text, expected));
+    }
+    REQUIRE_FALSE(contains(text, "\xC3\xBD"));  // "ý", the Wingdings byte itself
+}
+
+TEST_CASE("native PDF keeps a run that holds only a space", "[native_pdf]") {
+    const auto entries = render_entries(make_parts(
+        R"(<w:p><w:r><w:t>AAA</w:t></w:r><w:r><w:t xml:space="preserve"> </w:t></w:r><w:r><w:t>BBB</w:t></w:r></w:p>)"));
+    std::string line;
+    for (const auto& e : entries) line += "[" + e.text + "@" + std::to_string(e.x) + "]";
+    INFO(line);
+    CHECK(contains(line, "AAA BBB"));
+}
+
+
 TEST_CASE("native PDF draws chart and axis titles", "[native_pdf]") {
     const auto parts = make_parts(
         chart_paragraph("rIdC"), {{"rIdC", "chart", "charts/chart1.xml"}},
@@ -378,9 +448,10 @@ TEST_CASE("native PDF repeats table header rows on every page", "[native_pdf]") 
 }
 
 // A chart part with the given plot-area content (groups and axes).
-std::string chart_with_plot(const std::string& plot) {
+// `after`: what follows the plot area in <c:chart> (a <c:legend>).
+std::string chart_with_plot(const std::string& plot, const std::string& after = {}) {
     return std::string(R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?><c:chartSpace)") + kNamespaces +
-           "><c:chart><c:plotArea>" + plot + "</c:plotArea></c:chart></c:chartSpace>";
+           "><c:chart><c:plotArea>" + plot + "</c:plotArea>" + after + "</c:chart></c:chartSpace>";
 }
 
 std::string series_xml(int idx, const std::string& name, double q1, double q2) {
@@ -396,9 +467,9 @@ constexpr const char* kAxes =
     R"(<c:catAx><c:axId val="1"/><c:axPos val="b"/><c:crossAx val="2"/></c:catAx>)"
     R"(<c:valAx><c:axId val="2"/><c:axPos val="l"/><c:crossAx val="1"/></c:valAx>)";
 
-std::vector<TextEntry> render_chart(const std::string& plot) {
+std::vector<TextEntry> render_chart(const std::string& plot, const std::string& after = {}) {
     return render_entries(make_parts(chart_paragraph("rIdC"), {{"rIdC", "chart", "charts/chart1.xml"}},
-                                     {{"word/charts/chart1.xml", chart_with_plot(plot)}}, kSect));
+                                     {{"word/charts/chart1.xml", chart_with_plot(plot, after)}}, kSect));
 }
 
 bool has_entry(const std::vector<TextEntry>& entries, const std::string& text) {
@@ -436,8 +507,8 @@ TEST_CASE("native PDF draws horizontal and stacked bar charts", "[native_pdf]") 
         const auto entries = render_chart(
             R"(<c:barChart><c:barDir val="col"/><c:grouping val="stacked"/>)" + series_xml(0, "A", 12450, 21080) +
             series_xml(1, "B", 10000, 10000) + R"(<c:axId val="1"/><c:axId val="2"/></c:barChart>)" + kAxes);
-        REQUIRE(has_entry(entries, "40000"));  // sum 31080; clustered would stop at 25000
-        REQUIRE_FALSE(has_entry(entries, "25000"));
+        // Sum 31080 (+5 % headroom): the axis goes past it; clustered would stop at 25000.
+        REQUIRE((has_entry(entries, "35000") || has_entry(entries, "40000")));
     }
     SECTION("100 % stacked: a percent axis") {
         const auto entries = render_chart(
@@ -455,12 +526,65 @@ TEST_CASE("native PDF draws combo charts with a secondary axis", "[native_pdf]")
         R"(<c:lineChart><c:grouping val="standard"/>)" + series_xml(1, "Margin", 22, 27) +
         R"(<c:marker val="1"/><c:axId val="3"/><c:axId val="4"/></c:lineChart>)" + kAxes +
         R"(<c:catAx><c:axId val="3"/><c:delete val="1"/><c:axPos val="b"/><c:crossAx val="4"/></c:catAx>)"
-        R"(<c:valAx><c:axId val="4"/><c:axPos val="r"/><c:crossAx val="3"/></c:valAx>)");
+        R"(<c:valAx><c:axId val="4"/><c:axPos val="r"/><c:crossAx val="3"/></c:valAx>)",
+        R"(<c:legend><c:legendPos val="b"/></c:legend>)");
     REQUIRE(has_entry(entries, "25000"));  // primary axis, left
     REQUIRE(has_entry(entries, "30"));     // secondary axis, right
     REQUIRE(entry_with(entries, "30").x > entry_with(entries, "25000").x + 100.0);
     REQUIRE(has_entry(entries, "Revenue"));
     REQUIRE(has_entry(entries, "Margin"));
+}
+
+TEST_CASE("native PDF puts the chart legend where <c:legendPos> says", "[native_pdf]") {
+    const std::string bars = R"(<c:barChart><c:barDir val="col"/><c:grouping val="clustered"/>)" +
+                             series_xml(0, "Alpha", 3, 5) + series_xml(1, "Beta", 4, 2) +
+                             R"(<c:axId val="1"/><c:axId val="2"/></c:barChart>)" + kAxes;
+    SECTION("no <c:legend>: no legend") {
+        const auto entries = render_chart(bars);
+        CHECK_FALSE(has_entry(entries, "Alpha"));
+        CHECK(has_entry(entries, "Q1"));
+    }
+    SECTION("bottom: one centred row under the category labels") {
+        const auto entries = render_chart(bars, R"(<c:legend><c:legendPos val="b"/><c:overlay val="0"/></c:legend>)");
+        const TextEntry& a = entry_with(entries, "Alpha");
+        const TextEntry& b = entry_with(entries, "Beta");
+        CHECK(a.y == Catch::Approx(b.y).margin(0.5));
+        CHECK(a.y < entry_with(entries, "Q1").y);
+        // One row: extracted as one piece of text, or two side by side.
+        if (&a == &b) CHECK(a.text.find("Alpha") < a.text.find("Beta"));
+        else CHECK(b.x > a.x);
+    }
+    SECTION("right (also the default position): a column right of the plot, inside the chart") {
+        for (const char* legend : {R"(<c:legend><c:legendPos val="r"/></c:legend>)", "<c:legend/>"}) {
+            INFO(legend);
+            const auto entries = render_chart(bars, legend);
+            const TextEntry& a = entry_with(entries, "Alpha");
+            const TextEntry& b = entry_with(entries, "Beta");
+            CHECK(a.x == Catch::Approx(b.x).margin(0.5));
+            CHECK(a.y > b.y);
+            CHECK(a.x > entry_with(entries, "Q2").x);
+            // Within the chart's 236 pt wide extent from the left margin.
+            CHECK(a.x < 56.7 + 236.0);
+            CHECK(b.y > entry_with(entries, "Q1").y);
+        }
+    }
+    SECTION("a deleted entry is left out") {
+        const auto entries = render_chart(
+            bars, R"(<c:legend><c:legendPos val="t"/><c:legendEntry><c:idx val="1"/><c:delete val="1"/></c:legendEntry></c:legend>)");
+        CHECK(has_entry(entries, "Alpha"));
+        CHECK_FALSE(has_entry(entries, "Beta"));
+        CHECK(entry_with(entries, "Alpha").y > entry_with(entries, "Q1").y);
+    }
+    SECTION("pie: the categories, right of the pie") {
+        const auto entries = render_chart(R"(<c:pieChart><c:varyColors val="1"/>)" + series_xml(0, "S", 3, 5) +
+                                              "</c:pieChart>",
+                                          R"(<c:legend><c:legendPos val="r"/></c:legend>)");
+        const TextEntry& q1 = entry_with(entries, "Q1");
+        const TextEntry& q2 = entry_with(entries, "Q2");
+        CHECK(q1.x == Catch::Approx(q2.x).margin(0.5));
+        CHECK(q1.y > q2.y);
+        CHECK(q1.x > 56.7 + 236.0 / 2.0);  // past the middle of the chart, where the pie is
+    }
 }
 
 TEST_CASE("native PDF lays out several sections", "[native_pdf]") {
@@ -489,7 +613,7 @@ TEST_CASE("native PDF lays out several sections", "[native_pdf]") {
 
     pugi::xml_document doc;
     REQUIRE(doc.load_string(parts.at("word/document.xml").c_str()));
-    const fs::path out = fs::temp_directory_path() / "docweft_native_sections.pdf";
+    const fs::path out = temp_pdf("docweft_native_sections");
     docweft::docx::render_native_pdf(doc, parts, out);
     PoDoFo::PdfMemDocument pdf;
     pdf.Load(out.string());
@@ -531,14 +655,15 @@ TEST_CASE("native PDF keeps a keepNext paragraph with the next one", "[native_pd
 }
 
 TEST_CASE("native PDF strict mode rejects content it would get wrong", "[native_pdf]") {
-    const std::string footnote =
-        R"(<w:p><w:r><w:t>With a note</w:t></w:r><w:r><w:footnoteReference w:id="1"/></w:r></w:p>)";
+    const std::string symbol =
+        R"(<w:p><w:r><w:t>With a symbol</w:t></w:r><w:r><w:sym w:font="Webdings" w:char="F021"/></w:r></w:p>)";
     const std::string columns =
         R"(<w:sectPr><w:cols w:num="2"/></w:sectPr>)";
 
     SECTION("strict (default): NotImplemented listing every problem") {
         const auto parts = make_parts(
-            footnote + chart_paragraph("rIdC"), {{"rIdC", "chart", "charts/chart1.xml"}},
+            symbol + R"(<w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p>)" + chart_paragraph("rIdC"),
+            {{"rIdC", "chart", "charts/chart1.xml"}},
             {{"word/charts/chart1.xml",
               chart_with_plot(R"(<c:pieChart>)" + series_xml(0, "A", 1, 2) + R"(</c:pieChart>)"
                               R"(<c:barChart><c:barDir val="col"/>)" + series_xml(1, "B", 1, 2) + R"(</c:barChart>)")}},
@@ -549,23 +674,27 @@ TEST_CASE("native PDF strict mode rejects content it would get wrong", "[native_
         } catch (const docweft::ReportException& e) {
             REQUIRE(e.code() == docweft::ReportError::NotImplemented);
             const std::string msg = e.what();
-            REQUIRE(contains(msg, "footnotes"));
-            REQUIRE(contains(msg, "multi-column"));
+            REQUIRE(contains(msg, "symbol character F021 of font 'Webdings'"));
+            REQUIRE(contains(msg, "footnotes in multi-column layout"));
             REQUIRE(contains(msg, "pie charts combined with other chart types"));
             REQUIRE(contains(msg, "DOCWEFT_NATIVE_PDF_STRICT"));
         }
     }
     SECTION("DOCWEFT_NATIVE_PDF_STRICT=0 renders anyway") {
         ScopedEnvVar lenient("DOCWEFT_NATIVE_PDF_STRICT", "0");
-        REQUIRE(contains(all_text(render_pages(make_parts(footnote, {}, {}, columns))), "With a note"));
+        REQUIRE(contains(all_text(render_pages(make_parts(symbol, {}, {}, columns))), "With a symbol"));
     }
 }
 
-TEST_CASE("native PDF strict mode rejects text boxes and unsupported images", "[native_pdf]") {
-    const std::string textbox =
+TEST_CASE("native PDF strict mode rejects shapes it can't draw and unsupported images", "[native_pdf]") {
+    const std::string group =
         R"(<w:p><w:r><w:drawing><wp:anchor><wp:extent cx="1000" cy="1000"/><a:graphic>)"
-        R"(<a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">)"
-        R"(<w:txbxContent>)" + p("in a box") + R"(</w:txbxContent></a:graphicData></a:graphic></wp:anchor></w:drawing></w:r></w:p>)";
+        R"(<a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingGroup">)"
+        R"(</a:graphicData></a:graphic></wp:anchor></w:drawing></w:r></w:p>)";
+    const std::string star = "<w:p>" + shape_run(false, 0, 0, 50, 50, "star5", "") + "</w:p>";
+    const std::string rotated = "<w:p>" + shape_run(false, 0, 0, 50, 50, "rect", "") + "</w:p>";
+    const std::string float_in_box =
+        "<w:p>" + shape_run(true, 0, 0, 100, 50, "rect", "", {}, "<w:p>" + shape_run(true, 10, 10, 5, 5, "rect", "") + "</w:p>") + "</w:p>";
     const std::string emf_picture =
         R"(<w:p><w:r><w:drawing><wp:inline><wp:extent cx="1000" cy="1000"/><a:graphic>)"
         R"(<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:blipFill>)"
@@ -574,14 +703,19 @@ TEST_CASE("native PDF strict mode rejects text boxes and unsupported images", "[
     emf.replace(40, 4, " EMF");
 
     try {
-        render_pages(make_parts(textbox + emf_picture, {{"rIdE", "image", "media/image1.emf"}},
+        std::string turned = rotated;
+        turned.replace(turned.find("<a:xfrm>"), 8, R"(<a:xfrm rot="2700000">)");
+        render_pages(make_parts(group + star + turned + float_in_box + emf_picture, {{"rIdE", "image", "media/image1.emf"}},
                                 {{"word/media/image1.emf", emf}}));
         FAIL("expected NotImplemented");
     } catch (const docweft::ReportException& e) {
         REQUIRE(e.code() == docweft::ReportError::NotImplemented);
         const std::string msg = e.what();
-        REQUIRE(contains(msg, "text boxes"));
-        REQUIRE(contains(msg, "EMF"));
+        CHECK(contains(msg, "shape groups"));
+        CHECK(contains(msg, "shapes of type 'star5'"));
+        CHECK(contains(msg, "rotated shapes"));
+        CHECK(contains(msg, "floating objects inside text boxes"));
+        CHECK(contains(msg, "EMF"));
     }
 }
 
@@ -766,6 +900,7 @@ struct PageDrawing {
     std::vector<std::string> fills;   // "rrggbb" of each filled rectangle, in drawing order
     std::vector<StrokedLine> lines;   // stroked straight lines, in drawing order
     std::vector<DrawnImage>  images;  // image XObjects, in drawing order
+    std::vector<std::string> text_colors;  // fill color of each text show
     int first_text = -1, last_text = -1;  // order of the first/last text shown
 };
 
@@ -773,8 +908,8 @@ struct PageDrawing {
 PageDrawing render_drawing(const Parts& parts, unsigned page = 0) {
     pugi::xml_document doc;
     const std::string& xml = parts.at("word/document.xml");
-    REQUIRE(doc.load_buffer(xml.data(), xml.size()));
-    const fs::path out = fs::temp_directory_path() / "docweft_native_test_drawing.pdf";
+    REQUIRE(doc.load_buffer(xml.data(), xml.size(), docweft::docx::kXmlParse));
+    const fs::path out = temp_pdf("docweft_native_test_drawing");
     docweft::docx::render_native_pdf(doc, parts, out);
 
     PoDoFo::PdfMemDocument pdf;
@@ -827,6 +962,7 @@ PageDrawing render_drawing(const Parts& parts, unsigned page = 0) {
             case PoDoFo::PdfOperator::cm: if (ops.size() == 6) matrix = ops; break;
             case PoDoFo::PdfOperator::Tj:
             case PoDoFo::PdfOperator::TJ:
+                d.text_colors.push_back(fill);
                 if (d.first_text < 0) d.first_text = order;
                 d.last_text = order;
                 break;
@@ -1223,7 +1359,7 @@ TEST_CASE("native PDF keeps text out of a top-and-bottom floating picture's band
                                      "<wp:wrapTopAndBottom/>"));
     // A second picture, positioned on the page 300..380 pt from the top,
     // anchored in the first line: the lines below must skip that band.
-    body = para_with("FIRST", floating(100, 80, "page", offset(200), "page", offset(300), "<wp:wrapSquare wrapText=\"bothSides\"/>")) + body;
+    body = para_with("FIRST", floating(100, 80, "page", offset(200), "page", offset(300), "<wp:wrapTopAndBottom/>")) + body;
     for (int i = 0; i < 25; ++i) body += para_with("LINE-" + std::to_string(i));
     const auto entries = render_entries(with_picture(body));
     auto y = [&](const char* needle) { return entry_with(entries, needle).y; };
@@ -1239,6 +1375,69 @@ TEST_CASE("native PDF keeps text out of a top-and-bottom floating picture's band
         below = below || e.y < band_bottom;
     }
     CHECK(below);
+}
+
+TEST_CASE("native PDF flows text beside square-wrapped floating pictures", "[native_pdf]") {
+    constexpr double kLeft = 56.7, kRight = 595.3 - 56.7;  // kSect's margins
+    std::string words;
+    for (int i = 0; i < 160; ++i) words += "word" + std::to_string(i) + " ";
+
+    SECTION("beside it while the lines meet it, the whole width below") {
+        // 150 x 120 pt at the left margin, the paragraph's top: text on its right.
+        const std::string body =
+            para_with(words, floating(150, 120, "margin", "<wp:align>left</wp:align>", "paragraph", offset(0),
+                                      R"(<wp:wrapSquare wrapText="bothSides"/>)")) +
+            para_with("NEXT-PARA");
+        const auto entries = render_entries(with_picture(body));
+        const double top = entry_with(entries, "word0").y + 12.0, bottom = top - 120.0;
+        int beside = 0, below = 0;
+        for (const auto& e : entries) {
+            INFO(e.text << " at " << e.x << ", " << e.y);
+            if (e.page != 0) continue;
+            if (e.y > bottom) {
+                CHECK(e.x >= kLeft + 150.0 - 0.5);
+                ++beside;
+            } else if (e.x < kLeft + 1.0) {
+                ++below;
+            }
+        }
+        CHECK(beside >= 5);
+        CHECK(below >= 3);
+        CHECK(entry_with(entries, "NEXT-PARA").x == Catch::Approx(kLeft).margin(0.5));
+    }
+    SECTION("wrapText=left keeps the text on the left") {
+        const std::string body =
+            para_with(words, floating(150, 120, "page", offset(250), "paragraph", offset(0),
+                                      R"(<wp:wrapSquare wrapText="left"/>)"));
+        const auto entries = render_entries(with_picture(body));
+        const double bottom = entry_with(entries, "word0").y + 12.0 - 120.0;
+        for (const auto& e : entries) {
+            INFO(e.text << " at " << e.x << ", " << e.y);
+            if (e.page == 0 && e.y > bottom) CHECK(e.x < 250.0);
+        }
+    }
+    SECTION("no room beside it: the lines move below") {
+        const std::string body =
+            para_with("FIRST") +
+            para_with(words, floating(kRight - kLeft - 10.0, 100, "margin", "<wp:align>left</wp:align>",
+                                      "paragraph", offset(0), R"(<wp:wrapTight wrapText="bothSides"/>)"));
+        const auto entries = render_entries(with_picture(body));
+        const double top = entry_with(entries, "FIRST").y - 4.0;
+        const double bottom = top - 100.0;
+        for (const auto& e : entries) {
+            INFO(e.text << " at " << e.y);
+            if (e.page == 0 && e.text.find("FIRST") == std::string::npos) CHECK(e.y < bottom);
+        }
+        CHECK(entry_with(entries, "word0").y == Catch::Approx(bottom - 10.0).margin(5.0));
+    }
+    SECTION("a table after it goes below it") {
+        const std::string body =
+            para_with("ANCHOR", floating(150, 200, "margin", "<wp:align>left</wp:align>", "paragraph", offset(0),
+                                         R"(<wp:wrapSquare wrapText="bothSides"/>)")) +
+            R"(<w:tbl><w:tblGrid><w:gridCol w:w="4000"/></w:tblGrid><w:tr><w:tc><w:p><w:r><w:t>CELL</w:t></w:r></w:p></w:tc></w:tr></w:tbl>)";
+        const auto entries = render_entries(with_picture(body));
+        CHECK(entry_with(entries, "CELL").y < entry_with(entries, "ANCHOR").y + 12.0 - 200.0);
+    }
 }
 
 TEST_CASE("native PDF doesn't let a floating header logo push the body down", "[native_pdf]") {
@@ -1386,8 +1585,8 @@ TEST_CASE("native PDF leaves out pictures in hidden runs", "[native_pdf]") {
                                                {{"word/media/image1.png", std::string(tf_test::tiny_png_bytes())}});
         pugi::xml_document doc;
         const std::string& xml = parts.at("word/document.xml");
-        REQUIRE(doc.load_buffer(xml.data(), xml.size()));
-        const fs::path out = fs::temp_directory_path() / "docweft_native_test_hidden_image.pdf";
+        REQUIRE(doc.load_buffer(xml.data(), xml.size(), docweft::docx::kXmlParse));
+        const fs::path out = temp_pdf("docweft_native_test_hidden_image");
         docweft::docx::render_native_pdf(doc, parts, out);
         PoDoFo::PdfMemDocument pdf;
         pdf.Load(out.string());
@@ -1402,6 +1601,858 @@ TEST_CASE("native PDF leaves out pictures in hidden runs", "[native_pdf]") {
     };
     REQUIRE(image_count("") == 1);
     REQUIRE(image_count("<w:vanish/>") == 0);
+}
+
+TEST_CASE("native PDF writes chart numbers with the document's separators", "[native_pdf]") {
+    // Bar values labelled "#,##0.0"; the value axis steps by 0.2 for the
+    // second chart. `lang`: the chart's <c:lang>, `doc_lang`: styles.xml's.
+    auto render_text = [](double q1, double q2, const std::string& lang, const std::string& doc_lang) {
+        auto num = [](double v) { std::ostringstream os; os << v; return os.str(); };
+        const std::string chart =
+            std::string(R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?><c:chartSpace)") + kNamespaces + ">" +
+            (lang.empty() ? "" : R"(<c:lang val=")" + lang + R"("/>)") +
+            R"(<c:chart><c:plotArea><c:barChart><c:barDir val="col"/><c:grouping val="clustered"/>)"
+            R"(<c:ser><c:idx val="0"/><c:order val="0"/>)"
+            R"(<c:dLbls><c:numFmt formatCode="#,##0.0" sourceLinked="0"/><c:showVal val="1"/></c:dLbls>)"
+            R"(<c:cat><c:strRef><c:strCache><c:pt idx="0"><c:v>Q1</c:v></c:pt><c:pt idx="1"><c:v>Q2</c:v></c:pt></c:strCache></c:strRef></c:cat>)"
+            R"(<c:val><c:numRef><c:numCache><c:pt idx="0"><c:v>)" + num(q1) + R"(</c:v></c:pt><c:pt idx="1"><c:v>)" + num(q2) +
+            R"(</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser><c:axId val="1"/><c:axId val="2"/></c:barChart>)" + kAxes +
+            "</c:plotArea></c:chart></c:chartSpace>";
+        Parts extra{{"word/charts/chart1.xml", chart}};
+        if (!doc_lang.empty()) {
+            extra["word/styles.xml"] =
+                std::string(R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles)") + kNamespaces + ">" +
+                R"(<w:docDefaults><w:rPrDefault><w:rPr><w:lang w:val=")" + doc_lang +
+                R"("/></w:rPr></w:rPrDefault></w:docDefaults></w:styles>)";
+        }
+        return all_text(render_pages(make_parts(chart_paragraph("rIdC"), {{"rIdC", "chart", "charts/chart1.xml"}}, extra, kSect)));
+    };
+    const std::string nbsp = " ";
+
+    const std::string ru = render_text(1234.5, 2.25, "ru-RU", "");
+    CHECK(contains(ru, "1" + nbsp + "234,5"));
+    CHECK(contains(ru, "2,3"));  // 2.25 rounded half up, decimal comma
+    CHECK_FALSE(contains(ru, "1,234.5"));
+    CHECK(contains(render_text(0.3, 0.7, "ru-RU", ""), "0,2"));  // axis labels too
+
+    // No <c:lang>: the document's language decides.
+    CHECK(contains(render_text(1234.5, 2.25, "", "de-DE"), "1.234,5"));
+    CHECK(contains(render_text(1234.5, 2.25, "", "ru-RU"), "1" + nbsp + "234,5"));
+    // The chart's own language wins; English (and no language at all) as before.
+    CHECK(contains(render_text(1234.5, 2.25, "en-US", "ru-RU"), "1,234.5"));
+    const std::string none = render_text(0.3, 0.7, "", "");
+    CHECK(contains(none, "0.2"));
+}
+
+TEST_CASE("native PDF follows a table style's basedOn chain", "[native_pdf]") {
+    // Base: red inside lines, green header row, 1 cm left cell margin.
+    // Derived (used by the table): blue top border, a blue first column,
+    // and its own header rows bold on top of the base's green.
+    const std::string styles =
+        std::string(R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles)") + kNamespaces + ">"
+        R"(<w:style w:type="table" w:styleId="Base"><w:tblPr><w:tblBorders>)"
+        R"(<w:top w:val="nil"/><w:bottom w:val="nil"/><w:left w:val="nil"/><w:right w:val="nil"/>)"
+        R"(<w:insideH w:val="single" w:sz="8" w:color="FF0000"/><w:insideV w:val="nil"/></w:tblBorders>)"
+        R"(<w:tblCellMar><w:left w:w="567" w:type="dxa"/></w:tblCellMar></w:tblPr>)"
+        R"(<w:tblStylePr w:type="firstRow"><w:tcPr><w:shd w:val="clear" w:color="auto" w:fill="00A000"/></w:tcPr></w:tblStylePr>)"
+        R"(</w:style>)"
+        R"(<w:style w:type="table" w:styleId="Derived"><w:basedOn w:val="Base"/><w:tblPr><w:tblBorders>)"
+        R"(<w:top w:val="single" w:sz="8" w:color="0000FF"/></w:tblBorders></w:tblPr>)"
+        R"(<w:tblStylePr w:type="firstRow"><w:rPr><w:b/></w:rPr></w:tblStylePr>)"
+        R"(<w:tblStylePr w:type="firstCol"><w:tcPr><w:shd w:val="clear" w:color="auto" w:fill="0000C0"/></w:tcPr></w:tblStylePr>)"
+        R"(</w:style></w:styles>)";
+    std::string rows;
+    for (int r = 0; r < 3; ++r) {
+        rows += "<w:tr>";
+        for (int c = 0; c < 2; ++c) rows += "<w:tc>" + p("R" + std::to_string(r) + "C" + std::to_string(c)) + "</w:tc>";
+        rows += "</w:tr>";
+    }
+    const std::string body =
+        R"(<w:tbl><w:tblPr><w:tblStyle w:val="Derived"/><w:tblLook w:firstRow="1" w:firstColumn="1" w:noHBand="1" w:noVBand="1"/></w:tblPr>)"
+        R"(<w:tblGrid><w:gridCol w:w="3000"/><w:gridCol w:w="3000"/></w:tblGrid>)" + rows + "</w:tbl>";
+    const Parts parts = make_parts(body, {}, {{"word/styles.xml", styles}}, kSect);
+    const PageDrawing d = render_drawing(parts);
+
+    CHECK(std::count(d.fills.begin(), d.fills.end(), std::string("00a000")) == 2);  // header row: the base's region
+    CHECK(std::count(d.fills.begin(), d.fills.end(), std::string("0000c0")) == 2);  // first column below it
+    CHECK(lines_in(d, "0000ff", true).size() == 2);   // the derived style's top border
+    std::set<long> red_rows;  // the base's lines between the rows (a shared edge is stroked twice)
+    for (const StrokedLine& l : lines_in(d, "ff0000", true)) red_rows.insert(std::lround(l.y1));
+    CHECK(red_rows.size() == 2);
+    CHECK(lines_in(d, "000000", false).empty());      // base says: no vertical lines
+    // The base's 1 cm left cell margin.
+    CHECK(entry_with(render_entries(parts), "R1C0").x == Catch::Approx(56.7 + 28.35).margin(1.0));
+}
+
+TEST_CASE("native PDF lets a table style's font size and alignment beat Normal's 11/12 pt left", "[native_pdf]") {
+    // Normal: 12 pt, left. Table style: 8 pt, centred. "Body": 12 pt, left,
+    // but not the default style — it always wins over the table style.
+    const std::string styles =
+        std::string(R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles)") + kNamespaces + ">"
+        R"(<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:pPr><w:jc w:val="left"/></w:pPr>)"
+        R"(<w:rPr><w:sz w:val="24"/></w:rPr></w:style>)"
+        R"(<w:style w:type="paragraph" w:styleId="Body"><w:pPr><w:jc w:val="left"/></w:pPr><w:rPr><w:sz w:val="24"/></w:rPr></w:style>)"
+        R"(<w:style w:type="table" w:styleId="T"><w:pPr><w:jc w:val="center"/></w:pPr><w:rPr><w:sz w:val="16"/></w:rPr></w:style>)"
+        "</w:styles>";
+    const std::string cell_paras = p("NORMAL-A") + p("NORMAL-B") + p("BODY-A", R"(<w:pStyle w:val="Body"/>)") +
+                                   p("BODY-B", R"(<w:pStyle w:val="Body"/>)");
+    const std::string body =
+        R"(<w:tbl><w:tblPr><w:tblStyle w:val="T"/></w:tblPr><w:tblGrid><w:gridCol w:w="6000"/></w:tblGrid><w:tr><w:tc>)" +
+        cell_paras + "</w:tc></w:tr></w:tbl>";
+    auto render = [&](const std::string& compat) {
+        Parts extra{{"word/styles.xml", styles}};
+        if (!compat.empty()) {
+            extra["word/settings.xml"] =
+                std::string(R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:settings)") + kNamespaces +
+                "><w:compat>" + compat + "</w:compat></w:settings>";
+        }
+        return render_entries(make_parts(body, {}, extra, kSect));
+    };
+    auto gap = [](const std::vector<TextEntry>& e, const char* a, const char* b) {
+        return entry_with(e, a).y - entry_with(e, b).y;
+    };
+
+    // No compat setting (older documents): the table style wins against Normal.
+    const auto quirk = render("");
+    CHECK(gap(quirk, "NORMAL-A", "NORMAL-B") < gap(quirk, "BODY-A", "BODY-B") - 3.0);  // 8 pt lines vs 12 pt
+    CHECK(entry_with(quirk, "NORMAL-A").x > entry_with(quirk, "BODY-A").x + 50.0);    // centred vs left
+
+    // Word 2013+ documents opt out: Normal wins like any paragraph style.
+    const auto modern = render(
+        R"(<w:compatSetting w:name="overrideTableStyleFontSizeAndJustification" w:uri="http://schemas.microsoft.com/office/word" w:val="1"/>)");
+    CHECK(gap(modern, "NORMAL-A", "NORMAL-B") == Catch::Approx(gap(modern, "BODY-A", "BODY-B")).margin(0.1));
+    CHECK(entry_with(modern, "NORMAL-A").x == Catch::Approx(entry_with(modern, "BODY-A").x).margin(0.1));
+}
+
+TEST_CASE("native PDF places floating pictures in table cells relative to the cell", "[native_pdf]") {
+    // One-row table, first column 3000 twips (150 pt) from the margin; the
+    // cell's content box starts at 56.7 + 5.4 pt.
+    auto table = [](const std::string& cell0, const std::string& cell1 = p("NEXT-CELL")) {
+        return R"(<w:tbl><w:tblGrid><w:gridCol w:w="3000"/><w:gridCol w:w="3000"/></w:tblGrid><w:tr><w:tc>)" + cell0 +
+               "</w:tc><w:tc>" + cell1 + "</w:tc></w:tr></w:tbl>";
+    };
+    const double cell_x = 56.7 + 5.4;
+
+    SECTION("a stamp behind the signature: offset from the cell and its paragraph, under the text") {
+        const std::string body = table(para_with("SIGNATURE", floating(60, 40, "column", offset(10), "paragraph", offset(5),
+                                                                       "<wp:wrapNone/>", /*behind*/ true)));
+        const Parts parts = with_picture(body);
+        const PageDrawing d = render_drawing(parts);
+        REQUIRE(d.images.size() == 1);
+        CHECK(d.images[0].x == Catch::Approx(cell_x + 10.0).margin(0.2));
+        CHECK(d.images[0].order < d.first_text);
+        // Its top 5 pt below the top of the cell's text, which starts at the page's top margin.
+        CHECK(d.images[0].y + 40.0 == Catch::Approx(kPageHeight - 56.7 - 5.0).margin(0.5));
+        // wrapNone: the row keeps its one line of height.
+        const auto entries = render_entries(parts);
+        CHECK(entry_with(entries, "SIGNATURE").y == Catch::Approx(entry_with(entries, "NEXT-CELL").y).margin(0.1));
+    }
+    SECTION("in front, aligned right in the cell") {
+        const Parts parts = with_picture(table(para_with("TEXT", floating(30, 20, "column", "<wp:align>right</wp:align>",
+                                                                           "paragraph", offset(0), "<wp:wrapNone/>"))));
+        const PageDrawing d = render_drawing(parts);
+        REQUIRE(d.images.size() == 1);
+        CHECK(d.images[0].x + 30.0 == Catch::Approx(56.7 + 150.0 - 5.4).margin(0.2));
+        CHECK(d.images[0].order > d.last_text);
+    }
+    SECTION("layoutInCell=\"0\": positioned on the page") {
+        std::string pic = floating(30, 20, "column", offset(300), "paragraph", offset(0), "<wp:wrapNone/>");
+        pic.replace(pic.find("layoutInCell=\"1\""), 16, "layoutInCell=\"0\"");
+        const PageDrawing d = render_drawing(with_picture(table(para_with("TEXT", pic))));
+        REQUIRE(d.images.size() == 1);
+        CHECK(d.images[0].x == Catch::Approx(56.7 + 300.0).margin(0.2));
+    }
+    SECTION("top-and-bottom wrapping pushes the cell's text down and grows the row") {
+        const std::string body =
+            table(para_with("ANCHOR", floating(40, 100, "column", offset(0), "paragraph", offset(0), "<wp:wrapTopAndBottom/>")) +
+                  p("AFTER")) +
+            para_with("BELOW-TABLE");
+        const auto entries = render_entries(with_picture(body));
+        auto y = [&](const char* needle) { return entry_with(entries, needle).y; };
+        CHECK(y("NEXT-CELL") - y("ANCHOR") == Catch::Approx(100.0).margin(0.5));  // the anchor's own text right under the picture
+        CHECK(y("NEXT-CELL") - y("BELOW-TABLE") > 120.0);
+    }
+}
+
+TEST_CASE("native PDF draws text boxes with their fill, outline and text", "[native_pdf]") {
+    // Yellow box with a 1 pt red outline, 200 x 80 pt at (100, 200) from
+    // the page's corner, text centred vertically.
+    const std::string box = shape_run(
+        true, 100, 200, 200, 80, "rect",
+        R"(<a:solidFill><a:srgbClr val="FFFF00"/></a:solidFill><a:ln w="12700"><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill></a:ln>)",
+        {}, p("IN-A-BOX"), R"(<wps:bodyPr anchor="ctr"/>)");
+    const Parts parts = make_parts(para_with("ANCHOR-TEXT", box) + p("AFTER"), {}, {}, kSect);
+    const PageDrawing d = render_drawing(parts);
+    const auto entries = render_entries(parts);
+
+    CHECK(std::count(d.fills.begin(), d.fills.end(), std::string("ffff00")) == 1);
+    bool red_outline = false;
+    for (const StrokedLine& l : d.lines) red_outline = red_outline || (l.color == "ff0000" && l.width == Catch::Approx(1.0));
+    CHECK(red_outline);
+    // The box's text inside it, once — not in its anchor paragraph's line.
+    const TextEntry& in_box = entry_with(entries, "IN-A-BOX");
+    CHECK(in_box.x == Catch::Approx(100.0 + 7.2).margin(0.5));
+    CHECK(in_box.y < kPageHeight - 200.0 - 20.0);  // anchored in the middle of the 80 pt box
+    CHECK(in_box.y > kPageHeight - 280.0 + 20.0);
+    CHECK(std::count_if(entries.begin(), entries.end(), [](const TextEntry& e) { return contains(e.text, "IN-A-BOX"); }) == 1);
+    // In front, taking no room: the body flows as if it weren't there.
+    CHECK(entry_with(entries, "ANCHOR-TEXT").y - entry_with(entries, "AFTER").y < 20.0);
+}
+
+TEST_CASE("native PDF draws inline shapes with their style's colors and fits text to them", "[native_pdf]") {
+    // A default Word shape: accent1 fill, darker outline, white text — all
+    // from <wps:style>. Auto-fit: 10 pt tall as stored, grown for three lines.
+    const std::string style =
+        R"(<wps:style><a:lnRef idx="2"><a:schemeClr val="accent1"><a:shade val="50000"/></a:schemeClr></a:lnRef>)"
+        R"(<a:fillRef idx="1"><a:schemeClr val="accent1"/></a:fillRef><a:effectRef idx="0"><a:schemeClr val="accent1"/></a:effectRef>)"
+        R"(<a:fontRef idx="minor"><a:schemeClr val="lt1"/></a:fontRef></wps:style>)";
+    const std::string content = p("WHITE-1") + p("WHITE-2") + "<w:p><w:r><w:rPr><w:color w:val=\"00FF00\"/></w:rPr><w:t>GREEN-3</w:t></w:r></w:p>";
+    const std::string shape = shape_run(false, 0, 0, 150, 10, "roundRect", "", style, content,
+                                        R"(<wps:bodyPr><a:spAutoFit/></wps:bodyPr>)");
+    const Parts parts = make_parts(p("BEFORE") + "<w:p>" + shape + "</w:p>" + p("AFTER"), {}, {}, kSect);
+    const PageDrawing d = render_drawing(parts);
+    const auto entries = render_entries(parts);
+    auto y = [&](const char* needle) { return entry_with(entries, needle).y; };
+
+    // Text colors in drawing order: BEFORE black, the box's two white lines, the green one, AFTER black.
+    REQUIRE(d.text_colors.size() == 5);
+    CHECK(d.text_colors[0] == "000000");
+    CHECK(d.text_colors[1] == "ffffff");
+    CHECK(d.text_colors[2] == "ffffff");
+    CHECK(d.text_colors[3] == "00ff00");
+    CHECK(d.text_colors[4] == "000000");
+    // The shape is as tall as its three lines, and the flow continues below it.
+    const double line = y("WHITE-1") - y("WHITE-2");
+    CHECK(y("BEFORE") - y("AFTER") > 3.0 * line + 7.2);
+    CHECK(y("GREEN-3") > y("AFTER"));
+}
+
+TEST_CASE("native PDF draws a text box floating in a table cell", "[native_pdf]") {
+    std::string box = shape_run(true, 0, 0, 120, 40, "rect", R"(<a:noFill/><a:ln w="6350"><a:solidFill><a:srgbClr val="0000FF"/></a:solidFill></a:ln>)",
+                                {}, p("CELL-BOX"));
+    // Relative to the cell's column and paragraph rather than the page.
+    box.replace(box.find(R"(relativeFrom="page")"), 19, R"(relativeFrom="column")");
+    box.replace(box.find(R"(relativeFrom="page")"), 19, R"(relativeFrom="paragraph")");
+    const std::string body =
+        R"(<w:tbl><w:tblGrid><w:gridCol w:w="4000"/></w:tblGrid><w:tr><w:tc>)" + para_with("CELL-TEXT", box) +
+        "</w:tc></w:tr></w:tbl>";
+    const auto entries = render_entries(make_parts(body, {}, {}, kSect));
+    CHECK(entry_with(entries, "CELL-BOX").x == Catch::Approx(56.7 + 5.4 + 7.2).margin(0.5));
+    CHECK(entry_with(entries, "CELL-BOX").y < entry_with(entries, "CELL-TEXT").y + 1.0);
+}
+
+// ── Footnotes and endnotes ──────────────────────────────────────────────────
+
+constexpr const char* kNoteStyles =
+    R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?>)"
+    R"(<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">)"
+    R"(<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/>)"
+    R"(<w:rPr><w:sz w:val="22"/></w:rPr></w:style>)"
+    R"(<w:style w:type="paragraph" w:styleId="FootnoteText"><w:name w:val="footnote text"/>)"
+    R"(<w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:rPr><w:sz w:val="20"/></w:rPr></w:style>)"
+    R"(<w:style w:type="character" w:styleId="FootnoteReference"><w:name w:val="footnote reference"/>)"
+    R"(<w:rPr><w:vertAlign w:val="superscript"/></w:rPr></w:style>)"
+    R"(</w:styles>)";
+
+// A footnote/endnote part: Word's separator notes plus `notes` (id, text
+// paragraphs) — each note's first paragraph starts with its own mark.
+std::string notes_xml(const char* kind, const std::vector<std::pair<int, std::vector<std::string>>>& notes,
+                      const std::string& notice = {}) {
+    const std::string tag = std::string("w:") + kind;
+    std::string x = std::string(R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:)") + kind + "s" + kNamespaces + ">";
+    x += "<" + tag + R"( w:type="separator" w:id="-1"><w:p><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:r><w:separator/></w:r></w:p></)" + tag + ">";
+    x += "<" + tag + R"( w:type="continuationSeparator" w:id="0"><w:p><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:r><w:continuationSeparator/></w:r></w:p></)" + tag + ">";
+    x += "<" + tag + R"( w:type="continuationNotice" w:id="1000"><w:p><w:pPr><w:jc w:val="right"/></w:pPr><w:r><w:t>)" + notice + "</w:t></w:r></w:p></" + tag + ">";
+    for (const auto& [id, paras] : notes) {
+        x += "<" + tag + " w:id=\"" + std::to_string(id) + "\">";
+        for (std::size_t i = 0; i < paras.size(); ++i) {
+            x += R"(<w:p><w:pPr><w:pStyle w:val="FootnoteText"/></w:pPr>)";
+            if (i == 0) {
+                x += std::string(R"(<w:r><w:rPr><w:rStyle w:val="FootnoteReference"/></w:rPr><w:)") + kind + "Ref/></w:r>"
+                     R"(<w:r><w:t xml:space="preserve"> </w:t></w:r>)";
+            }
+            x += R"(<w:r><w:t xml:space="preserve">)" + paras[i] + "</w:t></w:r></w:p>";
+        }
+        x += "</" + tag + ">";
+    }
+    return x + "</w:" + kind + "s>";
+}
+
+// A run referencing footnote (or endnote) `id`.
+std::string note_ref(int id, const char* kind = "footnote", bool custom = false) {
+    return std::string(R"(<w:r><w:rPr><w:rStyle w:val="FootnoteReference"/></w:rPr><w:)") + kind +
+           "Reference w:id=\"" + std::to_string(id) + "\"" + (custom ? R"( w:customMarkFollows="1")" : "") +
+           "/>" + (custom ? "<w:t>*</w:t>" : "") + "</w:r>";
+}
+
+std::string para_with_ref(const std::string& text, int id, const char* kind = "footnote") {
+    return R"(<w:p><w:r><w:t xml:space="preserve">)" + text + "</w:t></w:r>" + note_ref(id, kind) + "</w:p>";
+}
+
+Parts note_parts(const std::string& body, const std::string& footnotes, const std::string& endnotes = {},
+                 const std::string& settings = {}, const std::string& sect = kSect) {
+    Parts extra{{"word/styles.xml", kNoteStyles}, {"word/footnotes.xml", footnotes}};
+    if (!endnotes.empty()) extra["word/endnotes.xml"] = endnotes;
+    if (!settings.empty()) {
+        extra["word/settings.xml"] = std::string(R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:settings)") +
+                                     kNamespaces + ">" + settings + "</w:settings>";
+    }
+    return make_parts(body, {{"rIdS", "styles", "styles.xml"}, {"rIdF", "footnotes", "footnotes.xml"},
+                             {"rIdE", "endnotes", "endnotes.xml"}, {"rIdT", "settings", "settings.xml"}},
+                      extra, sect);
+}
+
+// Text entries of page `page` that are exactly `text`.
+std::vector<TextEntry> entries_equal(const std::vector<TextEntry>& entries, const std::string& text) {
+    std::vector<TextEntry> out;
+    for (const auto& e : entries) {
+        if (e.text == text) out.push_back(e);
+    }
+    return out;
+}
+
+TEST_CASE("native PDF draws footnotes at the bottom of their page and endnotes at the end", "[native_pdf]") {
+    const std::string body =
+        para_with_ref("FIRST-REF", 1) +
+        R"(<w:p><w:r><w:t xml:space="preserve">CUSTOM-REF</w:t></w:r>)" + note_ref(2, "footnote", true) + "</w:p>" +
+        para_with_ref("SECOND-REF", 3) + para_with_ref("END-REF", 1, "endnote") + p("LAST-BODY");
+    const auto entries = render_entries(note_parts(
+        body, notes_xml("footnote", {{1, {"NOTE-ONE"}}, {2, {"NOTE-CUSTOM"}}, {3, {"NOTE-THREE"}}}),
+        notes_xml("endnote", {{1, {"END-TEXT-I"}}})));
+    for (const auto& e : entries) INFO(e.page << " " << e.x << "," << e.y << " [" << e.text << "]");
+
+    // All on page 1: footnotes below the body, above the bottom margin, in order.
+    const TextEntry& last_body = entry_with(entries, "LAST-BODY");
+    const TextEntry& one   = entry_with(entries, "NOTE-ONE");
+    const TextEntry& cust  = entry_with(entries, "NOTE-CUSTOM");
+    const TextEntry& three = entry_with(entries, "NOTE-THREE");
+    CHECK(one.page == 0);
+    CHECK(three.page == 0);
+    CHECK(one.y < last_body.y);
+    CHECK(cust.y < one.y);
+    CHECK(three.y < cust.y);
+    CHECK(three.y >= 56.7 - 0.5);
+    CHECK(one.y < 200.0);  // at the bottom, not after the text
+    // The endnote follows the body text.
+    const TextEntry& endnote = entry_with(entries, "END-TEXT-I");
+    CHECK(endnote.y < last_body.y);
+    CHECK(endnote.y > one.y);
+
+    // Marks: 1, *, 2 (the custom mark takes no number); the endnote is "i".
+    CHECK(entries_equal(entries, "1").size() == 2);  // reference + the note's own mark
+    CHECK(entries_equal(entries, "2").size() == 2);
+    CHECK(entries_equal(entries, "3").empty());
+    CHECK(entries_equal(entries, "i").size() == 2);
+    // The reference is raised above its line's baseline.
+    const TextEntry& first = entry_with(entries, "FIRST-REF");
+    bool raised = false;
+    for (const auto& e : entries_equal(entries, "1")) {
+        if (std::abs(e.y - first.y) < 8.0) raised = e.y > first.y + 1.0;
+    }
+    CHECK(raised);
+}
+
+TEST_CASE("native PDF keeps every footnote on the page of its reference", "[native_pdf]") {
+    std::string body;
+    std::vector<std::pair<int, std::vector<std::string>>> notes;
+    for (int i = 1; i <= 70; ++i) {
+        body += para_with_ref("PARA-" + std::to_string(i) + "-X", i);
+        notes.push_back({i, {"NOTE-" + std::to_string(i) + "-X"}});
+    }
+    const auto entries = render_entries(note_parts(body, notes_xml("footnote", notes)));
+    int pages = 0;
+    for (int i = 1; i <= 70; ++i) {
+        const TextEntry& para = entry_with(entries, "PARA-" + std::to_string(i) + "-X");
+        const TextEntry& note = entry_with(entries, "NOTE-" + std::to_string(i) + "-X");
+        INFO("note " << i);
+        CHECK(para.page == note.page);
+        CHECK(note.y >= 56.7 - 0.5);
+        // Below every body line of its page.
+        for (const auto& e : entries) {
+            if (e.page == note.page && e.text.rfind("PARA-", 0) == 0) CHECK(e.y > note.y);
+        }
+        pages = std::max(pages, para.page + 1);
+    }
+    CHECK(pages >= 2);
+}
+
+TEST_CASE("native PDF continues a long footnote on the next page", "[native_pdf]") {
+    std::vector<std::string> lines;
+    for (int i = 1; i <= 90; ++i) lines.push_back("LONG-" + std::to_string(i) + "-X");
+    const std::string body = para_with_ref("REF-PARA", 1) + p("AFTER-PARA");
+    const auto entries = render_entries(note_parts(body, notes_xml("footnote", {{1, lines}})));
+
+    const TextEntry& ref = entry_with(entries, "REF-PARA");
+    CHECK(ref.page == 0);
+    CHECK(entry_with(entries, "LONG-1-X").page == 0);
+    // Each line once, in order, never below the bottom margin or overlapping body text.
+    int last_page = 0;
+    double last_y = 1e9;
+    for (int i = 1; i <= 90; ++i) {
+        const std::string needle = "LONG-" + std::to_string(i) + "-X";
+        int count = 0;
+        for (const auto& e : entries) count += e.text.find(needle) != std::string::npos ? 1 : 0;
+        INFO(needle);
+        CHECK(count == 1);
+        const TextEntry& e = entry_with(entries, needle);
+        CHECK(e.y >= 56.7 - 0.5);
+        CHECK(e.y <= 841.9 - 56.7);
+        CHECK((e.page > last_page || e.y < last_y));
+        last_page = e.page;
+        last_y = e.y;
+    }
+    CHECK(last_page >= 1);
+    // The body goes on above the continued note.
+    const TextEntry& after = entry_with(entries, "AFTER-PARA");
+    for (const auto& e : entries) {
+        if (e.page == after.page && e.text.rfind("LONG-", 0) == 0) CHECK(e.y < after.y);
+    }
+}
+
+TEST_CASE("native PDF numbers footnotes as footnotePr says", "[native_pdf]") {
+    const std::string notes = notes_xml("footnote", {{1, {"NOTE-A"}}, {2, {"NOTE-B"}}});
+    const std::string body = para_with_ref("PAGE-ONE", 1) +
+                             R"(<w:p><w:r><w:br w:type="page"/></w:r></w:p>)" + para_with_ref("PAGE-TWO", 2);
+    auto marks = [&](const std::string& settings) {
+        const auto entries = render_entries(note_parts(body, notes, {}, settings));
+        std::vector<std::string> out;
+        for (const auto& e : entries) {
+            if (e.text != "PAGE-ONE" && e.text != "PAGE-TWO" && e.text.find("NOTE-") == std::string::npos &&
+                e.text.find_first_not_of(" ") != std::string::npos) {
+                out.push_back(std::to_string(e.page) + ":" + e.text);
+            }
+        }
+        return out;
+    };
+    using V = std::vector<std::string>;
+    CHECK(marks("") == V{"0:1", "0:1", "1:2", "1:2"});
+    CHECK(marks(R"(<w:footnotePr><w:numRestart w:val="eachPage"/></w:footnotePr>)") ==
+          V{"0:1", "0:1", "1:1", "1:1"});
+    CHECK(marks(R"(<w:footnotePr><w:numFmt w:val="chicago"/></w:footnotePr>)") ==
+          V{"0:*", "0:*", "1:†", "1:†"});
+    CHECK(marks(R"(<w:footnotePr><w:numFmt w:val="lowerRoman"/><w:numStart w:val="3"/></w:footnotePr>)") ==
+          V{"0:iii", "0:iii", "1:iv", "1:iv"});
+}
+
+TEST_CASE("native PDF places footnotes referenced in table cells", "[native_pdf]") {
+    const std::string body =
+        R"(<w:tbl><w:tblPr><w:tblW w:w="5000" w:type="dxa"/></w:tblPr><w:tblGrid><w:gridCol w:w="5000"/></w:tblGrid>)"
+        R"(<w:tr><w:tc>)" + para_with_ref("CELL-REF", 1) + "</w:tc></w:tr></w:tbl>" + p("BELOW-TABLE");
+    const auto entries = render_entries(note_parts(body, notes_xml("footnote", {{1, {"CELL-NOTE"}}})));
+    const TextEntry& note = entry_with(entries, "CELL-NOTE");
+    CHECK(note.page == 0);
+    CHECK(note.y < entry_with(entries, "BELOW-TABLE").y);
+    CHECK(note.y < 200.0);
+}
+
+TEST_CASE("native PDF puts beneathText footnotes right under the text", "[native_pdf]") {
+    const std::string body = para_with_ref("SHORT-BODY", 1);
+    const std::string notes = notes_xml("footnote", {{1, {"UNDER-NOTE"}}});
+    const auto bottom = render_entries(note_parts(body, notes));
+    const auto beneath = render_entries(
+        note_parts(body, notes, {}, R"(<w:footnotePr><w:pos w:val="beneathText"/></w:footnotePr>)"));
+    CHECK(entry_with(bottom, "UNDER-NOTE").y < 200.0);
+    const double text_y = entry_with(beneath, "SHORT-BODY").y;
+    const double note_y = entry_with(beneath, "UNDER-NOTE").y;
+    CHECK(note_y < text_y);
+    CHECK(note_y > text_y - 50.0);  // the separator and the note's line, nothing more
+}
+
+TEST_CASE("native PDF prints the continuation notice under a footnote that goes on", "[native_pdf]") {
+    std::vector<std::string> lines;
+    for (int i = 1; i <= 90; ++i) lines.push_back("CONT-" + std::to_string(i) + "-X");
+    const auto entries = render_entries(note_parts(para_with_ref("REF-PARA", 1) + p("AFTER-PARA"),
+                                                   notes_xml("footnote", {{1, lines}}, "NOTICE-TEXT")));
+    std::vector<TextEntry> notices;
+    for (const auto& e : entries) {
+        if (e.text.find("NOTICE-TEXT") != std::string::npos) notices.push_back(e);
+    }
+    REQUIRE(!notices.empty());
+    int last_page = 0;
+    for (const auto& e : entries) last_page = std::max(last_page, e.page);
+    for (const auto& n : notices) {
+        CHECK(n.y >= 56.7 - 0.5);
+        CHECK(n.page < entry_with(entries, "CONT-90-X").page);  // not under the note's end
+        // Under the last line of the note on its page.
+        for (const auto& e : entries) {
+            if (e.page == n.page && e.text.rfind("CONT-", 0) == 0) CHECK(e.y > n.y);
+        }
+    }
+    for (int i = 1; i <= 90; ++i) {
+        int count = 0;
+        for (const auto& e : entries) count += e.text.find("CONT-" + std::to_string(i) + "-X") != std::string::npos;
+        CHECK(count == 1);
+    }
+    CHECK(last_page >= 1);
+}
+
+TEST_CASE("native PDF keeps a heading with the next paragraph and its footnote", "[native_pdf]") {
+    // The filler leaves ~42 pt: room for the heading and the next line, not
+    // for them plus the next line's footnote (and its separator).
+    const std::string filler = p("FILLER", R"(<w:spacing w:before="13500" w:after="0"/>)");
+    const std::string heading = p("THE-HEADING", R"(<w:keepNext/><w:spacing w:after="0"/>)");
+    std::vector<std::string> lines;
+    for (int i = 1; i <= 6; ++i) lines.push_back("KN-NOTE-" + std::to_string(i));
+    const std::string notes = notes_xml("footnote", {{1, lines}});
+
+    const auto without = render_entries(note_parts(filler + heading + p("PLAIN-NEXT"), notes));
+    CHECK(entry_with(without, "THE-HEADING").page == 0);
+    CHECK(entry_with(without, "PLAIN-NEXT").page == 0);
+
+    const auto with = render_entries(note_parts(filler + heading + para_with_ref("NOTED-NEXT", 1), notes));
+    CHECK(entry_with(with, "NOTED-NEXT").page == 1);
+    CHECK(entry_with(with, "THE-HEADING").page == 1);
+    CHECK(entry_with(with, "KN-NOTE-1").page == 1);
+}
+
+TEST_CASE("native PDF continues a footnote into a section with other margins", "[native_pdf]") {
+    // Paragraphs that wrap differently at the two text widths.
+    std::vector<std::string> paras;
+    for (int i = 1; i <= 40; ++i) {
+        paras.push_back("WIDE-" + std::to_string(i) + "-X lorem ipsum dolor sit amet consectetur adipiscing elit "
+                        "sed do eiusmod tempor incididunt ut labore et dolore magna aliqua");
+    }
+    const std::string narrow_sect =
+        R"(<w:p><w:pPr><w:sectPr><w:pgSz w:w="11906" w:h="16838"/>)"
+        R"(<w:pgMar w:top="1134" w:right="3402" w:bottom="1134" w:left="1134"/></w:sectPr></w:pPr></w:p>)";
+    const std::string body = para_with_ref("REF-PARA", 1) + narrow_sect + p("SECOND-SECTION");
+    const auto entries = render_entries(note_parts(body, notes_xml("footnote", {{1, paras}})));
+    int last_page = 0;
+    double last_y = 1e9;
+    for (int i = 1; i <= 40; ++i) {
+        const std::string needle = "WIDE-" + std::to_string(i) + "-X";
+        int count = 0;
+        for (const auto& e : entries) count += e.text.find(needle) != std::string::npos;
+        INFO(needle);
+        CHECK(count == 1);
+        const TextEntry& e = entry_with(entries, needle);
+        CHECK((e.page > last_page || e.y < last_y));
+        last_page = e.page;
+        last_y = e.y;
+    }
+    CHECK(last_page >= 1);
+}
+
+
+TEST_CASE("native PDF flows text through columns", "[native_pdf]") {
+    constexpr double kLeft = 56.7, kWidth = 595.3 - 2 * 56.7;
+    // kSect with columns; `type`: this section's start.
+    auto sect = [](const std::string& cols, const std::string& type = {}) {
+        return R"(<w:sectPr>)" + (type.empty() ? std::string() : R"(<w:type w:val=")" + type + R"("/>)") +
+               R"(<w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1134" w:right="1134" w:bottom="1134" w:left="1134"/>)" +
+               cols + "</w:sectPr>";
+    };
+    auto paras = [](const std::string& prefix, int n) {
+        std::string out;
+        for (int i = 0; i < n; ++i) out += para_with(prefix + std::to_string(i));
+        return out;
+    };
+    const double col2 = kLeft + (kWidth - 36.0) / 2.0 + 36.0;  // default space: 1/2 inch
+
+    SECTION("a full column continues at the top of the next, then on the next page") {
+        const auto entries = render_entries(make_parts(paras("L-", 140), {}, {}, sect(R"(<w:cols w:num="2"/>)")));
+        const TextEntry& first = entry_with(entries, "L-0");
+        CHECK(first.x == Catch::Approx(kLeft).margin(0.5));
+        // The first line of the right column: at the left column's top.
+        const auto right = std::find_if(entries.begin(), entries.end(), [&](const TextEntry& e) {
+            return e.page == 0 && e.x > kLeft + 100.0;
+        });
+        REQUIRE(right != entries.end());
+        CHECK(right->x == Catch::Approx(col2).margin(0.5));
+        CHECK(right->y == Catch::Approx(first.y).margin(0.5));
+        // Lines keep their order: left column, right column, next page.
+        int last = -1, page = 0;
+        bool left_side = true;
+        for (const auto& e : entries) {
+            const int i = std::stoi(e.text.substr(2));
+            INFO(e.text << " p" << e.page << " x" << e.x);
+            CHECK(i == last + 1);
+            last = i;
+            const bool now_left = e.x < kLeft + 100.0;
+            if (e.page == page && !left_side) CHECK_FALSE(now_left);  // no going back
+            if (e.page != page) { page = e.page; left_side = true; }
+            left_side = left_side && now_left;
+        }
+        CHECK(page >= 1);
+    }
+    SECTION("a column break starts the next column") {
+        const auto entries = render_entries(make_parts(
+            para_with("TOP-LEFT") + R"(<w:p><w:r><w:br w:type="column"/><w:t>TOP-RIGHT</w:t></w:r></w:p>)",
+            {}, {}, sect(R"(<w:cols w:num="2"/>)")));
+        CHECK(entry_with(entries, "TOP-RIGHT").x == Catch::Approx(col2).margin(0.5));
+        CHECK(entry_with(entries, "TOP-RIGHT").y == Catch::Approx(entry_with(entries, "TOP-LEFT").y).margin(0.5));
+        CHECK(entry_with(entries, "TOP-RIGHT").page == 0);
+    }
+    SECTION("unequal columns: each <w:col>'s width and space") {
+        const auto entries = render_entries(make_parts(
+            para_with("NARROW") + R"(<w:p><w:r><w:br w:type="column"/><w:t>WIDE</w:t></w:r></w:p>)", {}, {},
+            sect(R"(<w:cols w:num="2" w:equalWidth="0"><w:col w:w="2000" w:space="360"/><w:col w:w="7638"/></w:cols>)")));
+        CHECK(entry_with(entries, "WIDE").x == Catch::Approx(kLeft + 100.0 + 18.0).margin(0.5));
+    }
+    SECTION("columns before a continuous section break are levelled, the text after goes below") {
+        const std::string body =
+            para_with("BEFORE") +
+            "<w:p><w:pPr>" + sect("") + "</w:pPr></w:p>" +                      // single column
+            paras("C-", 9) + "<w:p><w:pPr>" + sect(R"(<w:cols w:num="3" w:sep="1"/>)", "continuous") +
+            "</w:pPr></w:p>" + para_with("AFTER");
+        const auto entries = render_entries(make_parts(body, {}, {}, sect("", "continuous")));
+        std::map<int, int> per_column;
+        double lowest = 1e9, top = -1e9;
+        for (const auto& e : entries) {
+            if (e.text.rfind("C-", 0) != 0) continue;
+            INFO(e.text << " x" << e.x << " y" << e.y);
+            CHECK(e.page == 0);
+            ++per_column[static_cast<int>((e.x - kLeft) / (kWidth / 3.0))];
+            lowest = std::min(lowest, e.y);
+            top = std::max(top, e.y);
+        }
+        // 9 + the empty paragraph holding the section break: 10 lines,
+        // 4 + 4 + 2 (one of them that empty paragraph), as in Word.
+        REQUIRE(per_column.size() == 3);
+        CHECK(per_column[0] == 4);
+        CHECK(per_column[1] == 4);
+        CHECK(per_column[2] == 1);
+        CHECK(top < entry_with(entries, "BEFORE").y);
+        const TextEntry& after = entry_with(entries, "AFTER");
+        CHECK(after.page == 0);
+        CHECK(after.x == Catch::Approx(kLeft).margin(0.5));
+        CHECK(after.y < lowest);
+        CHECK(after.y > lowest - 40.0);
+    }
+}
+
+TEST_CASE("native PDF replaces a font without Cyrillic by one of the same kind", "[native_pdf]") {
+    // The fonts embedded in the PDF of `body`, by their base names.
+    auto fonts_of = [](const std::string& body) {
+        const Parts parts = make_parts(body);
+        pugi::xml_document doc;
+        const std::string& xml = parts.at("word/document.xml");
+        REQUIRE(doc.load_buffer(xml.data(), xml.size(), docweft::docx::kXmlParse));
+        const fs::path out = temp_pdf("docweft_native_fonts");
+        docweft::docx::render_native_pdf(doc, parts, out);
+        PoDoFo::PdfMemDocument pdf;
+        pdf.Load(out.string());
+        std::string names;
+        for (const PoDoFo::PdfObject* obj : pdf.GetObjects()) {
+            const PoDoFo::PdfDictionary* dict = nullptr;
+            if (obj->TryGetDictionary(dict) && dict->HasKey("BaseFont") && dict->HasKey("Subtype") &&
+                dict->MustFindKey("Subtype").GetName() == "Type0") {
+                names += std::string(dict->MustFindKey("BaseFont").GetName().GetString()) + " ";
+            }
+        }
+        fs::remove(out);
+        return names;
+    };
+    auto run = [](const char* font, const char* rpr, const char* text) {
+        return std::string(R"(<w:p><w:r><w:rPr><w:rFonts w:ascii=")") + font + R"(" w:hAnsi=")" + font + R"("/>)" +
+               rpr + "</w:rPr><w:t>" + text + "</w:t></w:r></w:p>";
+    };
+    // Needs Caladea (Cambria's substitute, Latin only) and DejaVu Serif /
+    // Sans Mono, the first serif and monospaced replacements tried.
+    PoDoFo::PdfMemDocument probe;
+    for (const char* family : {"Caladea", "DejaVu Serif", "DejaVu Sans Mono"}) {
+        PoDoFo::PdfFont* f = probe.GetFonts().SearchFont(family);
+        if (f == nullptr || std::string(f->GetMetrics().GeFontFamilyNameSafe()) != family) {
+            SKIP(std::string(family) + " isn't installed");
+        }
+    }
+
+    const std::string serif_fonts = fonts_of(run("Cambria", "", "Привет") + run("Cambria", "<w:i/>", "мир"));
+    INFO(serif_fonts);
+    CHECK(contains(serif_fonts, "DejaVuSerif"));
+    CHECK(contains(serif_fonts, "Italic"));
+    CHECK_FALSE(contains(serif_fonts, "DejaVuSans "));
+    CHECK_FALSE(contains(serif_fonts, "DejaVuSans-"));
+
+    // Only the letters Caladea lacks are replaced: the comma stays in it.
+    const std::string mixed_fonts = fonts_of(run("Cambria", "", "выросла,"));
+    INFO(mixed_fonts);
+    CHECK(contains(mixed_fonts, "DejaVuSerif"));
+    CHECK(contains(mixed_fonts, "Caladea"));
+
+    const std::string mono_fonts = fonts_of(run("Consolas", "", "Код"));
+    INFO(mono_fonts);
+    CHECK(contains(mono_fonts, "DejaVuSansMono"));
+}
+
+TEST_CASE("native PDF spaces paragraphs by the larger of space after and before", "[native_pdf]") {
+    // Exact 12 pt lines; the first paragraph has 10 pt after, the second 24 pt before.
+    const std::string body =
+        R"(<w:p><w:pPr><w:spacing w:after="200" w:line="240" w:lineRule="exact"/></w:pPr><w:r><w:t>FIRST</w:t></w:r></w:p>)"
+        R"(<w:p><w:pPr><w:spacing w:before="480" w:after="0" w:line="240" w:lineRule="exact"/></w:pPr><w:r><w:t>SECOND</w:t></w:r></w:p>)";
+    auto gap = [&](const std::string& compat) {
+        Parts extra;
+        if (!compat.empty()) {
+            extra["word/settings.xml"] = std::string(R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:settings)") +
+                                         kNamespaces + "><w:compat>" + compat + "</w:compat></w:settings>";
+        }
+        const auto entries = render_entries(make_parts(body, {}, extra));
+        return entry_with(entries, "FIRST").y - entry_with(entries, "SECOND").y;
+    };
+    CHECK(gap("") == Catch::Approx(12.0 + 24.0).margin(0.1));
+    // "Don't use HTML paragraph auto spacing": they add up.
+    CHECK(gap("<w:doNotUseHTMLParagraphAutoSpacing/>") == Catch::Approx(12.0 + 10.0 + 24.0).margin(0.1));
+}
+
+TEST_CASE("native PDF keeps widow and orphan lines off page edges", "[native_pdf]") {
+    // Exact 12 pt lines, no spacing: kSect's body holds 60 of them.
+    const std::string ppr = R"(<w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="exact"/>)";
+    auto filler = [&](int n) {
+        std::string out;
+        for (int i = 0; i < n; ++i) out += "<w:p><w:pPr>" + ppr + "</w:pPr><w:r><w:t>F" + std::to_string(i) + "</w:t></w:r></w:p>";
+        return out;
+    };
+    auto para = [&](int lines, const std::string& extra = {}) {
+        std::string runs;
+        for (int i = 1; i <= lines; ++i) runs += (i > 1 ? "<w:br/>" : "") + std::string("<w:t>L") + std::to_string(i) + "</w:t>";
+        return "<w:p><w:pPr>" + ppr + extra + "</w:pPr><w:r>" + runs + "</w:r></w:p>";
+    };
+    auto page_of = [](const std::vector<TextEntry>& entries, const std::string& text) {
+        for (const auto& e : entries) if (e.text == text) return e.page;
+        return -1;
+    };
+    SECTION("the last line doesn't go over alone: the one before it goes along") {
+        const auto entries = render_entries(make_parts(filler(57) + para(4), {}, {}, kSect));
+        CHECK(page_of(entries, "L2") == 0);
+        CHECK(page_of(entries, "L3") == 1);
+        CHECK(page_of(entries, "L4") == 1);
+    }
+    SECTION("widowControl off: it does") {
+        const auto entries = render_entries(
+            make_parts(filler(57) + para(4, R"(<w:widowControl w:val="0"/>)"), {}, {}, kSect));
+        CHECK(page_of(entries, "L3") == 0);
+        CHECK(page_of(entries, "L4") == 1);
+    }
+    SECTION("the first line doesn't stay alone: the paragraph moves") {
+        const auto entries = render_entries(make_parts(filler(59) + para(3), {}, {}, kSect));
+        CHECK(page_of(entries, "F58") == 0);
+        CHECK(page_of(entries, "L1") == 1);
+    }
+    SECTION("three lines with room for two: all move, none left alone") {
+        const auto entries = render_entries(make_parts(filler(58) + para(3), {}, {}, kSect));
+        CHECK(page_of(entries, "L1") == 1);
+        CHECK(page_of(entries, "L3") == 1);
+    }
+}
+
+TEST_CASE("native PDF gives table borders room in the row height", "[native_pdf]") {
+    // Two-row tables with all borders `sz` eighths of a point; exact 20 pt
+    // lines (above a row's one-line minimum), no cell margins.
+    auto row_pitch = [](int sz, double* first_top = nullptr) {
+        const std::string b = R"( w:val="single" w:sz=")" + std::to_string(sz) + R"(" w:space="0" w:color="000000"/>)";
+        const std::string ppr = R"(<w:pPr><w:spacing w:before="0" w:after="0" w:line="400" w:lineRule="exact"/></w:pPr>)";
+        auto row = [&](const char* text) {
+            return std::string("<w:tr><w:tc><w:tcPr><w:tcW w:w=\"3000\" w:type=\"dxa\"/></w:tcPr><w:p>") + ppr +
+                   "<w:r><w:t>" + text + "</w:t></w:r></w:p></w:tc></w:tr>";
+        };
+        const std::string body =
+            R"(<w:tbl><w:tblPr><w:tblBorders><w:top)" + b + "<w:left" + b + "<w:bottom" + b + "<w:right" + b +
+            "<w:insideH" + b + "<w:insideV" + b + R"(</w:tblBorders><w:tblCellMar><w:top w:w="0" w:type="dxa"/>)"
+            R"(<w:bottom w:w="0" w:type="dxa"/></w:tblCellMar></w:tblPr><w:tblGrid><w:gridCol w:w="3000"/></w:tblGrid>)" +
+            row("ROWA") + row("ROWB") + "</w:tbl>" + p("AFTER");
+        const auto entries = render_entries(make_parts(body, {}, {}, kSect));
+        if (first_top != nullptr) *first_top = entry_with(entries, "ROWA").y;
+        return std::pair{entry_with(entries, "ROWA").y - entry_with(entries, "ROWB").y,
+                         entry_with(entries, "ROWB").y - entry_with(entries, "AFTER").y};
+    };
+    double top_thin = 0.0, top_thick = 0.0;
+    const auto [thin_rows, thin_after] = row_pitch(4, &top_thin);     // 0.5 pt
+    const auto [thick_rows, thick_after] = row_pitch(24, &top_thick);  // 3 pt
+    // Between rows: the line plus one border.
+    CHECK(thin_rows == Catch::Approx(20.0 + 0.5).margin(0.05));
+    CHECK(thick_rows == Catch::Approx(20.0 + 3.0).margin(0.05));
+    // The text sits under the table's top border, the next paragraph under its bottom one.
+    CHECK(top_thin - top_thick == Catch::Approx(2.5).margin(0.05));
+    CHECK(thick_after - thin_after == Catch::Approx(2.5).margin(0.05));
+}
+
+TEST_CASE("native PDF lays out chart axes as LibreOffice does", "[native_pdf]") {
+    const std::string bars = R"(<c:barChart><c:barDir val="col"/><c:grouping val="clustered"/>)";
+    SECTION("scale: 5 % headroom, the finest 1/2/5 step that fits the axis' length") {
+        // 3400 → 3570: steps 100 and 200 would crowd a ~108 pt axis; 500 gives 8 intervals.
+        const auto entries = render_chart(bars + series_xml(0, "A", 1700, 3400) +
+                                          R"(<c:axId val="1"/><c:axId val="2"/></c:barChart>)" + kAxes);
+        CHECK(has_entry(entries, "500"));
+        CHECK(has_entry(entries, "4000"));
+        CHECK_FALSE(has_entry(entries, "4500"));
+    }
+    SECTION("a value axis title stands turned, left of the value labels") {
+        const auto entries = render_chart(
+            bars + series_xml(0, "A", 3, 5) + R"(<c:axId val="1"/><c:axId val="2"/></c:barChart>)"
+            R"(<c:catAx><c:axId val="1"/><c:axPos val="b"/><c:crossAx val="2"/></c:catAx>)"
+            R"(<c:valAx><c:axId val="2"/><c:title><c:tx><c:rich><a:bodyPr/><a:p><a:r><a:t>VALTITLE</a:t></a:r></a:p>)"
+            R"(</c:rich></c:tx></c:title><c:axPos val="l"/><c:crossAx val="1"/></c:valAx>)");
+        REQUIRE(has_entry(entries, "VALTITLE"));
+        CHECK(entry_with(entries, "VALTITLE").x < entry_with(entries, "Q1").x);
+        // Turned: it starts within the axis' height (above its "0", below
+        // the plot's top) rather than sitting over the plot.
+        const double zero = entry_with(entries, "0").y;
+        CHECK(entry_with(entries, "VALTITLE").y > zero);
+        CHECK(entry_with(entries, "VALTITLE").y < zero + 100.0);
+    }
+    SECTION("area charts put their points on the category ticks, edge to edge") {
+        auto spread = [&](const std::string& plot) {
+            const auto entries = render_chart(plot + kAxes);
+            return entry_with(entries, "Q2").x - entry_with(entries, "Q1").x;
+        };
+        const double area = spread(R"(<c:areaChart><c:grouping val="standard"/>)" + series_xml(0, "A", 3, 5) +
+                                   R"(<c:axId val="1"/><c:axId val="2"/></c:areaChart>)");
+        const double bar = spread(bars + series_xml(0, "A", 3, 5) + R"(<c:axId val="1"/><c:axId val="2"/></c:barChart>)");
+        CHECK(area > bar * 1.5);  // the whole plot width, not half of it
+    }
+}
+
+TEST_CASE("native PDF wraps long chart titles", "[native_pdf]") {
+    // 18 pt bold (the default) in the 236 pt wide test chart: a line may
+    // take 80 % of it.
+    auto title_lines = [](const std::string& rich_paragraphs) {
+        const std::string chart =
+            std::string(R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?><c:chartSpace)") + kNamespaces +
+            "><c:chart><c:title><c:tx><c:rich><a:bodyPr/>" + rich_paragraphs + "</c:rich></c:tx></c:title><c:plotArea>"
+            R"(<c:barChart><c:barDir val="col"/><c:grouping val="clustered"/>)" + series_xml(0, "A", 3, 5) +
+            R"(<c:axId val="1"/><c:axId val="2"/></c:barChart>)" + kAxes + "</c:plotArea></c:chart></c:chartSpace>";
+        const auto entries = render_entries(make_parts(chart_paragraph("rIdC"), {{"rIdC", "chart", "charts/chart1.xml"}},
+                                                       {{"word/charts/chart1.xml", chart}}, kSect));
+        std::set<long> ys;
+        for (const auto& e : entries) {
+            if (e.text.find("WORD") != std::string::npos) ys.insert(std::lround(e.y));
+        }
+        return ys.size();
+    };
+    auto para = [](const std::string& text) { return "<a:p><a:r><a:t>" + text + "</a:t></a:r></a:p>"; };
+    CHECK(title_lines(para("WORDA WORDB")) == 1);
+    CHECK(title_lines(para("WORDA WORDB WORDC WORDD WORDE WORDF WORDG WORDH")) >= 2);
+    // Each paragraph of the title's rich text starts a line of its own.
+    CHECK(title_lines(para("WORDA") + para("WORDB")) == 2);
+}
+
+TEST_CASE("native PDF wraps long axis titles", "[native_pdf]") {
+    // Bold 10 pt axis titles in the 236 x 142 pt test chart.
+    auto axis_title_lines = [](const std::string& cat_title, const std::string& val_title) {
+        auto title = [](const std::string& text) {
+            return "<c:title><c:tx><c:rich><a:bodyPr/><a:p><a:r><a:t>" + text + "</a:t></a:r></a:p></c:rich></c:tx></c:title>";
+        };
+        const auto entries = render_chart(
+            R"(<c:barChart><c:barDir val="col"/><c:grouping val="clustered"/>)" + series_xml(0, "A", 3, 5) +
+            R"(<c:axId val="1"/><c:axId val="2"/></c:barChart>)"
+            R"(<c:catAx><c:axId val="1"/>)" + title(cat_title) + R"(<c:axPos val="b"/><c:crossAx val="2"/></c:catAx>)"
+            R"(<c:valAx><c:axId val="2"/>)" + title(val_title) + R"(<c:axPos val="l"/><c:crossAx val="1"/></c:valAx>)");
+        std::set<long> cat_rows, val_columns;
+        for (const auto& e : entries) {
+            if (e.text.find("CAT") != std::string::npos) cat_rows.insert(std::lround(e.y));
+            if (e.text.find("VAL") != std::string::npos) val_columns.insert(std::lround(e.x));
+        }
+        return std::pair{cat_rows.size(), val_columns.size()};
+    };
+    const auto [short_cat, short_val] = axis_title_lines("CATA CATB", "VALA VALB");
+    CHECK(short_cat == 1);
+    CHECK(short_val == 1);
+    // Wider than 80 % of the chart / longer than the plot box's height.
+    const auto [long_cat, long_val] = axis_title_lines(
+        "CATA CATB CATC CATD CATE CATF CATG CATH CATI CATJ CATK CATL CATM CATN",
+        "VALA VALB VALC VALD VALE VALF VALG VALH VALI VALJ VALK VALL VALM VALN");
+    CHECK(long_cat >= 2);   // rows, one under another
+    CHECK(long_val >= 2);   // turned: columns side by side
 }
 
 #endif  // DOCWEFT_HAVE_PODOFO

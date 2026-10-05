@@ -19,18 +19,26 @@ namespace docweft::docx {
 /// — TOC page numbers — filled in from its own layout), keep with next,
 /// headers/footers and page breaks, several sections (page size,
 /// orientation, margins, headers/footers, page numbering restarts and
-/// formats); tables with borders, shading, table style regions (header
-/// row, banding, ...), margins, vertical alignment, row heights,
-/// vertically merged cells and repeated header rows; PNG/JPEG images, inline or floating (<wp:anchor>: positioned,
-/// in front of or behind the text, text kept out of their band);
-/// bar/line/area/pie/doughnut charts — stacked, 100 % stacked,
+/// formats); tables with borders, shading, table styles (following
+/// <w:basedOn>) and their regions (header row, banding, ...), margins,
+/// vertical alignment, row heights, vertically merged cells and repeated
+/// header rows; footnotes at the bottom of their reference's page (long
+/// ones continued on the next) and endnotes at the end of the document or
+/// section, numbered as <w:footnotePr>/<w:endnotePr> say; PNG/JPEG
+/// images, inline or floating (<wp:anchor>: positioned on the page or in
+/// their table cell, in front of or behind
+/// the text, text kept out of their band); text boxes and simple shapes
+/// (rectangle, rounded rectangle, ellipse, line) with fill, outline and
+/// text; bar/line/area/pie/doughnut charts — stacked, 100 % stacked,
 /// horizontal, combined with a secondary axis — with the template's
-/// colors, titles and data labels.
+/// colors, titles and data labels, numbers in the document's language.
+
 ///
 /// Strict mode (on unless DOCWEFT_NATIVE_PDF_STRICT=0): before drawing, the
 /// document is checked for content this renderer would get wrong rather
-/// than just plainer — text boxes, footnotes, equations, multi-column
-/// layout, non-PNG/JPEG images, SmartArt and shapes, radar/scatter/...
+/// than just plainer — equations, multi-column layout,
+/// non-PNG/JPEG images, SmartArt, shape groups, freeform or rotated
+/// shapes, legacy VML graphics, radar/scatter/...
 /// charts, pie charts mixed with other types, ... — and rejected with
 /// NotImplemented listing all of them, so the caller's converter chain can
 /// move on.

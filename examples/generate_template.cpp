@@ -84,6 +84,8 @@ constexpr std::string_view kContentTypes = R"(<?xml version="1.0" encoding="UTF-
             ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
   <Override PartName="/word/styles.xml"
             ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>
+  <Override PartName="/word/settings.xml"
+            ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/>
   <Override PartName="/word/charts/chart1.xml"
             ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>
 </Types>)";
@@ -95,11 +97,31 @@ constexpr std::string_view kPackageRels = R"(<?xml version="1.0" encoding="UTF-8
                 Target="word/document.xml"/>
 </Relationships>)";
 
+// Document settings as a new Word 2013+ document has them. Without this
+// part a converter falls back to its own defaults — LibreOffice then adds
+// up the space after one paragraph and before the next, which Word (and
+// LibreOffice for a document that has settings) doesn't.
+constexpr std::string_view kSettings = R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:defaultTabStop w:val="720"/>
+  <w:characterSpacingControl w:val="doNotCompress"/>
+  <w:compat>
+    <w:compatSetting w:name="compatibilityMode" w:uri="http://schemas.microsoft.com/office/word" w:val="15"/>
+    <w:compatSetting w:name="overrideTableStyleFontSizeAndJustification" w:uri="http://schemas.microsoft.com/office/word" w:val="1"/>
+    <w:compatSetting w:name="enableOpenTypeFeatures" w:uri="http://schemas.microsoft.com/office/word" w:val="1"/>
+    <w:compatSetting w:name="doNotFlipMirrorIndents" w:uri="http://schemas.microsoft.com/office/word" w:val="1"/>
+    <w:compatSetting w:name="differentiateMultirowTableHeaders" w:uri="http://schemas.microsoft.com/office/word" w:val="1"/>
+  </w:compat>
+</w:settings>)";
+
 constexpr std::string_view kDocumentRels = R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
   <Relationship Id="rId1"
                 Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles"
                 Target="styles.xml"/>
+  <Relationship Id="rIdSettings"
+                Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings"
+                Target="settings.xml"/>
   <Relationship Id="rIdChart1"
                 Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart"
                 Target="charts/chart1.xml"/>
@@ -299,6 +321,7 @@ int main(int argc, char** argv) {
         {"_rels/.rels",                  std::string(kPackageRels)},
         {"word/_rels/document.xml.rels", std::string(kDocumentRels)},
         {"word/styles.xml",              std::string(kStyles)},
+        {"word/settings.xml",            std::string(kSettings)},
         {"word/document.xml",            std::string(kDocument)},
         {"word/charts/chart1.xml",       std::string(kChart)},
     };

@@ -161,7 +161,7 @@ void DocxMerger::load(const std::string& path) {
 
 void DocxMerger::reparse_document() {
     const std::string& xml = parts_.at(kDocumentPart);
-    const auto result = document_.load_buffer(xml.data(), xml.size());
+    const auto result = document_.load_buffer(xml.data(), xml.size(), kXmlParse);
     if (!result) {
         throw ReportException(
             ReportError::CantCopyDocxTemplate,
@@ -244,10 +244,18 @@ void DocxMerger::write_archive(
 //        Windows: detected via HKCR\Word.Application\CLSID, driven by a
 //                 generated VBScript through `cscript //B` (started without a
 //                 shell or console window).
-//        macOS:   detected via Microsoft Word.app in /Applications or
-//                 ~/Applications, driven by AppleScript through `osascript`.
-//                 The first run shows the system "allow to control Microsoft
-//                 Word" (Automation) prompt; the host app bundle needs
+//        macOS:   opt-in (setWordConversion(Enabled) or DOCWEFT_MSWORD):
+//                 Word comes to the front while converting, and it is
+//                 sandboxed: it works in a folder inside its own container
+//                 (no "Grant File Access" dialog), which the host may need a
+//                 one-time "access data from other apps" approval to write
+//                 into — not something to spring on a host by default. When
+//                 the container is missing, Word saves into the scratch
+//                 folder and asks for access to it. Detected via
+//                 Microsoft Word.app in /Applications or ~/Applications,
+//                 driven by AppleScript through `osascript`. The first run
+//                 shows the system "allow to control Microsoft Word"
+//                 (Automation) prompt; the host app bundle needs
 //                 NSAppleEventsUsageDescription (and, under hardened runtime,
 //                 com.apple.security.automation.apple-events).
 //   2. LibreOffice `soffice --headless --convert-to` (all platforms).
@@ -268,6 +276,10 @@ void DocxMerger::write_archive(
 //                                chain. Used by tests to assert the
 //                                NoConverter path.
 //   DOCWEFT_NO_MSWORD          — any non-empty value skips Word.
+//   DOCWEFT_MSWORD             — any non-empty value turns Word on on macOS.
+//                                Both are read only under
+//                                WordConversion::Default; an explicit
+//                                setWordConversion() wins.
 //   DOCWEFT_SOFFICE            — absolute path to soffice. If set non-empty
 //                                it is used as-is (no other LibreOffice
 //                                probe). Empty value disables the
@@ -275,10 +287,12 @@ void DocxMerger::write_archive(
 //   DOCWEFT_SOFFICE_TIMEOUT    — LibreOffice time limit, seconds (default
 //                                120). On expiry soffice and its child
 //                                processes are killed and the chain moves on.
-//   DOCWEFT_MSWORD_TIMEOUT     — Word (Windows) time limit, seconds (default
-//                                300). On expiry cscript and the WINWORD.EXE
-//                                it started are stopped and the chain moves
-//                                on (see run_msword_conversion()).
+//   DOCWEFT_MSWORD_TIMEOUT     — Word time limit, seconds (default 300).
+//                                Windows: on expiry cscript and the
+//                                WINWORD.EXE it started are stopped and the
+//                                chain moves on (see run_msword_conversion()).
+//                                macOS: bounds each Apple Event of the script
+//                                (see run_msword_mac_conversion()).
 //   DOCWEFT_CONVERTER_URL     — remote converter endpoint, e.g.
 //                                http://localhost:3000/forms/libreoffice/convert
 //   DOCWEFT_CONVERTER_TOKEN    — optional; sent as `Authorization: Bearer`.
@@ -436,7 +450,9 @@ struct ConverterChain {
 };
 
 // Build the chain for `format` ("pdf" or "html").
-ConverterChain find_converters(const std::string& format) {
+ConverterChain find_converters(const std::string& format,
+                               IReportMerger::WordConversion word_mode) {
+    using WordConversion = IReportMerger::WordConversion;
     (void)format;  // only consulted by the .pdf-only backends, if compiled in
     ConverterChain chain;
     if (env_nonempty("DOCWEFT_DISABLE_CONVERTERS")) {
@@ -448,9 +464,18 @@ ConverterChain find_converters(const std::string& format) {
         chain.skipped.push_back(fmt::format("{}: {}", converter_label(kind), why));
     };
 
-    if (env_nonempty("DOCWEFT_NO_MSWORD")) {
+    std::string word = find_msword();
+    if (word_mode == WordConversion::Disabled) {
+        skip(ConverterKind::MSWord, "disabled by setWordConversion(Disabled)");
+    } else if (word_mode == WordConversion::Default && env_nonempty("DOCWEFT_NO_MSWORD")) {
         skip(ConverterKind::MSWord, "disabled by DOCWEFT_NO_MSWORD");
-    } else if (std::string word = find_msword(); !word.empty()) {
+#ifdef __APPLE__
+    } else if (word_mode == WordConversion::Default && !word.empty()
+               && !env_nonempty("DOCWEFT_MSWORD")) {
+        skip(ConverterKind::MSWord, "installed, but off by default on macOS — turn "
+                                    "it on with setWordConversion(Enabled) or DOCWEFT_MSWORD=1");
+#endif
+    } else if (!word.empty()) {
         chain.available.push_back({ConverterKind::MSWord, std::move(word), {}});
     } else {
 #if defined(_WIN32) || defined(__APPLE__)
@@ -573,7 +598,7 @@ constexpr const char* kDefaultThemeXml =
     const auto rels_it = parts.find("word/_rels/document.xml.rels");
     if (rels_it == parts.end()) return false;  // no rels → charts can't be linked anyway
     pugi::xml_document rels;
-    if (!rels.load_buffer(rels_it->second.data(), rels_it->second.size())) return false;
+    if (!rels.load_buffer(rels_it->second.data(), rels_it->second.size(), kXmlParse)) return false;
     for (auto rel : rels.child("Relationships").children("Relationship")) {
         if (std::strcmp(rel.attribute("Type").value(), kThemeRelType) == 0) return false;
     }
@@ -591,7 +616,7 @@ void add_default_theme(std::unordered_map<std::string, std::string>& parts) {
 
     auto& rels_xml = parts["word/_rels/document.xml.rels"];
     pugi::xml_document rels;
-    rels.load_buffer(rels_xml.data(), rels_xml.size());
+    rels.load_buffer(rels_xml.data(), rels_xml.size(), kXmlParse);
     auto rel = rels.child("Relationships").append_child("Relationship");
     rel.append_attribute("Id").set_value("rIdDocWeftTheme");
     rel.append_attribute("Type").set_value(kThemeRelType);
@@ -602,7 +627,7 @@ void add_default_theme(std::unordered_map<std::string, std::string>& parts) {
 
     auto& ct_xml = parts["[Content_Types].xml"];
     pugi::xml_document ct;
-    ct.load_buffer(ct_xml.data(), ct_xml.size());
+    ct.load_buffer(ct_xml.data(), ct_xml.size(), kXmlParse);
     auto ovr = ct.child("Types").append_child("Override");
     ovr.append_attribute("PartName").set_value(("/" + part_name).c_str());
     ovr.append_attribute("ContentType").set_value(kThemeContentType);
@@ -780,16 +805,35 @@ ProcessResult run_with_timeout(const std::vector<std::filesystem::path>& args,
 // success, otherwise the reason. Bounded by DOCWEFT_SOFFICE_TIMEOUT —
 // soffice can hang on a dialog or a stuck profile lock, and save() must not
 // hang with it.
+//
+// The user's LibreOffice profile can be used by one soffice at a time:
+// while another one is starting or converting (another save() running in
+// parallel), a second exits with code 1 without a word. Such a failure is
+// retried a few times after a short wait, still with the user's profile:
+// a fresh profile of its own would double the time (creating it) and
+// ignore the user's LibreOffice settings. A failure that says something
+// isn't retried.
 std::string run_soffice_conversion(const std::filesystem::path& soffice,
                                    const std::string& format,  // "pdf" or "html"
                                    const std::filesystem::path& input,
                                    const std::filesystem::path& outdir)
 {
     const int timeout_s = env_seconds("DOCWEFT_SOFFICE_TIMEOUT", 120);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_s);
     const std::filesystem::path err = outdir / "tf_soffice.err";
-    const ProcessResult r = run_with_timeout(
-        {soffice, "--headless", "--convert-to", format, "--outdir", outdir, input},
-        err, std::chrono::seconds(timeout_s));
+    ProcessResult r;
+    auto wait = std::chrono::milliseconds(250);
+    for (int attempt = 0;; ++attempt) {
+        const auto left = std::chrono::duration_cast<std::chrono::seconds>(
+            deadline - std::chrono::steady_clock::now());
+        r = run_with_timeout(
+            {soffice, "--headless", "--convert-to", format, "--outdir", outdir, input},
+            err, std::max(left, std::chrono::seconds(1)));
+        const bool busy = r.started && !r.timed_out && r.exit_code == 1 && read_error_text(err).empty();
+        if (!busy || attempt == 5 || std::chrono::steady_clock::now() + wait >= deadline) break;
+        std::this_thread::sleep_for(wait);
+        wait = std::min(wait * 2, std::chrono::milliseconds(2000));
+    }
 
     if (!r.started) return "could not start soffice";
     if (r.timed_out) {
@@ -1163,18 +1207,91 @@ void inline_local_images(const std::filesystem::path& html_path,
 
 
 #ifdef __APPLE__
+// A fresh folder inside Word's own sandbox container
+// (~/Library/Containers/com.microsoft.Word/Data/tmp/docweft-*), or empty when
+// the container doesn't exist (Word never launched) or can't be written.
+// Word reads and writes there without the "Grant File Access" dialog; the
+// usual workaround for automating sandboxed Office on Mac. Since macOS 14
+// the host itself may get a one-time "access data from other apps" prompt
+// for writing into another app's container.
+std::filesystem::path make_msword_container_dir() {
+    const std::string home = home_dir();
+    if (home.empty()) return {};
+    const std::filesystem::path data =
+        std::filesystem::path(home) / "Library/Containers/com.microsoft.Word/Data";
+    std::error_code ec;
+    if (!std::filesystem::is_directory(data, ec)) return {};
+    const auto ts = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const std::filesystem::path dir = data / "tmp" / fmt::format("docweft-{}", ts);
+    if (!std::filesystem::create_directories(dir, ec) || ec) return {};
+    return dir;
+}
+
+// Move every entry of `from` into `to` (rename, or copy when rename fails,
+// e.g. across volumes). Returns an empty string on success.
+std::string move_dir_contents(const std::filesystem::path& from,
+                              const std::filesystem::path& to)
+{
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(from, ec)) {
+        const std::filesystem::path dest = to / entry.path().filename();
+        std::error_code mv_ec;
+        std::filesystem::rename(entry.path(), dest, mv_ec);
+        if (!mv_ec) continue;
+        std::filesystem::copy(entry.path(), dest,
+                              std::filesystem::copy_options::recursive |
+                              std::filesystem::copy_options::overwrite_existing,
+                              mv_ec);
+        if (mv_ec) {
+            return fmt::format("cannot move {} out of Word's container: {}",
+                               entry.path().filename().string(), mv_ec.message());
+        }
+    }
+    if (ec) return "cannot read Word's container folder: " + ec.message();
+    return {};
+}
+
 // Run Word for Mac via AppleScript. Returns an empty string on success,
 // otherwise the reason. Word is quit afterwards only if this call started
-// it. `with timeout` bounds each Apple Event, so a dialog nobody answers
-// (sign-in, "Grant File Access" for the sandbox) fails the step instead of
-// hanging save() forever.
+// it. `with timeout` (DOCWEFT_MSWORD_TIMEOUT) bounds each Apple Event, so a
+// dialog nobody answers (sign-in, "Grant File Access" for the sandbox) fails
+// the step instead of hanging save() forever.
+//
+// Word opens and saves inside its own container (make_msword_container_dir)
+// and the result — with the image folder of an HTML export — is moved next
+// to `output` afterwards. Without the container Word works on the scratch
+// folder directly and shows "Grant File Access" for it.
 std::string run_msword_mac_conversion(const std::string& format,  // "pdf" or "html"
                                       const std::filesystem::path& input,
                                       const std::filesystem::path& output)
 {
+    const std::filesystem::path work = make_msword_container_dir();
+    std::error_code rm_ec;
+    struct WorkGuard {
+        const std::filesystem::path& dir;
+        ~WorkGuard() {
+            std::error_code ec;
+            if (!dir.empty()) std::filesystem::remove_all(dir, ec);
+        }
+    } work_guard{work};
+
+    std::filesystem::path word_input  = input;
+    std::filesystem::path word_output = output;
+    if (!work.empty()) {
+        word_input  = work / input.filename();
+        word_output = work / output.filename();
+        std::error_code cp_ec;
+        std::filesystem::copy_file(input, word_input, cp_ec);
+        if (cp_ec) {
+            return "cannot copy the document into Word's container: " + cp_ec.message();
+        }
+    }
+
     const std::filesystem::path dir    = output.parent_path();
     const std::filesystem::path script = dir / "tf_msword.applescript";
     const std::filesystem::path err    = dir / "tf_msword.err";
+    const int timeout_s = env_seconds("DOCWEFT_MSWORD_TIMEOUT", 300);
     {
         std::ofstream os(script, std::ios::binary);
         if (!os) return "cannot write the AppleScript file";
@@ -1182,7 +1299,7 @@ std::string run_msword_mac_conversion(const std::string& format,  // "pdf" or "h
               "  set inFile to POSIX file (item 1 of argv)\n"
               "  set outPath to item 2 of argv\n"
               "  set wasRunning to application \"Microsoft Word\" is running\n"
-              "  with timeout of 300 seconds\n"
+              "  with timeout of " << timeout_s << " seconds\n"
               "    tell application \"Microsoft Word\"\n"
               "      open inFile\n"
               "      set doc to active document\n"
@@ -1203,18 +1320,34 @@ std::string run_msword_mac_conversion(const std::string& format,  // "pdf" or "h
     const std::string cmd = fmt::format(
         "osascript {} {} {} >/dev/null 2>{}",
         shell_quote(script.string()),
-        shell_quote(std::filesystem::absolute(input).string()),
-        shell_quote(std::filesystem::absolute(output).string()),
+        shell_quote(std::filesystem::absolute(word_input).string()),
+        shell_quote(std::filesystem::absolute(word_output).string()),
         shell_quote(err.string()));
     const int rc = std::system(cmd.c_str());
-    std::error_code ec;
-    std::filesystem::remove(script, ec);
-    if (rc == 0) return {};
+    std::filesystem::remove(script, rm_ec);
+    if (rc == 0) {
+        if (work.empty()) return {};
+        std::filesystem::remove(word_input, rm_ec);
+        return move_dir_contents(work, dir);
+    }
 
     const std::string text = read_error_text(err);
     if (text.find("-1743") != std::string::npos) {
         return "macOS denied control of Microsoft Word — allow it in System "
                "Settings → Privacy & Security → Automation";
+    }
+    // errAETimeout: Word sat on an event, most likely behind a dialog.
+    if (text.find("-1712") != std::string::npos) {
+        return fmt::format("Microsoft Word did not answer within {} s "
+                           "(DOCWEFT_MSWORD_TIMEOUT) — probably waiting on a "
+                           "dialog such as sign-in or \"Grant File Access\"",
+                           timeout_s);
+    }
+    // userCanceledErr: a dialog in Word was cancelled — in practice the
+    // sandbox's "Grant File Access" for the folder Word saves into.
+    if (text.find("-128") != std::string::npos) {
+        return "a dialog in Microsoft Word was cancelled (most likely \"Grant "
+               "File Access\" for the temporary folder it saves into): " + text;
     }
     return text.empty() ? "osascript failed" : "osascript: " + text;
 }
@@ -1303,6 +1436,10 @@ std::string run_remote_conversion(const std::string& url,
 
 } // namespace
 
+void DocxMerger::setWordConversion(WordConversion mode) {
+    word_conversion_ = mode;
+}
+
 void DocxMerger::save(const std::string& path) {
     if (!loaded_) {
         throw ReportException(ReportError::SaveFailed,
@@ -1314,7 +1451,7 @@ void DocxMerger::save(const std::string& path) {
 
     if (ext == ".pdf" || ext == ".html" || ext == ".htm") {
         const std::string conv_format = (ext == ".pdf") ? "pdf" : "html";
-        const ConverterChain chain = find_converters(conv_format);
+        const ConverterChain chain = find_converters(conv_format, word_conversion_);
         if (chain.available.empty()) {
             std::string why;
             for (const auto& s : chain.skipped) why += "\n  - " + s;
@@ -1757,7 +1894,7 @@ void DocxMerger::setClipboardValue(const std::string& bookmark,
             any_part = true;
 
             pugi::xml_document part_doc;
-            if (!part_doc.load_buffer(bytes.data(), bytes.size())) continue;
+            if (!part_doc.load_buffer(bytes.data(), bytes.size(), kXmlParse)) continue;
 
             auto texts = collect_text_descendants(part_doc.document_element());
             if (replace_placeholder_in(texts, field, value)) {
@@ -1987,7 +2124,7 @@ std::string add_image_relationship(
     ensure_doc_rels_present(parts);
     pugi::xml_document rels;
     const auto& xml = parts[kDocRelsPart];
-    if (!rels.load_buffer(xml.data(), xml.size())) {
+    if (!rels.load_buffer(xml.data(), xml.size(), kXmlParse)) {
         throw ReportException(
             ReportError::CantCopyDocxTemplate,
             "document.xml.rels is not valid XML");
@@ -2025,7 +2162,7 @@ void ensure_content_type(
             "[Content_Types].xml is missing from the archive");
     }
     pugi::xml_document ct;
-    if (!ct.load_buffer(it->second.data(), it->second.size())) {
+    if (!ct.load_buffer(it->second.data(), it->second.size(), kXmlParse)) {
         throw ReportException(
             ReportError::CantCopyDocxTemplate,
             "[Content_Types].xml is not valid XML");
@@ -2210,8 +2347,7 @@ void DocxMerger::setImage(const std::string& bookmark,
     // namespaces are already declared on the root <w:document> element, so
     // parsing as a fragment with default options is safe.
     const auto parse_result = drawing_doc.load_buffer(
-        draw_xml.data(), draw_xml.size(),
-        pugi::parse_default | pugi::parse_ws_pcdata_single);
+        draw_xml.data(), draw_xml.size(), kXmlParse);
     if (!parse_result) {
         throw ReportException(
             ReportError::SaveFailed,
@@ -2278,7 +2414,7 @@ std::string resolve_doc_rid(const std::string& rels_xml,
                             const std::string& rid)
 {
     pugi::xml_document rels;
-    if (!rels.load_buffer(rels_xml.data(), rels_xml.size())) return {};
+    if (!rels.load_buffer(rels_xml.data(), rels_xml.size(), kXmlParse)) return {};
     for (auto rel : rels.child("Relationships").children("Relationship")) {
         if (rid == rel.attribute("Id").value()) {
             return rel.attribute("Target").value();
@@ -2444,7 +2580,7 @@ void DocxMerger::setChartValue(const std::string& bookmark,
     auto chart_it = parts_.find(chart_part);
 
     pugi::xml_document chart_doc;
-    if (!chart_doc.load_buffer(chart_it->second.data(), chart_it->second.size())) {
+    if (!chart_doc.load_buffer(chart_it->second.data(), chart_it->second.size(), kXmlParse)) {
         throw ReportException(
             ReportError::CantCopyDocxTemplate,
             fmt::format("chart part is not valid XML: {}", chart_part));
@@ -2653,7 +2789,8 @@ void rewrite_numeric_cache(pugi::xml_node val, const std::string& range,
 // from whatever <c:tx>/<c:rich> already existed, so a template's chosen
 // title styling survives a programmatic setChartTitle/setChartAxisTitle
 // call instead of being reset to bare defaults. A brand-new title (no
-// prior <c:tx>) gets the minimal empty skeleton the schema requires.
+// prior <c:tx>) gets the minimal empty skeleton the schema requires (a
+// <c:title> created from scratch is then styled by style_new_title()).
 void set_rich_title_text(pugi::xml_node title, const std::string& text) {
     auto old_tx   = title.child("c:tx");
     auto old_rich = old_tx ? old_tx.child("c:rich") : pugi::xml_node{};
@@ -2695,14 +2832,52 @@ pugi::xml_node axis_title_anchor(pugi::xml_node ax) {
     return {};
 }
 
+// Font of a title created from scratch: `sz` in hundredths of a point,
+// Word's dark grey text (tx1 at 65 %).
+void set_new_title_font(pugi::xml_node props, const char* sz, bool bold) {
+    props.append_attribute("sz") = sz;
+    props.append_attribute("b")  = bold ? "1" : "0";
+    auto clr = props.append_child("a:solidFill").append_child("a:schemeClr");
+    clr.append_attribute("val") = "tx1";
+    clr.append_child("a:lumMod").append_attribute("val") = "65000";
+    clr.append_child("a:lumOff").append_attribute("val") = "35000";
+}
+
+// Give a <c:title> that set_rich_title_text() has just filled with the
+// bare skeleton what Word writes for a title added in its UI: an explicit
+// <c:overlay val="0"/> (without it, whether the title takes room from the
+// plot area is up to each reader) and a font size, so viewers don't each
+// pick their own default — 14 pt for the chart's title, 10 pt bold for an
+// axis's, turned a quarter on a side axis.
+void style_new_title(pugi::xml_node title, pugi::xml_node owner) {
+    const bool axis = std::string_view(owner.name()) != "c:chart";
+    const char* sz  = axis ? "1000" : "1400";
+    auto rich = title.child("c:tx").child("c:rich");
+    if (axis) {
+        const std::string_view pos = owner.child("c:axPos").attribute("val").value();
+        if (pos == "l" || pos == "r") {
+            auto body = rich.child("a:bodyPr");
+            body.append_attribute("rot")  = "-5400000";
+            body.append_attribute("vert") = "horz";
+        }
+    }
+    auto p = rich.child("a:p");
+    set_new_title_font(p.prepend_child("a:pPr").append_child("a:defRPr"), sz, axis);
+    set_new_title_font(p.child("a:r").prepend_child("a:rPr"), sz, axis);
+    // CT_Title: tx, layout, overlay, spPr, txPr.
+    title.insert_child_after("c:overlay", title.child("c:tx")).append_attribute("val") = "0";
+}
+
 // Set (creating if absent) the title of `chart_node`'s <c:title> itself, or
 // an axis's <c:title> when `ax` is non-null — shared by setChartTitle and
 // setChartAxisTitle. `insert_before` is where a brand-new <c:title> goes
 // (schema-position anchor); for the chart's own title this also clears
-// <c:autoTitleDeleted>.
+// <c:autoTitleDeleted>. A brand-new title is styled as Word styles one
+// (style_new_title()); the template's own title keeps its formatting.
 void set_title(pugi::xml_node owner, pugi::xml_node insert_before, const std::string& text) {
     auto title_node = owner.child("c:title");
-    if (!title_node) {
+    const bool created = !title_node;
+    if (created) {
         if (!insert_before) {
             throw ReportException(ReportError::CantCopyDocxTemplate,
                                   "chart is missing a required element to anchor a new <c:title> at");
@@ -2710,6 +2885,7 @@ void set_title(pugi::xml_node owner, pugi::xml_node insert_before, const std::st
         title_node = owner.insert_child_before("c:title", insert_before);
     }
     set_rich_title_text(title_node, text);
+    if (created) style_new_title(title_node, owner);
 }
 
 // True if `plot_area` contains at least one supported (cat/val-shaped)
@@ -2844,7 +3020,7 @@ std::string resolve_workbook_sheet_part(
     auto rels_it = wb_parts.find("xl/_rels/workbook.xml.rels");
     if (wb_it != wb_parts.end() && rels_it != wb_parts.end() && !sheet_name.empty()) {
         pugi::xml_document wb_doc;
-        if (wb_doc.load_buffer(wb_it->second.data(), wb_it->second.size())) {
+        if (wb_doc.load_buffer(wb_it->second.data(), wb_it->second.size(), kXmlParse)) {
             for (auto sheet : wb_doc.child("workbook").child("sheets").children("sheet")) {
                 if (sheet_name != sheet.attribute("name").value()) continue;
                 const std::string rid = sheet.attribute("r:id").value();
@@ -2944,7 +3120,7 @@ void DocxMerger::setChartSeriesName(const std::string& bookmark,
     auto chart_it = parts_.find(chart_part);
 
     pugi::xml_document chart_doc;
-    if (!chart_doc.load_buffer(chart_it->second.data(), chart_it->second.size())) {
+    if (!chart_doc.load_buffer(chart_it->second.data(), chart_it->second.size(), kXmlParse)) {
         throw ReportException(
             ReportError::CantCopyDocxTemplate,
             fmt::format("chart part is not valid XML: {}", chart_part));
@@ -2998,7 +3174,7 @@ void DocxMerger::setChartTitle(const std::string& bookmark, const std::string& t
     auto chart_it = parts_.find(chart_part);
 
     pugi::xml_document chart_doc;
-    if (!chart_doc.load_buffer(chart_it->second.data(), chart_it->second.size())) {
+    if (!chart_doc.load_buffer(chart_it->second.data(), chart_it->second.size(), kXmlParse)) {
         throw ReportException(
             ReportError::CantCopyDocxTemplate,
             fmt::format("chart part is not valid XML: {}", chart_part));
@@ -3043,7 +3219,7 @@ void DocxMerger::setChartAxisTitle(const std::string& bookmark,
     auto chart_it = parts_.find(chart_part);
 
     pugi::xml_document chart_doc;
-    if (!chart_doc.load_buffer(chart_it->second.data(), chart_it->second.size())) {
+    if (!chart_doc.load_buffer(chart_it->second.data(), chart_it->second.size(), kXmlParse)) {
         throw ReportException(
             ReportError::CantCopyDocxTemplate,
             fmt::format("chart part is not valid XML: {}", chart_part));
@@ -3107,7 +3283,7 @@ void DocxMerger::setChartData(const std::string&              bookmark,
     auto chart_it = parts_.find(chart_part);
 
     pugi::xml_document chart_doc;
-    if (!chart_doc.load_buffer(chart_it->second.data(), chart_it->second.size())) {
+    if (!chart_doc.load_buffer(chart_it->second.data(), chart_it->second.size(), kXmlParse)) {
         throw ReportException(
             ReportError::CantCopyDocxTemplate,
             fmt::format("chart part is not valid XML: {}", chart_part));

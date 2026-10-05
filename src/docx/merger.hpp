@@ -15,6 +15,12 @@ namespace docweft::docx {
 /// Name of the main document part inside every .docx archive.
 inline constexpr const char* kDocumentPart = "word/document.xml";
 
+/// pugixml options for parsing a part. parse_ws_pcdata_single keeps the text
+/// of an element that holds only whitespace — `<w:t xml:space="preserve"> </w:t>`,
+/// the space Word often puts in a run of its own — which the defaults drop
+/// (the space would vanish from every saved and converted document).
+inline constexpr unsigned kXmlParse = pugi::parse_default | pugi::parse_ws_pcdata_single;
+
 /// In-memory representation of a loaded .docx.
 /// We keep the full archive contents as a (path → bytes) map so we can
 /// rewrite any part and repack on save() while preserving everything else
@@ -28,6 +34,7 @@ public:
     void setCodePage(const std::string& code_page) override;
     void load(const std::string& path) override;
     void save(const std::string& path) override;
+    void setWordConversion(WordConversion mode) override;
 
     void setClipboardValue(const std::string& bookmark,
                            const std::string& field,
@@ -83,6 +90,7 @@ private:
 
     bool        loaded_     = false;
     std::string code_page_  = "UTF-8";
+    WordConversion word_conversion_ = WordConversion::Default;
     std::vector<std::string> pasted_;
 
     // ── Internals ────────────────────────────────────────────────────────
